@@ -5,6 +5,7 @@ use std::{any::Any, cmp::max, sync::Arc, time::Duration};
 
 use dynamo_runtime::config::environment_names::kvbm::remote_storage as env_g4;
 use once_cell::sync::Lazy;
+use tokio::sync::Semaphore;
 
 /// Default maximum concurrent H2O (host-to-object) transfers.
 const DEFAULT_MAX_CONCURRENT_H2O: usize = 8;
@@ -27,6 +28,19 @@ static G4_TRANSFER_TIMEOUT: Lazy<Duration> = Lazy::new(|| {
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_G4_TRANSFER_TIMEOUT_SECS);
     Duration::from_secs(secs)
+});
+
+/// Default batch size for flushing remaining blocks on request finish.
+const DEFAULT_FLUSH_BATCH_SIZE: usize = 512;
+
+/// Flush batch size - cached from env var.
+/// Controls how many blocks are offloaded per D2H transfer during the
+/// post-request flush. Smaller batches allow D2H and H2O to pipeline.
+static FLUSH_BATCH_SIZE: Lazy<usize> = Lazy::new(|| {
+    std::env::var("DYN_KVBM_FLUSH_BATCH_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_FLUSH_BATCH_SIZE)
 });
 
 use dynamo_llm::{
@@ -1436,6 +1450,85 @@ impl VllmConnectorSlot {
         Ok(())
     }
 
+    /// Flush blocks that were never offloaded during chunked prefill.
+    ///
+    /// vLLM v1 chunked prefill only calls `apply_scheduler_output` for the first chunk.
+    /// The remaining chunks are processed internally by vLLM without going through the
+    /// connector's scheduler interface. This method is called from `request_finished`
+    /// with ALL block_ids vLLM allocated, and offloads any blocks that were missed.
+    ///
+    /// Blocks are flushed in batches (FLUSH_BATCH_SIZE) to allow D2H and H2O to pipeline.
+    /// GPU blocks are held until all D2H transfers complete (via pending_operations),
+    /// then freed by vLLM. H2O to object storage continues from CPU blocks in the background.
+    pub fn flush_remaining_blocks(
+        &mut self,
+        all_block_ids: &[BlockId],
+    ) -> Result<(), SlotError> {
+        let already_offloaded = self.evaluated_blocks;
+        let total_sequence_blocks = self.sequence.blocks().len();
+
+        // Don't flush past what the sequence covers
+        let flushable = std::cmp::min(all_block_ids.len(), total_sequence_blocks);
+
+        if already_offloaded >= flushable {
+            return Ok(());
+        }
+
+        // Skip the last block if it covers the exact end of the sequence
+        // (same boundary logic as apply_scheduler_output)
+        let flush_end = if flushable == total_sequence_blocks
+            && (total_sequence_blocks * self.block_size) == self.sequence.total_tokens()
+        {
+            flushable.saturating_sub(1)
+        } else {
+            flushable
+        };
+
+        if already_offloaded >= flush_end {
+            return Ok(());
+        }
+
+        let total_remaining = flush_end - already_offloaded;
+        let batch_size = *FLUSH_BATCH_SIZE;
+
+        tracing::info!(
+            request_id = %self.request_id,
+            already_offloaded = already_offloaded,
+            flushing = total_remaining,
+            total_sequence_blocks = total_sequence_blocks,
+            batch_size = batch_size,
+            num_batches = (total_remaining + batch_size - 1) / batch_size,
+            "Flushing remaining blocks on request finish"
+        );
+
+        // Temporarily allow offload_blocks to work even though we're about to
+        // transition to Finishing. We set state to Prefilling so the
+        // Finishing/Finished check in offload_blocks doesn't reject us.
+        let saved_state = self.state;
+        self.state = SlotState::Prefilling;
+
+        // Split into batches for D2H/H2O pipelining
+        let mut offset = already_offloaded;
+        while offset < flush_end {
+            let batch_end = std::cmp::min(offset + batch_size, flush_end);
+            let batch_block_ids = &all_block_ids[offset..batch_end];
+            let batch_token_blocks: Vec<TokenBlock> = self
+                .sequence
+                .blocks()[offset..batch_end]
+                .to_vec();
+
+            self.offload_blocks(batch_block_ids, &batch_token_blocks)?;
+            offset = batch_end;
+        }
+
+        self.evaluated_blocks = flush_end;
+
+        // Restore state (mark_as_finished will set it to Finishing/Finished)
+        self.state = saved_state;
+
+        Ok(())
+    }
+
     fn onboard_blocks(
         &mut self,
         src_blocks: Box<dyn AnyBlocks>,
@@ -1641,6 +1734,18 @@ impl RemoteTransferRequest {
     }
 }
 
+/// Item pushed to the drain queue after D2H completes.
+/// Holds Arc references to host blocks, preventing eviction until H2O finishes.
+struct DrainItem {
+    request_id: String,
+    sequence_hashes: Vec<u64>,
+    host_block_ids: Vec<BlockId>,
+    /// PinGuard that holds Arc references to the immutable host blocks.
+    /// The blocks cannot be evicted while this guard exists.
+    pin_guard: PinGuard,
+    block_size: usize,
+}
+
 struct LocalTransferEngine {
     block_manager: VllmBlockManager,
     leader: Arc<KvbmLeader>,
@@ -1683,12 +1788,19 @@ impl LocalTransferEngine {
         let (onboard_tx, mut onboard_rx) = mpsc::unbounded_channel::<LocalOnboardRequest>();
         let (offload_tx, mut offload_rx) = mpsc::unbounded_channel::<LocalOffloadRequest>();
         let (remote_tx, mut remote_rx) = mpsc::unbounded_channel::<RemoteTransferRequest>();
+        let (drain_tx, mut drain_rx) = mpsc::unbounded_channel::<DrainItem>();
 
         // Pin registry for preventing host block eviction during H2O transfers.
-        // Shared between offload task (creates pins) and remote task (releases pins).
+        // Shared between drain task (creates pins) and remote task (releases pins).
         let pin_registry = PinRegistry::new();
-        let pin_registry_offload = pin_registry.clone();
+        let pin_registry_drain = pin_registry.clone();
         let pin_registry_remote = pin_registry.clone();
+
+        // Semaphore to cap concurrent H2O transfers. The drain task acquires a permit
+        // before sending each H2O request. Permits are released when the remote task
+        // completes the H2O and drops the pin from the registry.
+        let h2o_semaphore = Arc::new(Semaphore::new(*MAX_CONCURRENT_H2O));
+        let h2o_semaphore_remote = h2o_semaphore.clone();
 
         // Clone resources needed for tasks
         let block_manager_offload = self.block_manager.clone();
@@ -1697,8 +1809,10 @@ impl LocalTransferEngine {
         let leader_onboard = Arc::clone(&self.leader);
         let leader_remote = Arc::clone(&self.leader);
 
-        // Clone remote_tx for the offload task to trigger H2O after D2H
-        let remote_tx_for_offload = remote_tx.clone();
+        // Clone drain_tx for the offload task to push items after D2H
+        let drain_tx_for_offload = drain_tx.clone();
+        // Clone remote_tx for the drain task to send H2O requests
+        let remote_tx_for_drain = remote_tx.clone();
 
         let kvbm_metrics_onboard = kvbm_metrics.clone();
         let kvbm_metrics_offload = kvbm_metrics.clone();
@@ -1741,8 +1855,7 @@ impl LocalTransferEngine {
                         &block_manager_offload,
                         &leader_offload,
                         kvbm_metrics_offload.clone(),
-                        &remote_tx_for_offload,
-                        &pin_registry_offload,
+                        &drain_tx_for_offload,
                     )
                     .await
                     {
@@ -1785,27 +1898,180 @@ impl LocalTransferEngine {
 
         let remote_task = CriticalTaskExecutionHandle::new_with_runtime(
             |cancellation_token_remote| async move {
-                while let Some(req) = remote_rx.recv().await {
-                    if cancellation_token_remote.is_cancelled() {
-                        tracing::debug!("RemoteTransferTask: received cancellation signal");
-                        break;
+                // Spawn each remote transfer as a concurrent task.
+                // The H2O semaphore (in the drain task) already caps concurrency,
+                // so we don't need additional limiting here.
+                let mut join_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+                loop {
+                    tokio::select! {
+                        _ = cancellation_token_remote.cancelled() => {
+                            tracing::debug!("RemoteTransferTask: received cancellation signal");
+                            break;
+                        }
+                        req = remote_rx.recv() => {
+                            match req {
+                                Some(req) => {
+                                    let block_manager = block_manager_remote.clone();
+                                    let leader = Arc::clone(&leader_remote);
+                                    let metrics = kvbm_metrics_remote.clone();
+                                    let pin_reg = pin_registry_remote.clone();
+                                    let semaphore = h2o_semaphore_remote.clone();
+
+                                    let handle = tokio::spawn(async move {
+                                        if let Err(e) = process_remote_transfer_request(
+                                            req,
+                                            &block_manager,
+                                            &leader,
+                                            metrics,
+                                            &pin_reg,
+                                            &semaphore,
+                                        )
+                                        .await
+                                        {
+                                            tracing::error!("RemoteTransferTask: error processing request: {:?}", e);
+                                        }
+                                    });
+                                    join_handles.push(handle);
+
+                                    // Periodically clean up completed handles to avoid unbounded growth
+                                    if join_handles.len() > 64 {
+                                        join_handles.retain(|h| !h.is_finished());
+                                    }
+                                }
+                                None => {
+                                    tracing::debug!("RemoteTransferTask: channel closed");
+                                    break;
+                                }
+                            }
+                        }
                     }
-                    if let Err(e) = process_remote_transfer_request(
-                        req,
-                        &block_manager_remote,
-                        &leader_remote,
-                        kvbm_metrics_remote.clone(),
-                        &pin_registry_remote,
-                    )
-                    .await
-                    {
-                        tracing::error!("RemoteTransferTask: error processing request: {:?}", e);
-                    }
+                }
+
+                // Wait for all in-flight remote transfers to complete on shutdown
+                for handle in join_handles {
+                    let _ = handle.await;
                 }
                 Ok(())
             },
-            task_token,
+            task_token.clone(),
             "RemoteTransferTask",
+            &task_handle,
+        )
+        .unwrap();
+
+        // Drain task: event-driven H2O offload from CPU (G2) to object storage (G4).
+        // Consumes DrainItems pushed by the offload task after each D2H completion.
+        // Uses a semaphore to cap concurrent H2O transfers at MAX_CONCURRENT_H2O.
+        let _drain_task = CriticalTaskExecutionHandle::new_with_runtime(
+            |cancellation_token_drain| async move {
+                tracing::info!(
+                    max_concurrent_h2o = *MAX_CONCURRENT_H2O,
+                    "DrainTask started: event-driven G2->G4 offload"
+                );
+
+                loop {
+                    let item = tokio::select! {
+                        _ = cancellation_token_drain.cancelled() => {
+                            tracing::debug!("DrainTask: received cancellation signal");
+                            break;
+                        }
+                        item = drain_rx.recv() => {
+                            match item {
+                                Some(item) => item,
+                                None => {
+                                    tracing::debug!("DrainTask: channel closed");
+                                    break;
+                                }
+                            }
+                        }
+                    };
+
+                    let num_blocks = item.host_block_ids.len();
+                    let request_id = item.request_id.clone();
+
+                    // Validate block integrity before H2O
+                    tracing::debug!(
+                        target: "kvbm-g4",
+                        request_id = %request_id,
+                        num_blocks = num_blocks,
+                        "DrainTask: received item, acquiring H2O permit"
+                    );
+
+                    // Acquire semaphore permit -- blocks if MAX_CONCURRENT_H2O in-flight
+                    let _permit = tokio::select! {
+                        _ = cancellation_token_drain.cancelled() => {
+                            tracing::debug!("DrainTask: cancelled while waiting for H2O permit");
+                            break;
+                        }
+                        permit = h2o_semaphore.clone().acquire_owned() => {
+                            match permit {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    tracing::error!("DrainTask: H2O semaphore closed");
+                                    break;
+                                }
+                            }
+                        }
+                    };
+
+                    let h2o_operation_id = uuid::Uuid::new_v4();
+
+                    // Insert pin guard into registry (prevents host block eviction during H2O).
+                    // The pin_guard was created in process_offload_to_storage and transferred
+                    // here via the DrainItem. The remote task will release it on H2O completion.
+                    pin_registry_drain.insert(h2o_operation_id, item.pin_guard);
+
+                    tracing::debug!(
+                        target: "kvbm-g4",
+                        request_id = %request_id,
+                        pin_id = %h2o_operation_id,
+                        num_blocks = num_blocks,
+                        "DrainTask: pinned host blocks for h2o transfer"
+                    );
+
+                    let h2o_req = RemoteTransferRequest::new_h2o(
+                        request_id.clone(),
+                        item.sequence_hashes,
+                        item.host_block_ids,
+                        h2o_operation_id,
+                        item.block_size,
+                        h2o_operation_id,
+                    );
+
+                    if let Err(e) = remote_tx_for_drain.send(h2o_req) {
+                        tracing::error!(
+                            target: "kvbm-g4",
+                            request_id = %request_id,
+                            "DrainTask: failed to send H2O request: {:?}", e
+                        );
+                        // Release the pin since H2O won't happen
+                        pin_registry_drain.remove(&h2o_operation_id);
+                        // _permit is dropped here, releasing the semaphore slot
+                        continue;
+                    }
+
+                    tracing::debug!(
+                        target: "kvbm-g4",
+                        request_id = %request_id,
+                        operation_id = %h2o_operation_id,
+                        num_blocks = num_blocks,
+                        "DrainTask: H2O request sent"
+                    );
+
+                    // Transfer ownership of the semaphore permit to the H2O lifecycle.
+                    // We forget the permit here to prevent it from being released when
+                    // this scope exits. The remote task's release_pin calls
+                    // semaphore.add_permits(1) when the H2O completes, restoring the
+                    // permit. This ensures the semaphore correctly limits concurrent H2O.
+                    std::mem::forget(_permit);
+                }
+
+                tracing::info!("DrainTask: shutting down");
+                Ok(())
+            },
+            task_token,
+            "DrainTask",
             &task_handle,
         )
         .unwrap();
@@ -1877,8 +2143,7 @@ async fn process_offload_request(
     block_manager: &VllmBlockManager,
     leader: &Arc<KvbmLeader>,
     kvbm_metrics: KvbmMetrics,
-    remote_tx: &mpsc::UnboundedSender<RemoteTransferRequest>,
-    pin_registry: &PinRegistry,
+    drain_tx: &mpsc::UnboundedSender<DrainItem>,
 ) -> anyhow::Result<()> {
     let request_id = offload_req.request_id.clone();
     let operation_id = offload_req.operation_id;
@@ -1911,8 +2176,7 @@ async fn process_offload_request(
             &request_id,
             &operation_id,
             "disk",
-            None, // No H2O for disk path
-            pin_registry,
+            None, // No drain for disk path
         )
         .await?;
     } else {
@@ -1928,8 +2192,7 @@ async fn process_offload_request(
             &request_id,
             &operation_id,
             "host",
-            Some(remote_tx), // Enable H2O after D2H
-            pin_registry,
+            Some(drain_tx), // Push to drain queue after D2H
         )
         .await?;
     }
@@ -1946,8 +2209,7 @@ async fn process_offload_to_storage<S, L, M>(
     request_id: &str,
     operation_id: &uuid::Uuid,
     storage_name: &str,
-    remote_tx: Option<&mpsc::UnboundedSender<RemoteTransferRequest>>,
-    pin_registry: &PinRegistry,
+    drain_tx: Option<&mpsc::UnboundedSender<DrainItem>>,
 ) -> anyhow::Result<()>
 where
     S: Storage + NixlRegisterableStorage + 'static,
@@ -2046,76 +2308,42 @@ where
         storage_name
     );
 
-    // Decide if H2O should be triggered (uses lib/llm decision logic)
+    // Push to drain queue for async H2O (G2 -> G4) if host transfer and G4 is enabled
     let is_host_transfer = transfer_pool == BlockTransferPool::Host;
-    let should_h2o = vllm_int::should_trigger_h2o(
-        is_host_transfer,
-        leader.remote_registry_enabled(),
-        pin_registry.len(),
-        *MAX_CONCURRENT_H2O,
-    );
+    if is_host_transfer && leader.remote_registry_enabled() {
+        if let Some(drain_tx) = drain_tx {
+            let host_block_ids: Vec<BlockId> =
+                immutable_blocks.iter().map(|b| b.block_id()).collect();
+            let num_blocks = host_block_ids.len();
 
-    if is_host_transfer && leader.remote_registry_enabled() && !should_h2o {
-        tracing::warn!(
-            request_id = request_id,
-            current_h2o = pin_registry.len(),
-            max_h2o = *MAX_CONCURRENT_H2O,
-            num_blocks = offload_req.sequence_hashes.len(),
-            "Skipping H2O transfer due to backpressure"
-        );
-    }
+            // Create PinGuard to prevent host block eviction while in drain queue and during H2O.
+            // The guard holds Arc references to the immutable blocks, keeping their refcount > 0.
+            let pin_guard = PinGuard::new(immutable_blocks);
 
-    if let Some(remote_tx) = remote_tx.filter(|_| should_h2o) {
-        let host_block_ids: Vec<BlockId> = immutable_blocks.iter().map(|b| b.block_id()).collect();
-        let h2o_operation_id = uuid::Uuid::new_v4();
+            let item = DrainItem {
+                request_id: offload_req.request_id.clone(),
+                sequence_hashes: offload_req.sequence_hashes.clone(),
+                host_block_ids,
+                pin_guard,
+                block_size: offload_req.block_size,
+            };
 
-        // Pin the host blocks to prevent eviction during H2O transfer.
-        // The PinGuard holds references to the immutable blocks, keeping
-        // their Arc reference count > 0, which prevents them from being
-        // returned to the inactive pool and evicted.
-        let pin_guard = PinGuard::new(immutable_blocks);
-        pin_registry.insert(h2o_operation_id, pin_guard);
+            if let Err(e) = drain_tx.send(item) {
+                tracing::error!(
+                    request_id = request_id,
+                    num_blocks = num_blocks,
+                    "Failed to enqueue drain item: {:?}. Blocks remain on G2 only.", e
+                );
+                // pin_guard is dropped via the DrainItem inside the SendError,
+                // releasing the blocks back to the inactive pool. No data loss,
+                // but these blocks won't reach G4.
+            }
 
-        tracing::debug!(
-            target: "kvbm-g4",
-            request_id = request_id,
-            pin_id = %h2o_operation_id,
-            num_blocks = host_block_ids.len(),
-            "pinned host blocks for h2o transfer"
-        );
-
-        let h2o_req = RemoteTransferRequest::new_h2o(
-            offload_req.request_id.clone(),
-            offload_req.sequence_hashes.clone(),
-            host_block_ids,
-            h2o_operation_id,
-            offload_req.block_size,
-            h2o_operation_id,
-        );
-
-        tracing::debug!(
-            request_id = request_id,
-            operation_id = %h2o_operation_id,
-            num_blocks = offload_req.sequence_hashes.len(),
-            "Triggering H2O transfer after D2H offload"
-        );
-
-        if let Err(e) = remote_tx.send(h2o_req) {
-            tracing::error!(
-                request_id = request_id,
-                "Failed to send H2O request: {:?}",
-                e
-            );
-            // Remove the pin since H2O won't happen
-            pin_registry.remove(&h2o_operation_id);
+            return Ok(());
         }
-
-        // Note: immutable_blocks ownership moved to pin_guard, which is now in the registry.
-        // The guard will be released by process_remote_transfer_request after H2O completes.
-        return Ok(());
     }
 
-    // If we didn't trigger H2O, the immutable_blocks are dropped here,
+    // If we didn't push to drain queue, the immutable_blocks are dropped here,
     // allowing them to be returned to the inactive pool normally.
     drop(immutable_blocks);
 
@@ -2185,19 +2413,26 @@ async fn process_remote_transfer_request(
     leader: &Arc<KvbmLeader>,
     kvbm_metrics: KvbmMetrics,
     pin_registry: &PinRegistry,
+    h2o_semaphore: &Arc<Semaphore>,
 ) -> anyhow::Result<()> {
     let request_id = &req.request_id;
     let operation_id = &req.operation_id;
     let pin_id = req.pin_id;
+    let is_h2o = req.is_h2o();
 
-    // Helper to release pin guard (called on all exit paths)
-    let release_pin = |pin_registry: &PinRegistry, pin_id: Option<uuid::Uuid>| {
+    // Helper to release pin guard and H2O semaphore permit (called on all exit paths)
+    let release_pin = |pin_registry: &PinRegistry, pin_id: Option<uuid::Uuid>, is_h2o: bool, semaphore: &Arc<Semaphore>| {
         if let Some(guard) = pin_id.and_then(|id| pin_registry.remove(&id)) {
             tracing::debug!(
                 pin_id = ?pin_id,
                 num_blocks = guard.count(),
                 "Released pin guard after H2O transfer"
             );
+            // Release the semaphore permit that was forgotten by the drain task.
+            // This allows the drain task to send the next H2O request.
+            if is_h2o {
+                semaphore.add_permits(1);
+            }
         }
     };
 
@@ -2215,7 +2450,7 @@ async fn process_remote_transfer_request(
         {
             Some(filtered) => filtered,
             None => {
-                release_pin(pin_registry, pin_id);
+                release_pin(pin_registry, pin_id, is_h2o, h2o_semaphore);
                 return Ok(());
             }
         }
@@ -2390,7 +2625,8 @@ async fn process_remote_transfer_request(
 
     // Release pin guard after transfer completes (success or failure).
     // This allows the host blocks to be returned to the inactive pool.
-    release_pin(pin_registry, pin_id);
+    // For H2O transfers from the drain task, this also releases the semaphore permit.
+    release_pin(pin_registry, pin_id, is_h2o, h2o_semaphore);
 
     result
 }

@@ -594,6 +594,10 @@ impl Leader for KvConnectorLeader {
     ) -> anyhow::Result<bool> {
         tracing::debug!("Request finished: {request_id}; block_ids: {block_ids:?}");
 
+        // Clean up onboarding tracking — if the request is cancelled mid-onboard,
+        // prevent build_connector_metadata from processing it again.
+        self.onboarding_slots.remove(&request_id);
+
         if !self.slot_manager().has_slot(&request_id) {
             tracing::warn!(
                 "request_finished called for request_id: {request_id} but slot is not found"
@@ -610,6 +614,35 @@ impl Leader for KvConnectorLeader {
         let mut slot = shared_slot
             .lock()
             .map_err(|e| anyhow::anyhow!("Failed to lock slot: {}", e))?;
+
+        // If the slot is still in Onboarding state when finished is called, the
+        // request was cancelled mid-transfer (e.g., client disconnected during G4
+        // onboard). Clear pending operations so mark_as_finished transitions
+        // directly to Finished instead of getting stuck in Finishing forever.
+        if matches!(slot.state(), SlotState::Onboarding(_)) {
+            tracing::warn!(
+                request_id = %request_id,
+                state = ?slot.state(),
+                "Request cancelled during onboarding - clearing pending operations"
+            );
+            let _ = slot.take_pending_operations();
+        }
+
+        // Flush blocks that were never offloaded during chunked prefill.
+        // vLLM v1 only calls apply_scheduler_output for the first chunk (~512 blocks).
+        // The remaining blocks are computed by vLLM but never seen by the connector.
+        // Flush them now using the full block_ids vLLM provides.
+        if let Some(vllm_slot) = slot
+            .as_any_mut()
+            .downcast_mut::<VllmConnectorSlot>()
+        {
+            if let Err(e) = vllm_slot.flush_remaining_blocks(&block_ids) {
+                tracing::error!(
+                    request_id = %request_id,
+                    "Failed to flush remaining blocks: {:?}. Blocks remain on GPU only.", e
+                );
+            }
+        }
 
         // Mark the slot as finished (sets state to Finishing if there are operations,
         // or Finished if all operations are complete)
