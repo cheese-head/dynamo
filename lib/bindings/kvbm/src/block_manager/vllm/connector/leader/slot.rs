@@ -1517,7 +1517,9 @@ impl VllmConnectorSlot {
                 .blocks()[offset..batch_end]
                 .to_vec();
 
-            self.offload_blocks(batch_block_ids, &batch_token_blocks)?;
+            // Flushed blocks don't have priority info; use default priority 0
+            let batch_priorities = vec![0u32; batch_block_ids.len()];
+            self.offload_blocks(batch_block_ids, &batch_token_blocks, &batch_priorities)?;
             offset = batch_end;
         }
 
