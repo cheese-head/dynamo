@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 # from kvbm.vllm_integration.rust import SchedulerOutput as RustSchedulerOutput
 
 from kvbm import KvbmLeader
+from kvbm.management import register_clear_pool, start_management_server
 from kvbm.utils import is_dyn_runtime_enabled
 from kvbm.vllm_integration.rust import KvbmRequest
 from kvbm.vllm_integration.rust import KvConnectorLeader as RustKvConnectorLeader
@@ -109,6 +110,15 @@ class KvConnectorLeader:
                 leader,
                 consolidator_vllm_endpoint=None,
                 consolidator_output_endpoint=None,
+            )
+
+        # Register the clear_pool callable and start the management HTTP
+        # server when KVBM_DEV_MODE is enabled.
+        register_clear_pool(self.clear_pool)
+        mgmt_port = start_management_server()
+        if mgmt_port is not None:
+            print(
+                f"[KVBM] Management API available at http://0.0.0.0:{mgmt_port}"
             )
 
     # KV Connector
@@ -244,6 +254,25 @@ class KvConnectorLeader:
         # ahead of time if the request is finished.
         status = self._connector.request_finished(request.request_id, block_ids)
         return status, None
+
+    # Management API
+
+    def clear_pool(self, pool: str) -> None:
+        """Clear (wipe) all KV cache entries from a specific pool.
+
+        Requires KVBM_DEV_MODE=TRUE environment variable.
+
+        This is a destructive operation that:
+          1. Drops all in-flight slots (freeing their block references).
+          2. Resets the target pool, returning every block to the empty state.
+
+        Args:
+            pool: One of "gpu"/"device", "cpu"/"host", or "disk".
+
+        Raises:
+            RuntimeError: If KVBM_DEV_MODE is not enabled or pool is invalid.
+        """
+        self._connector.clear_pool(pool)
 
     # Utility functions
 

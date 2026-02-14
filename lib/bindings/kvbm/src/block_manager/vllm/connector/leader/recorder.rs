@@ -197,6 +197,7 @@ impl KvConnectorLeaderRecorder {
             block_size: page_size,
             inflight_requests: HashSet::new(),
             onboarding_slots: HashSet::new(),
+            finishing_requests: HashSet::new(),
             iteration_counter: 0,
             kvbm_metrics,
         };
@@ -349,5 +350,10 @@ impl Leader for KvConnectorLeaderRecorder {
             .unbounded_tx
             .send(Action::CreateSlot(input_copy, CreateSlotOutput {}));
         Ok(())
+    }
+
+    fn clear_pool(&mut self, pool: String) -> anyhow::Result<()> {
+        // Delegate directly to the inner leader; recording this action is not critical.
+        self.connector_leader.clear_pool(pool)
     }
 }

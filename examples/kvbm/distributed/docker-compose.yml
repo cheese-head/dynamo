@@ -59,7 +59,7 @@ services:
 
   # Distributed registry hub: build and run inside the dynamo container
   registry:
-    image: ${DYNAMO_IMAGE:-dynamo:latest-vllm-local-dev}
+    image: ${DYNAMO_IMAGE:-dynamo:object-latest}
     volumes:
       - ../../..:/workspace
     working_dir: /workspace
@@ -79,7 +79,7 @@ services:
       DYN_REGISTRY_HUB_CAPACITY: "1000000"
       # Use info level in production. Debug level causes per-entry registration
       # logging that starves the ROUTER sender task during registration floods.
-      RUST_LOG: "dynamo_llm::block_manager::distributed::registry=info,registry=info"
+      RUST_LOG: "${REGISTRY_LOG:-dynamo_llm::block_manager::distributed::registry=debug,registry=debug}"
     ports:
       - "5555:5555"
       - "5556:5556"
@@ -90,7 +90,7 @@ services:
   # user: "0" so the process can write to /opt/models (HF cache volume); image default is non-root.
   # Mount host HugePages so the container can use them (ensure vm.nr_hugepages is set on the host).
   dynamo-kvbm:
-    image: ${DYNAMO_IMAGE:-dynamo:latest-vllm-local-dev}
+    image: ${DYNAMO_IMAGE:-dynamo:object-latest}
     user: "0"
     volumes:
       - ../../..:/workspace
@@ -110,7 +110,7 @@ services:
       # Model (openai/gpt-oss-120b). Set HF_TOKEN in .env or export for gated models.
       MODEL: ${MODEL:-openai/gpt-oss-120b}
       # Toggleable vLLM knobs (see file header for docs)
-      ENABLE_PREFIX_CACHING: ${ENABLE_PREFIX_CACHING:-true}
+      ENABLE_PREFIX_CACHING: ${ENABLE_PREFIX_CACHING:-false}
       GPU_MEMORY_UTILIZATION: ${GPU_MEMORY_UTILIZATION:-0.9}
       VLLM_EXTRA_ARGS: ${VLLM_EXTRA_ARGS:-}
       HF_HOME: /opt/models
@@ -125,6 +125,10 @@ services:
       DYN_REGISTRY_ENABLE: "1"
       DYN_REGISTRY_CLIENT_QUERY_ADDR: tcp://registry:5555
       DYN_REGISTRY_CLIENT_REGISTER_ADDR: tcp://registry:5556
+      # KVBM dev mode — enables destructive pool operations (clear/wipe)
+      # and starts the management HTTP server on KVBM_MANAGEMENT_PORT (default: 6881).
+      KVBM_DEV_MODE: ${KVBM_DEV_MODE:-}
+      KVBM_MANAGEMENT_PORT: ${KVBM_MANAGEMENT_PORT:-6881}
       # KVBM CPU cache (required)
       DYN_KVBM_CPU_CACHE_GB: "500"
       # Object storage (external S3-compatible). Used by KVBM Rust: BUCKET, ENDPOINT, REGION.
@@ -147,6 +151,7 @@ services:
       - kvbm
     ports:
       - "8000:8000"
+      - "6881:6881"   # KVBM management API (when KVBM_DEV_MODE=TRUE)
     command:
       - bash
       - -c
@@ -177,4 +182,3 @@ services:
           --gpu-memory-utilization "$${GPU_MEMORY_UTILIZATION}" \
           $${PREFIX_FLAG} \
           $${VLLM_EXTRA_ARGS}
-

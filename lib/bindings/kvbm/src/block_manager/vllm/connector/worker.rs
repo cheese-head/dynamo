@@ -88,6 +88,12 @@ pub struct KvConnectorWorker {
 
     /// Pending failure notifications not yet processed (request_id → failed UUIDs)
     pending_failures: HashMap<String, HashSet<uuid::Uuid>>,
+
+    /// Request IDs for which we already returned `is_finished_offloading`.
+    /// Prevents duplicate signals in TP>1: a previous step may have returned
+    /// the request via the normal slot-completion path, and a later step
+    /// (where the slot is already gone) must not return it again.
+    already_signaled_offloading: HashSet<String>,
 }
 
 impl KvConnectorWorker {
@@ -129,6 +135,7 @@ impl KvConnectorWorker {
             request_to_blocks: HashMap::new(),
             failed_block_ids: HashSet::new(),
             pending_failures: HashMap::new(),
+            already_signaled_offloading: HashSet::new(),
         })
     }
 }
@@ -400,10 +407,27 @@ impl Worker for KvConnectorWorker {
             tracing::debug!(request_id, "marking request as finished");
 
             if !self.connector.has_slot(&request_id) {
-                tracing::warn!(
-                    request_id,
-                    "finished request received for unknown request_id; assuming never started"
-                );
+                if self.already_signaled_offloading.contains(&request_id) {
+                    // We already returned this request as finished_offloading in a
+                    // previous step. Don't signal again — duplicates cause vLLM's
+                    // _update_from_kv_xfer_finished to process the same request twice,
+                    // crashing on the second assert req_id in self.requests.
+                    tracing::debug!(
+                        request_id,
+                        "finished request with no slot already signaled; skipping duplicate"
+                    );
+                } else {
+                    tracing::warn!(
+                        request_id,
+                        "finished request received for unknown request_id; \
+                         signaling as finished_offloading so vLLM can clean up"
+                    );
+                    // The leader returned `true` from request_finished, so vLLM is keeping
+                    // the request in self.requests until we signal completion. Since we have
+                    // no slot (no in-flight transfers to wait for), signal immediately.
+                    is_finished_offloading.insert(request_id.clone());
+                    self.already_signaled_offloading.insert(request_id);
+                }
                 continue;
             }
 
@@ -448,6 +472,9 @@ impl Worker for KvConnectorWorker {
         // note: when storing is finished we also remove the request from the engine state
         for request_id in &is_finished_offloading {
             self.maybe_finished_offloading.remove(request_id);
+            // Track that we signaled this request, so we don't duplicate if
+            // get_finished is called again after the slot is removed.
+            self.already_signaled_offloading.insert(request_id.clone());
             // Note: Store operations don't track failures or block_ids - no cleanup needed
 
             // currently chomping the error as the engine is closed and we are shutting down

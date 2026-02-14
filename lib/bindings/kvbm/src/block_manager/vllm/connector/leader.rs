@@ -78,6 +78,10 @@ pub trait Leader: Send + Sync + std::fmt::Debug {
     fn create_slot(&mut self, request: KvbmRequest, tokens: Vec<u32>) -> anyhow::Result<()>;
 
     fn slot_manager(&self) -> &ConnectorSlotManager<String>;
+
+    /// Clear (wipe) all KV cache entries from a specific pool.
+    /// Requires KVBM_DEV_MODE=TRUE. Returns Ok(()) on success.
+    fn clear_pool(&mut self, pool: String) -> anyhow::Result<()>;
 }
 
 #[derive(Debug)]
@@ -86,6 +90,10 @@ pub struct KvConnectorLeader {
     block_size: usize,
     inflight_requests: HashSet<String>,
     onboarding_slots: HashSet<String>,
+    /// Requests whose slots are in `Finishing` state (have in-flight worker operations).
+    /// These slots are kept alive in the slot_manager until the next `build_connector_metadata`
+    /// call, giving the worker time to signal completion via `get_finished`.
+    finishing_requests: HashSet<String>,
     iteration_counter: u64,
     kvbm_metrics: KvbmMetrics,
 }
@@ -236,6 +244,7 @@ impl KvConnectorLeader {
             block_size: page_size,
             inflight_requests: HashSet::new(),
             onboarding_slots: HashSet::new(),
+            finishing_requests: HashSet::new(),
             iteration_counter: 0,
             kvbm_metrics,
         }
@@ -376,6 +385,22 @@ impl Leader for KvConnectorLeader {
         &mut self,
         scheduler_output: SchedulerOutput,
     ) -> anyhow::Result<Vec<u8>> {
+        // Clean up slots that were in Finishing state from the previous request_finished call.
+        // By this point the worker has had at least one iteration to process completion,
+        // and the leader's slot is no longer needed for any decision-making.
+        // Drain into a Vec first to release the mutable borrow on self before calling slot_manager().
+        if !self.finishing_requests.is_empty() {
+            let to_clean: Vec<String> = self.finishing_requests.drain().collect();
+            for request_id in &to_clean {
+                if self.slot_manager().has_slot(request_id) {
+                    tracing::debug!(
+                        "Cleaning up Finishing slot for request {request_id}"
+                    );
+                    let _ = self.slot_manager().remove_slot(request_id);
+                }
+            }
+        }
+
         // the iteration counter is used to track the number of times we have built the connector metadata
         // all connetor operations have the iteration counter at which they were issued.
         // this allows operations to be lazily enqueued to the transfer engine
@@ -600,10 +625,17 @@ impl Leader for KvConnectorLeader {
 
         if !self.slot_manager().has_slot(&request_id) {
             tracing::warn!(
-                "request_finished called for request_id: {request_id} but slot is not found"
+                "request_finished called for request_id: {request_id} but slot is not found. \
+                 Returning true so vLLM keeps the request in self.requests until the worker \
+                 signals completion via get_finished (prevents assert req_id in self.requests crash)."
             );
             self.inflight_requests.remove(&request_id);
-            return Ok(false);
+            // Return `true` (not `false`). Returning `false` lets vLLM remove the request from
+            // self.requests immediately. If a KV transfer completion event is still queued from
+            // the worker, _update_from_kv_xfer_finished will assert req_id in self.requests
+            // and crash. The worker handles unknown requests by signaling them as
+            // is_finished_offloading, so vLLM will be notified to clean up.
+            return Ok(true);
         }
 
         // grab the slot
@@ -617,15 +649,22 @@ impl Leader for KvConnectorLeader {
 
         // If the slot is still in Onboarding state when finished is called, the
         // request was cancelled mid-transfer (e.g., client disconnected during G4
-        // onboard). Clear pending operations so mark_as_finished transitions
+        // onboard). Discard pending operations so mark_as_finished transitions
         // directly to Finished instead of getting stuck in Finishing forever.
+        // Use discard_pending_operations (not take_pending_operations) to avoid
+        // incrementing the dispatched counter for operations we're throwing away.
         if matches!(slot.state(), SlotState::Onboarding(_)) {
             tracing::warn!(
                 request_id = %request_id,
                 state = ?slot.state(),
-                "Request cancelled during onboarding - clearing pending operations"
+                "Request cancelled during onboarding - discarding pending operations"
             );
-            let _ = slot.take_pending_operations();
+            if let Some(vllm_slot) = slot
+                .as_any_mut()
+                .downcast_mut::<VllmConnectorSlot>()
+            {
+                vllm_slot.discard_pending_operations();
+            }
         }
 
         // Flush blocks that were never offloaded during chunked prefill.
@@ -658,23 +697,31 @@ impl Leader for KvConnectorLeader {
         //            The worker side of the connector API will later call `finish_requests()`
         //            to notify vLLM when the request is truly complete.
         //
-        // TODO(jthomson04): This is a temporary fix to ensure vLLM 0.11.2 compatibility.
-        //     IMPORTANT: We must ALWAYS return `true` here, even when the slot is already Finished.
+        // We ALWAYS return `true` here. If we return `false`, vLLM removes the request from
+        // `self.requests` immediately. However, our worker connector may still report completion
+        // later via `finish_requests()`. When that happens, vLLM's scheduler.py has an assertion
+        // `req_id in self.requests` that will fail because the request was already removed.
         //
-        //      Why? If we return `false`, vLLM removes the request from `self.requests` immediately.
-        //      However, our worker connector may still report completion later via `finish_requests()`.
-        //      When that happens, vLLM's scheduler.py has an assertion `req_id in self.requests`
-        //      that will fail because the request was already removed from the hash table.
-        //
-        //      By always returning `true`, we ensure vLLM keeps the request in its hash table until
-        //      our worker explicitly signals completion, avoiding the race condition.
-        //
-        //      If the slot is already Finished (no pending operations), we clean it up from our side
-        //      but still return `true` so vLLM waits for the worker's completion signal.
-        if let SlotState::Finished = slot.state() {
-            self.slot_manager().remove_slot(&request_id)?;
-        } else {
-            debug_assert!(matches!(slot.state(), SlotState::Finishing));
+        // By always returning `true`, we ensure vLLM keeps the request in its hash table until
+        // our worker explicitly signals completion via `get_finished`, avoiding the race.
+        match slot.state() {
+            SlotState::Finished => {
+                // No in-flight operations — clean up the slot immediately.
+                self.slot_manager().remove_slot(&request_id)?;
+            }
+            SlotState::Finishing => {
+                // There are dispatched operations the worker is still processing.
+                // Keep the slot alive so state is preserved for debugging/metrics.
+                // It will be cleaned up in the next `build_connector_metadata` call.
+                self.finishing_requests.insert(request_id);
+            }
+            other => {
+                tracing::warn!(
+                    "request_finished: unexpected slot state {:?} after mark_as_finished",
+                    other
+                );
+                self.slot_manager().remove_slot(&request_id)?;
+            }
         }
 
         Ok(true)
@@ -692,6 +739,27 @@ impl Leader for KvConnectorLeader {
 
         self.inflight_requests.insert(request.request_id);
 
+        Ok(())
+    }
+
+    fn clear_pool(&mut self, pool: String) -> anyhow::Result<()> {
+        if !is_dev_mode() {
+            anyhow::bail!(
+                "clear_pool called but KVBM_DEV_MODE is not enabled. \
+                 Set KVBM_DEV_MODE=TRUE to allow destructive pool operations."
+            );
+        }
+
+        tracing::warn!("clear_pool({pool}): wiping pool (dev-mode)");
+
+        // Also clear leader-side tracking state since all slots will be dropped.
+        self.inflight_requests.clear();
+        self.onboarding_slots.clear();
+        self.finishing_requests.clear();
+
+        self.slot_manager().clear_pool(&pool)?;
+
+        tracing::info!("clear_pool({pool}): pool wiped successfully");
         Ok(())
     }
 }
@@ -785,6 +853,25 @@ impl PyKvConnectorLeader {
             .create_slot(request, tokens)
             .map_err(to_pyerr)
     }
+
+    /// Clear (wipe) all KV cache entries from a specific pool.
+    ///
+    /// `pool` must be one of: "gpu" / "device", "cpu" / "host", or "disk".
+    ///
+    /// Requires KVBM_DEV_MODE=TRUE. Raises an exception if dev-mode is not enabled
+    /// or if the pool name is invalid.
+    fn clear_pool(&mut self, pool: String) -> PyResult<()> {
+        self.connector_leader
+            .clear_pool(pool)
+            .map_err(to_pyerr)
+    }
+}
+
+/// Check whether KVBM_DEV_MODE is enabled via environment variable.
+pub fn is_dev_mode() -> bool {
+    std::env::var(env_kvbm::KVBM_DEV_MODE)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 pub fn kvbm_metrics_endpoint_enabled() -> bool {

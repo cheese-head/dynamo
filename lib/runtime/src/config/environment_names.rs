@@ -180,6 +180,9 @@ pub mod kvbm {
     /// Disable disk offload filter
     pub const DYN_KVBM_DISABLE_DISK_OFFLOAD_FILTER: &str = "DYN_KVBM_DISABLE_DISK_OFFLOAD_FILTER";
 
+    /// Enable KVBM dev mode (allows destructive operations like pool wiping)
+    pub const KVBM_DEV_MODE: &str = "KVBM_DEV_MODE";
+
     /// CPU cache configuration
     pub mod cpu_cache {
         /// CPU cache size in GB
@@ -484,6 +487,7 @@ mod tests {
             kvbm::DYN_KVBM_METRICS_PORT,
             kvbm::ENABLE_KVBM_RECORD,
             kvbm::DYN_KVBM_DISABLE_DISK_OFFLOAD_FILTER,
+            kvbm::KVBM_DEV_MODE,
             kvbm::cpu_cache::DYN_KVBM_CPU_CACHE_GB,
             kvbm::cpu_cache::DYN_KVBM_CPU_CACHE_OVERRIDE_NUM_BLOCKS,
             kvbm::disk_cache::DYN_KVBM_DISK_CACHE_GB,

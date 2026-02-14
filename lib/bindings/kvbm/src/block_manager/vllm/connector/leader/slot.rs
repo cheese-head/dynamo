@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{any::Any, cmp::max, sync::Arc, time::Duration};
+use std::{any::Any, cmp::max, sync::Arc, time::{Duration, Instant}};
 
 use dynamo_runtime::config::environment_names::kvbm::remote_storage as env_g4;
 use once_cell::sync::Lazy;
@@ -308,6 +308,63 @@ impl<R: RequestKey> ConnectorSlotManager<R> {
     }
 }
 
+impl<R: RequestKey> ConnectorSlotManager<R> {
+    /// Clear (wipe) all KV cache entries from a specific pool.
+    ///
+    /// This drops **all** tracked slots (releasing block references) and then
+    /// resets the target pool, returning every block to the empty state.
+    ///
+    /// `pool` must be one of: `"gpu"` / `"device"`, `"cpu"` / `"host"`, or `"disk"`.
+    pub fn clear_pool(&self, pool: &str) -> Result<(), SlotError> {
+        // Step 1: Drop all slots so block references are released back to the pool.
+        {
+            let mut slots = self.slots.lock().unwrap();
+            let count = slots.len();
+            if count > 0 {
+                tracing::warn!(
+                    "clear_pool({pool}): dropping {count} active connector slots to release block references"
+                );
+                slots.clear();
+            }
+        }
+
+        // Step 2: Reset the target pool.
+        match pool.to_lowercase().as_str() {
+            "gpu" | "device" => {
+                if let Some(device) = self.block_manager.device() {
+                    device.reset_blocking()?;
+                    tracing::info!("clear_pool: device (GPU) pool wiped");
+                } else {
+                    return Err(SlotError::InvalidOperation("device pool is not configured".into()));
+                }
+            }
+            "cpu" | "host" => {
+                if let Some(host) = self.block_manager.host() {
+                    host.reset_blocking()?;
+                    tracing::info!("clear_pool: host (CPU) pool wiped");
+                } else {
+                    return Err(SlotError::InvalidOperation("host pool is not configured".into()));
+                }
+            }
+            "disk" => {
+                if let Some(disk) = self.block_manager.disk() {
+                    disk.reset_blocking()?;
+                    tracing::info!("clear_pool: disk pool wiped");
+                } else {
+                    return Err(SlotError::InvalidOperation("disk pool is not configured".into()));
+                }
+            }
+            other => {
+                return Err(SlotError::InvalidOperation(format!(
+                    "unknown pool '{other}': expected one of 'gpu', 'device', 'cpu', 'host', 'disk'"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+}
+
 impl<R: RequestKey> SlotManager<R> for ConnectorSlotManager<R> {
     type SlotType = dyn ExternallyManagedDeviceSlot;
 
@@ -413,6 +470,13 @@ pub struct VllmConnectorSlot {
 
     pending_operations: Option<Vec<WorkerTransferRequest>>,
 
+    /// Number of operations that have been dispatched to the worker (via `take_pending_operations`)
+    /// but have not yet been confirmed as complete. This tracks in-flight operations that
+    /// `pending_operations` no longer contains because they were consumed by
+    /// `build_connector_metadata`. Used by `mark_as_finished` to correctly transition to
+    /// `Finishing` when there are operations the worker is still processing.
+    dispatched_operations_count: usize,
+
     /// use this to issue [`LocalTransferRequest`]s to the transfer engine
     xfer_tx: mpsc::UnboundedSender<LocalTransferRequest>,
 
@@ -447,6 +511,12 @@ pub struct VllmConnectorSlot {
 
     /// Cache statistics tracker for this KVBM instance
     cache_stats: Arc<CacheStatsTracker>,
+
+    /// Timestamp when the slot entered `Onboarding` state.
+    /// Used to distinguish in-flight G4 transfers (which need S3 round-trips) from
+    /// genuinely failed transfers. Recovery in `apply_scheduler_output` only fires
+    /// after `G4_TRANSFER_TIMEOUT` has elapsed, giving slow transfers time to complete.
+    onboarding_started_at: Option<Instant>,
 
     /// Minimum priority threshold for offload filtering.
     /// All blocks after the first occurance of block priority < threshold are not offloaded.
@@ -492,6 +562,7 @@ impl VllmConnectorSlot {
             staging_from_disk: None,
             staging_from_g4: None,
             pending_operations: None,
+            dispatched_operations_count: 0,
             tokens_cached_from_device: 0,
             tokens_cached_from_host: 0,
             tokens_cached_from_disk: 0,
@@ -501,6 +572,7 @@ impl VllmConnectorSlot {
             skip_g4_on_retry: false,
             recovered_from_failed_transfer: false,
             attempted_g4_hashes: None,
+            onboarding_started_at: None,
             cache_stats,
             offload_min_priority,
             offload_terminated_at_block: None,
@@ -584,13 +656,15 @@ impl Slot for VllmConnectorSlot {
             tracing::warn!(target: "kvbm-g4", request_id = %self.request_id, "preemption while hashes staged");
             self.staging_from_g4.take();
         }
-        if self.pending_operations.is_some() {
+        if self.pending_operations.is_some() || self.dispatched_operations_count > 0 {
             tracing::warn!(
                 request_id = %self.request_id,
                 pending_ops = self.pending_operations.as_ref().map(|o| o.len()).unwrap_or(0),
-                "Preemption while operations pending"
+                dispatched_ops = self.dispatched_operations_count,
+                "Preemption while operations pending/in-flight"
             );
             self.pending_operations.take();
+            self.dispatched_operations_count = 0;
         }
 
         self.state = SlotState::Preempted;
@@ -607,6 +681,7 @@ impl Slot for VllmConnectorSlot {
         self.offload_terminated_at_block = None;
         self.skip_g4_on_retry = false;
         self.attempted_g4_hashes = None;
+        self.onboarding_started_at = None;
     }
 
     fn reset(&mut self) {
@@ -659,32 +734,22 @@ impl Slot for VllmConnectorSlot {
             );
         }
 
-        // Handle recovery from failed onboard prior to processing the scheduler output.
-        // When a transfer fails and vLLM reschedules the request, apply_scheduler_output
-        // is called BEFORE acquire_local_matches. We need to detect the failed state here
-        // and reset, otherwise our stale current_position will cause capacity errors.
+        // Onboarding state in apply_scheduler_output is NORMAL, not an error.
+        // vLLM schedules the request for prefill immediately after get_num_new_matched_tokens
+        // returns async=true. The async KV loading happens on the worker during the forward
+        // pass. The slot naturally transitions from Onboarding → Prefilling/Decoding via
+        // the state assignment below.
+        //
+        // Genuine onboarding failures are handled by acquire_local_matches, which is called
+        // when vLLM re-evaluates the request for KV matching after a failure/preemption.
         if matches!(self.state, SlotState::Onboarding(_)) {
-            tracing::warn!(
+            tracing::debug!(
                 request_id = %self.request_id,
                 current_position = self.current_position,
-                device_blocks = self.device_blocks.len(),
                 num_computed_tokens = num_computed_tokens,
-                "Detected Onboarding state in apply_scheduler_output - recovering from failed transfer"
+                "Onboarding state in apply_scheduler_output - transitioning to normal execution"
             );
-            // Reset slot state for retry.
-            // Do not clear device_blocks
-            self.current_position = 0;
-            self.evaluated_blocks = 0;
-            self.tokens_cached_from_device = 0;
-            self.tokens_cached_from_host = 0;
-            self.tokens_cached_from_disk = 0;
-            self.tokens_cached_from_g4 = 0;
-            self.performed_cache_lookup = false;
-            self.total_blocks_queried = 0;
-            self.skip_g4_on_retry = true;
-            self.recovered_from_failed_transfer = true;
-            self.pending_operations.take();
-            self.attempted_g4_hashes.take();
+            self.onboarding_started_at = None;
         }
 
         if !tokens.is_empty() {
@@ -965,30 +1030,37 @@ impl Slot for VllmConnectorSlot {
             );
         }
 
-        // Check if there are any pending operations
-        let has_pending_ops = self
+        // Check if there are any pending operations (not yet dispatched to worker)
+        let pending_count = self
             .pending_operations
             .as_ref()
-            .map(|ops| !ops.is_empty())
-            .unwrap_or(false);
+            .map(|ops| ops.len())
+            .unwrap_or(0);
 
-        if has_pending_ops {
-            // There are pending operations - need to wait for them to complete
+        // Check if there are any dispatched operations (sent to worker, not yet confirmed complete).
+        // `pending_operations` is drained by `build_connector_metadata` via `take_pending_operations()`
+        // well before `request_finished` fires, so without this check the slot would always
+        // transition to `Finished` even when the worker is still processing transfers.
+        let has_inflight_ops = pending_count > 0 || self.dispatched_operations_count > 0;
+
+        if has_inflight_ops {
+            // There are pending or in-flight operations - need to wait for them to complete
             self.state = SlotState::Finishing;
             tracing::debug!(
                 request_id = %self.request_id,
-                pending_operations = self.pending_operations.as_ref().unwrap().len(),
-                "request set to finish (with pending operations): cached_gpu_tokens: {}; cached_host_tokens: {}; cached_disk_tokens: {}",
+                pending_operations = pending_count,
+                dispatched_operations = self.dispatched_operations_count,
+                "request set to finish (with in-flight operations): cached_gpu_tokens: {}; cached_host_tokens: {}; cached_disk_tokens: {}",
                 self.tokens_cached_from_device,
                 self.tokens_cached_from_host,
                 self.tokens_cached_from_disk
             );
         } else {
-            // No pending operations - can immediately mark as finished
+            // No pending or in-flight operations - can immediately mark as finished
             self.state = SlotState::Finished;
             tracing::debug!(
                 request_id = %self.request_id,
-                "request set to finished (no pending operations): cached_gpu_tokens: {}; cached_host_tokens: {}; cached_disk_tokens: {}",
+                "request set to finished (no in-flight operations): cached_gpu_tokens: {}; cached_host_tokens: {}; cached_disk_tokens: {}",
                 self.tokens_cached_from_device,
                 self.tokens_cached_from_host,
                 self.tokens_cached_from_disk
@@ -1010,7 +1082,11 @@ impl Slot for VllmConnectorSlot {
     }
 
     fn take_pending_operations(&mut self) -> Option<Vec<WorkerTransferRequest>> {
-        self.pending_operations.take()
+        let ops = self.pending_operations.take();
+        if let Some(ref ops) = ops {
+            self.dispatched_operations_count += ops.len();
+        }
+        ops
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
@@ -1020,8 +1096,27 @@ impl Slot for VllmConnectorSlot {
             return Ok(());
         }
 
-        // Handle recovery from failed onboard - vLLM rescheduled the request
+        // Handle recovery from failed onboard - vLLM rescheduled the request.
+        // Same timeout logic as apply_scheduler_output: don't kill in-flight G4 transfers.
         if matches!(self.state(), SlotState::Onboarding(_)) {
+            let elapsed = self
+                .onboarding_started_at
+                .map(|t| t.elapsed())
+                .unwrap_or(Duration::ZERO);
+
+            if elapsed < *G4_TRANSFER_TIMEOUT {
+                // Transfer still in progress -- skip the lookup and let it run.
+                tracing::debug!(
+                    target: "kvbm-g4",
+                    request_id = %self.request_id,
+                    elapsed_ms = elapsed.as_millis(),
+                    timeout_secs = G4_TRANSFER_TIMEOUT.as_secs(),
+                    "Onboarding still in progress, skipping acquire_local_matches"
+                );
+                return Ok(());
+            }
+
+            // Transfer exceeded timeout -- genuine failure, recover.
             // Remove stale G4 hashes from registry to prevent other workers from hitting the same error
             if let Some(stale_hash_positions) = self.attempted_g4_hashes.take() {
                 tracing::warn!(
@@ -1029,7 +1124,8 @@ impl Slot for VllmConnectorSlot {
                     request_id = %self.request_id,
                     num_stale_hashes = stale_hash_positions.len(),
                     stale_hash_positions = ?stale_hash_positions,
-                    "onboard failed - removing stale hashes from registry"
+                    elapsed_ms = elapsed.as_millis(),
+                    "onboard timed out - removing stale hashes from registry"
                 );
 
                 // Remove stale entries from the registry (fire-and-forget)
@@ -1049,10 +1145,12 @@ impl Slot for VllmConnectorSlot {
                 target: "kvbm-g4",
                 request_id = %self.request_id,
                 state = ?self.state(),
-                "slot in onboarding state during acquire_local_matches; recovering from failed onboard - will skip lookup on retry"
+                elapsed_ms = elapsed.as_millis(),
+                "onboard timed out in acquire_local_matches; recovering - will skip G4 on retry"
             );
             // Clean up any pending operations from the failed onboard
             let _ = self.pending_operations.take();
+            self.onboarding_started_at = None;
             // Reset slot state to allow retry - staging fields should already be None
             // since trigger_onboarding consumed them with .take()
             self.state = SlotState::Preempted;
@@ -1350,6 +1448,7 @@ impl Slot for VllmConnectorSlot {
         }
 
         self.state = SlotState::Onboarding(num_external_tokens);
+        self.onboarding_started_at = Some(Instant::now());
         self.advance_computed_position(num_external_tokens)?;
 
         Ok(())
@@ -1448,6 +1547,21 @@ impl VllmConnectorSlot {
         self.append_pending_operation(worker_req);
 
         Ok(())
+    }
+
+    /// Discard all pending operations WITHOUT counting them as dispatched.
+    /// Used when a request is cancelled mid-transfer (e.g., during onboarding) and the
+    /// operations should not prevent the slot from transitioning to `Finished`.
+    /// Unlike `take_pending_operations()` (which increments `dispatched_operations_count`),
+    /// this method simply drops the pending operations.
+    pub fn discard_pending_operations(&mut self) {
+        if let Some(ops) = self.pending_operations.take() {
+            tracing::debug!(
+                request_id = %self.request_id,
+                discarded_ops = ops.len(),
+                "Discarding pending operations (cancelled request)"
+            );
+        }
     }
 
     /// Flush blocks that were never offloaded during chunked prefill.
