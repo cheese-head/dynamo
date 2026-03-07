@@ -8,7 +8,7 @@ use transfer::*;
 use utils::{
     LeaderMetadata, RemoteTransferRequest, WorkerMetadata, ZMQ_LEADER_METADATA_MESSAGE,
     ZMQ_PING_MESSAGE, ZMQ_REMOTE_TRANSFER_MESSAGE, ZMQ_TRANSFER_BLOCKS_MESSAGE,
-    ZMQ_WORKER_METADATA_MESSAGE,
+    ZMQ_WORKER_METADATA_MESSAGE, decode_remote_transfer_message,
 };
 use zmq::*;
 
@@ -18,7 +18,7 @@ use crate::block_manager::{
         Block, layout_to_blocks, locality,
         transfer::{PoolConfig, TransferContext},
     },
-    config::RemoteTransferContext,
+    config::{RemoteStorageConfig, RemoteTransferContext},
     connector::scheduler::TransferSchedulerClient,
     layout::LayoutType,
     offload::{MAX_CONCURRENT_TRANSFERS, MAX_TRANSFER_BATCH_SIZE},
@@ -36,6 +36,15 @@ use tokio_util::sync::CancellationToken;
 
 use dynamo_runtime::utils::task::CriticalTaskExecutionHandle;
 use tokio::sync::{Mutex, RwLock, oneshot};
+
+const DEFAULT_REMOTE_TRANSFER_CONTEXT_POOL_SIZE: usize = 64;
+
+fn remote_transfer_context_pool_size() -> usize {
+    std::env::var("DYN_KVBM_REMOTE_TRANSFER_CONTEXT_POOL_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_REMOTE_TRANSFER_CONTEXT_POOL_SIZE)
+}
 
 struct WorkerState {
     ready_for_ping: AtomicBool,
@@ -280,19 +289,20 @@ async fn perform_allocation_and_build_handler(
 
     // Create remote context if we have host blocks (for bounce buffers)
     // Supports both Object storage (S3/MinIO) and Disk storage (shared filesystem)
-    let remote_context = if host_blocks.is_some() {
-        create_remote_context(transfer_context.clone(), worker_id)
+    let remote_context_pool = if host_blocks.is_some() {
+        create_remote_context_pool(transfer_context.clone(), worker_id)?
     } else {
         None
     };
 
     let handler = BlockTransferHandler::new(
+        worker_id,
         device_blocks,
         host_blocks,
         disk_blocks,
         transfer_context,
         scheduler_client,
-        remote_context,
+        remote_context_pool,
         cancel_token,
     )?;
     Ok(handler)
@@ -511,18 +521,20 @@ impl Handler for RemoteTransferDispatch {
             ));
         }
 
-        let request: RemoteTransferRequest = serde_json::from_slice(&message.data[0])?;
+        let request: RemoteTransferRequest = decode_remote_transfer_message(&message.data[0])?;
 
         let linked_span = request.traceparent.as_deref().map(|tp| {
-            dynamo_runtime::logging::make_linked_span(
+            dynamo_runtime::logging::make_linked_worker_span(
                 "kvbm.worker_remote_transfer",
                 tp,
+                handler.worker_id,
             )
         });
 
         let do_transfer = async {
             tracing::info!(
                 target: "kvbm-g4",
+                worker_id = handler.worker_id,
                 request_id = %request.request_id,
                 operation_id = %request.operation_id,
                 direction = if request.is_onboard() { "onboard" } else { "offload" },
@@ -543,11 +555,19 @@ impl Handler for RemoteTransferDispatch {
                 match handler.execute_remote_transfer(request).await {
                     Ok(()) => {
                         handle.mark_complete(Ok(())).await;
-                        tracing::info!(target: "kvbm-g4", "worker remote transfer completed successfully");
+                        tracing::info!(
+                            target: "kvbm-g4",
+                            worker_id = handler.worker_id,
+                            "worker remote transfer completed successfully"
+                        );
                     }
                     Err(e) => {
                         handle.mark_complete(Err(anyhow::anyhow!("{}", e))).await;
-                        tracing::error!(target: "kvbm-g4", "worker remote transfer failed: {e:#}");
+                        tracing::error!(
+                            target: "kvbm-g4",
+                            worker_id = handler.worker_id,
+                            "worker remote transfer failed: {e:#}"
+                        );
                     }
                 }
             } else {
@@ -987,11 +1007,7 @@ impl KvbmWorker {
 /// - If only bucket is set -> object storage
 /// - If only disk path is set -> disk storage
 /// - If both are set -> object storage (unless explicitly overridden)
-fn create_remote_context(
-    transfer_context: Arc<crate::block_manager::block::transfer::TransferContext>,
-    worker_id: usize,
-) -> Option<Arc<RemoteTransferContext>> {
-    use crate::block_manager::config::RemoteStorageConfig;
+fn remote_storage_config(worker_id: usize) -> Option<RemoteStorageConfig> {
     use std::fs;
 
     // Get storage type preference
@@ -1036,10 +1052,8 @@ fn create_remote_context(
         DISK_FLAG_GDS_WRITE | DISK_FLAG_GDS_READ
     };
 
-    // Determine storage config based on type and available settings
-    let storage_config: Option<RemoteStorageConfig> = match storage_type.as_str() {
+    match storage_type.as_str() {
         "disk" => {
-            // Explicit disk selection
             if let Some(path) = disk_path {
                 tracing::info!(
                     worker_id = worker_id,
@@ -1069,7 +1083,6 @@ fn create_remote_context(
             }
         }
         "object" => {
-            // Explicit object selection
             tracing::info!(
                 worker_id = worker_id,
                 bucket = ?bucket,
@@ -1082,77 +1095,100 @@ fn create_remote_context(
                 region: object_region,
             })
         }
-        _ => {
-            // Auto-detect based on which env vars are set
-            match (&bucket, &disk_path) {
-                (Some(_), Some(path)) => {
-                    // Both configured - prefer object (can be overridden with explicit type)
-                    tracing::info!(
-                        worker_id = worker_id,
-                        bucket = ?bucket,
-                        disk_path = %path,
-                        "Both object and disk storage configured, defaulting to object"
-                    );
-                    Some(RemoteStorageConfig::Object {
-                        default_bucket: bucket,
-                        endpoint: object_endpoint,
-                        region: object_region,
-                    })
-                }
-                (Some(_), None) => {
-                    // Only object configured
-                    tracing::info!(
-                        worker_id = worker_id,
-                        bucket = ?bucket,
-                        endpoint = ?object_endpoint,
-                        "Creating remote context for object storage (auto-detected)"
-                    );
-                    Some(RemoteStorageConfig::Object {
-                        default_bucket: bucket,
-                        endpoint: object_endpoint,
-                        region: object_region,
-                    })
-                }
-                (None, Some(path)) => {
-                    // Only disk configured
-                    tracing::info!(
+        _ => match (&bucket, &disk_path) {
+            (Some(_), Some(path)) => {
+                tracing::info!(
+                    worker_id = worker_id,
+                    bucket = ?bucket,
+                    disk_path = %path,
+                    "Both object and disk storage configured, defaulting to object"
+                );
+                Some(RemoteStorageConfig::Object {
+                    default_bucket: bucket,
+                    endpoint: object_endpoint,
+                    region: object_region,
+                })
+            }
+            (Some(_), None) => {
+                tracing::info!(
+                    worker_id = worker_id,
+                    bucket = ?bucket,
+                    endpoint = ?object_endpoint,
+                    "Creating remote context for object storage (auto-detected)"
+                );
+                Some(RemoteStorageConfig::Object {
+                    default_bucket: bucket,
+                    endpoint: object_endpoint,
+                    region: object_region,
+                })
+            }
+            (None, Some(path)) => {
+                tracing::info!(
+                    worker_id = worker_id,
+                    base_path = %path,
+                    use_gds = disk_use_gds,
+                    "Creating remote context for disk storage (auto-detected)"
+                );
+
+                if let Err(e) = fs::create_dir_all(&path) {
+                    tracing::warn!(
                         worker_id = worker_id,
                         base_path = %path,
-                        use_gds = disk_use_gds,
-                        "Creating remote context for disk storage (auto-detected)"
+                        error = %e,
+                        "Failed to create remote disk base path; remote transfers may fail"
                     );
-
-                    if let Err(e) = fs::create_dir_all(&path) {
-                        tracing::warn!(
-                            worker_id = worker_id,
-                            base_path = %path,
-                            error = %e,
-                            "Failed to create remote disk base path; remote transfers may fail"
-                        );
-                    }
-
-                    Some(RemoteStorageConfig::Disk {
-                        base_path: path.clone(),
-                        transfer_flags: disk_flags,
-                    })
                 }
-                (None, None) => {
-                    // No remote storage configured
-                    tracing::debug!(
-                        worker_id = worker_id,
-                        "No remote storage configured (set DYN_KVBM_OBJECT_BUCKET or DYN_KVBM_REMOTE_DISK_PATH)"
-                    );
-                    None
-                }
+
+                Some(RemoteStorageConfig::Disk {
+                    base_path: path.clone(),
+                    transfer_flags: disk_flags,
+                })
             }
-        }
+            (None, None) => {
+                tracing::debug!(
+                    worker_id = worker_id,
+                    "No remote storage configured (set DYN_KVBM_OBJECT_BUCKET or DYN_KVBM_REMOTE_DISK_PATH)"
+                );
+                None
+            }
+        },
+    }
+}
+
+fn create_remote_context_pool(
+    transfer_context: Arc<crate::block_manager::block::transfer::TransferContext>,
+    worker_id: usize,
+) -> anyhow::Result<Option<Arc<RemoteTransferContextPool>>> {
+    let Some(storage_config) = remote_storage_config(worker_id) else {
+        return Ok(None);
     };
 
-    storage_config.map(|config| {
-        Arc::new(
-            RemoteTransferContext::new(transfer_context, config).with_worker_id(worker_id as u64),
-        )
-    })
+    let nixl_agent = transfer_context.nixl_agent();
+    let async_rt_handle = transfer_context.async_rt_handle().clone();
+    let cuda_context = transfer_context.stream().context().clone();
+    let pool_size = remote_transfer_context_pool_size();
+
+    let mut contexts = Vec::with_capacity(pool_size);
+    for _ in 0..pool_size {
+        let base = Arc::new(TransferContext::new(
+            nixl_agent.clone(),
+            cuda_context.new_stream()?,
+            async_rt_handle.clone(),
+            None,
+        )?);
+        contexts.push(Arc::new(
+            RemoteTransferContext::new(base, storage_config.clone())
+                .with_worker_id(worker_id as u64),
+        ));
+    }
+
+    tracing::info!(
+        worker_id = worker_id,
+        pool_size = pool_size,
+        "Created remote transfer context pool"
+    );
+
+    Ok(Some(Arc::new(RemoteTransferContextPool::new(contexts))))
 }
 
 impl Drop for KvbmWorker {

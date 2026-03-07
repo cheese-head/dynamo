@@ -27,6 +27,7 @@ interface GanttState {
   loadResponses: () => Promise<void>;
   zoomAt: (frac: number, factor: number) => void;
   pan: (deltaNsFrac: number) => void;
+  scrollToFrac: (frac: number) => void;
   resetZoom: () => void;
   brushZoom: (fracLo: number, fracHi: number) => void;
   setHover: (data: HoverData | null) => void;
@@ -136,6 +137,17 @@ export const useGanttStore = create<GanttState>()((set, get) => ({
     if (nMin < dataMinNs - margin) { nMin = dataMinNs - margin; nMax = nMin + dur; }
     if (nMax > dataMaxNs + margin) { nMax = dataMaxNs + margin; nMin = nMax - dur; }
     set({ viewMin: nMin, viewMax: nMax });
+  },
+
+  scrollToFrac(frac) {
+    const { viewMin, viewMax, dataMinNs, dataMaxNs } = get();
+    const viewDur = viewMax - viewMin;
+    const dataDur = dataMaxNs - dataMinNs;
+    const available = dataDur - viewDur;
+    if (available <= 0n) return;
+    const clamped = Math.max(0, Math.min(1, frac));
+    const start = dataMinNs + BigInt(Math.round(Number(available) * clamped));
+    set({ viewMin: start, viewMax: start + viewDur });
   },
 
   resetZoom() {

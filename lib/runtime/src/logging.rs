@@ -136,6 +136,12 @@ fn otlp_exporter_enabled() -> bool {
     env_is_truthy(env_logging::otlp::OTEL_EXPORT_ENABLED)
 }
 
+/// Public helper for callers that want to avoid constructing tracing spans
+/// in hot paths when OTEL exporting is disabled.
+pub fn otel_export_enabled() -> bool {
+    otlp_exporter_enabled()
+}
+
 /// Get the service name from environment or use default
 fn get_service_name() -> String {
     std::env::var(env_logging::otlp::OTEL_SERVICE_NAME)
@@ -441,6 +447,10 @@ pub fn make_handle_payload_span_from_tcp_headers(
 /// Use this to continue a trace across async boundaries (channels, ZMQ, etc.)
 /// where automatic span propagation doesn't work.
 pub fn make_linked_span(span_name: &'static str, traceparent: &str) -> Span {
+    if !otel_export_enabled() {
+        return Span::none();
+    }
+
     let (trace_id, parent_id) = parse_traceparent(traceparent);
     let mut headers = std::collections::HashMap::new();
     headers.insert("traceparent".to_string(), traceparent.to_string());
@@ -457,6 +467,45 @@ pub fn make_linked_span(span_name: &'static str, traceparent: &str) -> Span {
         tracing::info_span!(
             "linked_transfer",
             otel.name = span_name,
+        )
+    };
+
+    if let Some(context) = otel_context {
+        let _ = span.set_parent(context);
+    }
+
+    span
+}
+
+/// Create a linked tracing span and annotate it with a worker identifier so
+/// multi-worker traces can be distinguished directly in Tempo.
+pub fn make_linked_worker_span(
+    span_name: &'static str,
+    traceparent: &str,
+    worker_id: usize,
+) -> Span {
+    if !otel_export_enabled() {
+        return Span::none();
+    }
+
+    let (trace_id, parent_id) = parse_traceparent(traceparent);
+    let mut headers = std::collections::HashMap::new();
+    headers.insert("traceparent".to_string(), traceparent.to_string());
+    let (otel_context, _, _) = extract_otel_context_from_tcp_headers(&headers);
+
+    let span = if let (Some(tid), Some(pid)) = (trace_id.as_ref(), parent_id.as_ref()) {
+        tracing::info_span!(
+            "linked_transfer",
+            otel.name = span_name,
+            trace_id = tid.as_str(),
+            parent_id = pid.as_str(),
+            worker_id = worker_id,
+        )
+    } else {
+        tracing::info_span!(
+            "linked_transfer",
+            otel.name = span_name,
+            worker_id = worker_id,
         )
     };
 

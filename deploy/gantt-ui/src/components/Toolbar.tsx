@@ -41,7 +41,6 @@ export function Toolbar() {
   }, [auto, refresh]);
 
   const totalSpans = traceRows.reduce((n, r) => n + r.spans.length, 0);
-
   return (
     <div className="flex-shrink-0 border-b border-border bg-surface">
       {/* top row */}
@@ -127,6 +126,7 @@ export function Toolbar() {
           )}
         </div>
       </div>
+
     </div>
   );
 }

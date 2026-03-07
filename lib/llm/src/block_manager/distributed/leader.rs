@@ -385,7 +385,7 @@ impl KvbmLeader {
             .zmq_leader
             .get()
             .ok_or_else(|| anyhow::anyhow!("ZMQ leader not ready"))?;
-        let data = vec![serde_json::to_vec(&request)?];
+        let data = vec![encode_remote_transfer_message(&request)?];
         zmq.broadcast(ZMQ_REMOTE_TRANSFER_MESSAGE, data).await
     }
 
@@ -459,7 +459,7 @@ impl KvbmLeader {
             .zmq_leader
             .get()
             .ok_or_else(|| anyhow::anyhow!("ZMQ leader not ready"))?;
-        let data = vec![serde_json::to_vec(&request)?];
+        let data = vec![encode_transfer_blocks_message(&request)?];
         zmq.broadcast(ZMQ_TRANSFER_BLOCKS_MESSAGE, data).await
     }
 

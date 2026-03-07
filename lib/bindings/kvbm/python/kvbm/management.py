@@ -287,6 +287,11 @@ class _ManagementHandler(BaseHTTPRequestHandler):
             return
 
         disabled = bool(body.get("disabled"))
+        if disabled:
+            self._send_json(400, {
+                "error": "disabling CPU lookup is no longer supported; CPU lookup must remain enabled"
+            })
+            return
         try:
             _pool_ops.set_cpu_lookup_disabled(disabled)
             status = _pool_ops.get_cpu_lookup_status()

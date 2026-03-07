@@ -877,6 +877,7 @@ mod tests {
             uuid: operation_id,
             transfer_type: TransferType::Load,
             request_type: RequestType::Immediate,
+            block_ids: vec![],
         };
         worker_client.enqueue_request(worker_request).unwrap();
         assert_eq!(worker_client.slots.get("test").unwrap().operations.len(), 1);

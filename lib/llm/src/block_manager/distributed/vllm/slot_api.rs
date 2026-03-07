@@ -94,4 +94,5 @@ pub trait Slot: std::fmt::Debug {
 pub trait ExternallyManagedDeviceSlot: Slot {
     fn advance_computed_position(&mut self, num_tokens: usize) -> Result<(), SlotError>;
     fn append_mutable_device_blocks(&mut self, block_ids: &[BlockId]) -> Result<(), SlotError>;
+    fn set_request_traceparent(&mut self, _traceparent: Option<String>) {}
 }

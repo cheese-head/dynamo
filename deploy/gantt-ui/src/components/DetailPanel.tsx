@@ -201,13 +201,17 @@ function SpansTab({ row }: { row: TraceRow }) {
           const leftPct = totalMs > 0 ? (offsetMs / totalMs) * 100 : 0;
           const widthPct = totalMs > 0 ? Math.max((span.durMs / totalMs) * 100, 0.5) : 100;
           const keyAttrs = formatKeyAttrs(span);
+          const displayName =
+            span.rawName && span.rawName !== span.name
+              ? `${span.name} [raw: ${span.rawName}]`
+              : span.name;
 
           return (
             <tr key={i} className="border-b border-border/30 hover:bg-surface-alt/50">
               <td className="py-1.5 pr-4">
                 <span className="flex items-center gap-1.5">
                   <span className="inline-block h-2 w-2 rounded-sm" style={{ backgroundColor: spanColor(span.name) }} />
-                  <span className="font-mono text-text-primary">{span.name}</span>
+                  <span className="font-mono text-text-primary">{displayName}</span>
                 </span>
               </td>
               <td className="py-1.5 pr-4 font-mono text-text-secondary">+{fmtDuration(offsetMs)}</td>

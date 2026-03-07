@@ -16,8 +16,8 @@ pub enum TransferPriority {
 
 /// Sender side of a priority queue (high + low).
 pub struct PrioritySender<T> {
-    high: mpsc::Sender<T>,
-    low: mpsc::Sender<T>,
+    high: mpsc::UnboundedSender<T>,
+    low: mpsc::UnboundedSender<T>,
 }
 
 impl<T> Clone for PrioritySender<T> {
@@ -34,10 +34,10 @@ impl<T> PrioritySender<T> {
         &self,
         priority: TransferPriority,
         value: T,
-    ) -> Result<(), mpsc::error::TrySendError<T>> {
+    ) -> Result<(), mpsc::error::SendError<T>> {
         match priority {
-            TransferPriority::High => self.high.try_send(value),
-            TransferPriority::Low => self.low.try_send(value),
+            TransferPriority::High => self.high.send(value),
+            TransferPriority::Low => self.low.send(value),
         }
     }
 
@@ -48,25 +48,25 @@ impl<T> PrioritySender<T> {
         value: T,
     ) -> Result<(), mpsc::error::SendError<T>> {
         match priority {
-            TransferPriority::High => self.high.send(value).await,
-            TransferPriority::Low => self.low.send(value).await,
+            TransferPriority::High => self.high.send(value),
+            TransferPriority::Low => self.low.send(value),
         }
     }
 }
 
 /// Receiver side of a priority queue (high + low).
 pub struct PriorityReceiver<T> {
-    high: mpsc::Receiver<T>,
-    low: mpsc::Receiver<T>,
+    high: mpsc::UnboundedReceiver<T>,
+    low: mpsc::UnboundedReceiver<T>,
 }
 
 /// Build a priority queue with independent capacities for high and low lanes.
 pub fn priority_channel<T>(
-    high_capacity: usize,
-    low_capacity: usize,
+    _high_capacity: usize,
+    _low_capacity: usize,
 ) -> (PrioritySender<T>, PriorityReceiver<T>) {
-    let (high_tx, high_rx) = mpsc::channel(high_capacity);
-    let (low_tx, low_rx) = mpsc::channel(low_capacity);
+    let (high_tx, high_rx) = mpsc::unbounded_channel();
+    let (low_tx, low_rx) = mpsc::unbounded_channel();
     (
         PrioritySender {
             high: high_tx,
@@ -83,11 +83,10 @@ pub fn priority_channel<T>(
 ///
 /// - Never blocks waiting for queue capacity.
 /// - High-priority lane is preferred over low-priority lane.
-/// - Concurrency is capped by `max_inflight`.
 pub async fn run_priority_worker<T, F, Fut>(
     cancellation_token: CancellationToken,
     mut receiver: PriorityReceiver<T>,
-    max_inflight: usize,
+    _max_inflight: usize,
     mut worker: F,
 ) where
     T: Send + 'static,
@@ -97,18 +96,6 @@ pub async fn run_priority_worker<T, F, Fut>(
     let mut join_set = JoinSet::new();
 
     loop {
-        if join_set.len() >= max_inflight {
-            tokio::select! {
-                _ = cancellation_token.cancelled() => break,
-                done = join_set.join_next() => {
-                    if let Some(Err(e)) = done {
-                        tracing::error!("priority worker join error: {:?}", e);
-                    }
-                }
-            }
-            continue;
-        }
-
         tokio::select! {
             _ = cancellation_token.cancelled() => break,
             done = join_set.join_next(), if !join_set.is_empty() => {

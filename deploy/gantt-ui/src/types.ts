@@ -1,5 +1,6 @@
 export interface Span {
   name: string;
+  rawName?: string;
   startNs: bigint;
   endNs: bigint;
   durMs: number;
@@ -12,6 +13,8 @@ export interface TraceRow {
   spans: Span[];
   minNs: bigint;
   maxNs: bigint;
+  traceStartNs: bigint;
+  traceEndNs: bigint;
   totalDurMs: number;
   attributes: Record<string, string>;
 }

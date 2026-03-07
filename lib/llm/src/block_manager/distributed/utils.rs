@@ -14,6 +14,15 @@ pub const ZMQ_WORKER_METADATA_MESSAGE: &str = "worker_metadata";
 pub const ZMQ_LEADER_METADATA_MESSAGE: &str = "leader_metadata";
 pub const ZMQ_TRANSFER_BLOCKS_MESSAGE: &str = "transfer_blocks";
 pub const ZMQ_REMOTE_TRANSFER_MESSAGE: &str = "remote_transfer";
+const WIRE_MAGIC: [u8; 4] = *b"KVBM";
+const WIRE_VERSION: u8 = 1;
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WireMessageKind {
+    TransferBlocks,
+    RemoteTransfer,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerMetadata {
@@ -53,9 +62,9 @@ pub struct BlockTransferRequest {
     pub to_pool: BlockTransferPool,
     pub blocks: Vec<(usize, usize)>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub connector_req: Option<LeaderTransferRequest>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub sequence_hashes: Option<Vec<u64>>,
 }
 
@@ -91,6 +100,51 @@ impl BlockTransferRequest {
     }
 }
 
+pub fn encode_transfer_blocks_message(request: &BlockTransferRequest) -> anyhow::Result<Vec<u8>> {
+    let payload = bincode::serde::encode_to_vec(request, bincode::config::standard())?;
+    let mut out = Vec::with_capacity(6 + payload.len());
+    out.extend_from_slice(&WIRE_MAGIC);
+    out.push(WIRE_VERSION);
+    out.push(WireMessageKind::TransferBlocks as u8);
+    out.extend_from_slice(&payload);
+    Ok(out)
+}
+
+pub fn encode_remote_transfer_message(request: &RemoteTransferRequest) -> anyhow::Result<Vec<u8>> {
+    let payload = bincode::serde::encode_to_vec(request, bincode::config::standard())?;
+    let mut out = Vec::with_capacity(6 + payload.len());
+    out.extend_from_slice(&WIRE_MAGIC);
+    out.push(WIRE_VERSION);
+    out.push(WireMessageKind::RemoteTransfer as u8);
+    out.extend_from_slice(&payload);
+    Ok(out)
+}
+
+pub fn decode_transfer_blocks_message(bytes: &[u8]) -> anyhow::Result<BlockTransferRequest> {
+    if bytes.len() >= 6 && bytes[..4] == WIRE_MAGIC {
+        let version = bytes[4];
+        let kind = bytes[5];
+        if version != WIRE_VERSION {
+            anyhow::bail!("unsupported wire version: {}", version);
+        }
+        if kind != WireMessageKind::TransferBlocks as u8 {
+            anyhow::bail!("unexpected wire message kind: {}", kind);
+        }
+        return Ok(
+            bincode::serde::decode_from_slice::<BlockTransferRequest, _>(
+                &bytes[6..],
+                bincode::config::standard(),
+            )?
+            .0,
+        );
+    }
+
+    bincode::serde::decode_from_slice::<BlockTransferRequest, _>(bytes, bincode::config::standard())
+        .map(|(request, _)| request)
+        .or_else(|_| serde_json::from_slice::<BlockTransferRequest>(bytes))
+        .map_err(|e| anyhow::anyhow!("failed to decode transfer blocks request: {}", e))
+}
+
 /// Request for remote storage transfers (G4 object storage or remote disk).
 ///
 /// This request wraps a `RemoteTransferPipeline` with tracking metadata
@@ -105,10 +159,10 @@ pub struct RemoteTransferRequest {
     /// The transfer pipeline (direction, descriptors, block IDs)
     pub pipeline: SerializableRemoteTransferPipeline,
     /// Optional connector request for completion tracking
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub connector_req: Option<LeaderTransferRequest>,
     /// W3C traceparent for propagating trace context across ZMQ boundaries
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub traceparent: Option<String>,
 }
 
@@ -327,6 +381,31 @@ impl RemoteTransferRequest {
     }
 }
 
+pub fn decode_remote_transfer_message(bytes: &[u8]) -> anyhow::Result<RemoteTransferRequest> {
+    if bytes.len() >= 6 && bytes[..4] == WIRE_MAGIC {
+        let version = bytes[4];
+        let kind = bytes[5];
+        if version != WIRE_VERSION {
+            anyhow::bail!("unsupported wire version: {}", version);
+        }
+        if kind != WireMessageKind::RemoteTransfer as u8 {
+            anyhow::bail!("unexpected wire message kind: {}", kind);
+        }
+        return Ok(
+            bincode::serde::decode_from_slice::<RemoteTransferRequest, _>(
+                &bytes[6..],
+                bincode::config::standard(),
+            )?
+            .0,
+        );
+    }
+
+    bincode::serde::decode_from_slice::<RemoteTransferRequest, _>(bytes, bincode::config::standard())
+        .map(|(request, _)| request)
+        .or_else(|_| serde_json::from_slice::<RemoteTransferRequest>(bytes))
+        .map_err(|e| anyhow::anyhow!("failed to decode remote transfer request: {}", e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,6 +497,80 @@ mod tests {
         // Verify pipeline conversion
         let restored_pipeline = restored.to_pipeline();
         assert!(restored_pipeline.has_bounce());
+    }
+
+    #[test]
+    fn test_remote_transfer_request_wire_roundtrip() {
+        let descs = vec![RemoteBlockDescriptor::object_from_hash(
+            "bucket", 0xabc, 4096,
+        )];
+        let pipeline = RemoteTransferPipeline::onboard_with_bounce(descs, vec![5], vec![15]);
+        let request =
+            RemoteTransferRequest::new("req-123".to_string(), uuid::Uuid::new_v4(), &pipeline);
+
+        let encoded = encode_remote_transfer_message(&request).unwrap();
+        assert!(encoded.len() > 6);
+        assert_eq!(&encoded[..4], b"KVBM");
+        assert_eq!(encoded[4], WIRE_VERSION);
+        assert_eq!(encoded[5], WireMessageKind::RemoteTransfer as u8);
+
+        let restored = decode_remote_transfer_message(&encoded).unwrap();
+        assert_eq!(restored.request_id, request.request_id);
+        assert_eq!(restored.operation_id, request.operation_id);
+        assert!(restored.is_onboard());
+        assert_eq!(restored.num_blocks(), 1);
+        assert!(restored.to_pipeline().has_bounce());
+    }
+
+    #[test]
+    fn test_transfer_blocks_request_wire_roundtrip() {
+        let request = BlockTransferRequest::new(
+            BlockTransferPool::Host,
+            BlockTransferPool::Device,
+            vec![(1, 2), (3, 4)],
+        );
+
+        let encoded = encode_transfer_blocks_message(&request).unwrap();
+        assert!(encoded.len() > 6);
+        assert_eq!(&encoded[..4], b"KVBM");
+        assert_eq!(encoded[4], WIRE_VERSION);
+        assert_eq!(encoded[5], WireMessageKind::TransferBlocks as u8);
+
+        let restored = decode_transfer_blocks_message(&encoded).unwrap();
+        assert_eq!(restored.from_pool, request.from_pool);
+        assert_eq!(restored.to_pool, request.to_pool);
+        assert_eq!(restored.blocks, request.blocks);
+    }
+
+    #[test]
+    fn test_remote_transfer_request_legacy_bincode_decode_still_works() {
+        let descs = vec![RemoteBlockDescriptor::object_from_hash(
+            "bucket", 0xabc, 4096,
+        )];
+        let pipeline = RemoteTransferPipeline::onboard_with_bounce(descs, vec![5], vec![15]);
+        let request =
+            RemoteTransferRequest::new("req-legacy".to_string(), uuid::Uuid::new_v4(), &pipeline);
+
+        let legacy = bincode::serde::encode_to_vec(&request, bincode::config::standard()).unwrap();
+        let restored = decode_remote_transfer_message(&legacy).unwrap();
+        assert_eq!(restored.request_id, request.request_id);
+        assert_eq!(restored.operation_id, request.operation_id);
+        assert!(restored.is_onboard());
+    }
+
+    #[test]
+    fn test_transfer_blocks_request_legacy_bincode_decode_still_works() {
+        let request = BlockTransferRequest::new(
+            BlockTransferPool::Disk,
+            BlockTransferPool::Device,
+            vec![(10, 20)],
+        );
+
+        let legacy = bincode::serde::encode_to_vec(&request, bincode::config::standard()).unwrap();
+        let restored = decode_transfer_blocks_message(&legacy).unwrap();
+        assert_eq!(restored.from_pool, request.from_pool);
+        assert_eq!(restored.to_pool, request.to_pool);
+        assert_eq!(restored.blocks, request.blocks);
     }
 
     #[test]

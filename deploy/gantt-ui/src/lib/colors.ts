@@ -1,9 +1,17 @@
 export const SPAN_COLORS: Record<string, string> = {
+  "kvbm.request_poll": "#4dabf7",
   "kvbm.get_matched_tokens": "#4dabf7",
   "kvbm.stage_local_matches": "#4dabf7",
+  "kvbm.process_remote_transfer": "#fd7e14",
+  "kvbm.remote_transfer_allocate": "#ffa94d",
+  "kvbm.remote_transfer_build_pipeline": "#fab005",
+  "kvbm.remote_transfer_dispatch": "#f08c00",
   "kvbm.r2h": "#ff922b",
   "kvbm.worker_remote_transfer": "#ff922b",
   "kvbm.remote_transfer": "#ff922b",
+  "kvbm.remote_transfer_chunked": "#ff922b",
+  "kvbm.remote_transfer_chunk_r2h": "#ff922b",
+  "kvbm.remote_transfer_chunk_h2d": "#f06595",
   "kvbm.h2d": "#f06595",
   "kvbm.update_state_after_alloc": "#20c997",
   "kvbm.trigger_onboarding": "#20c997",
@@ -24,8 +32,18 @@ export function spanColor(name: string): string {
   return SPAN_COLORS[name] ?? "#868e96";
 }
 
+export function traceColor(traceID: string): string {
+  let hash = 0;
+  for (let i = 0; i < traceID.length; i++) {
+    hash = (hash * 31 + traceID.charCodeAt(i)) | 0;
+  }
+  const hue = Math.abs(hash) % 360;
+  return `hsla(${hue}, 70%, 60%, 0.16)`;
+}
+
 export const LEGEND_ITEMS = [
   { label: "match", color: "#4dabf7" },
+  { label: "dispatch", color: "#f08c00" },
   { label: "R2H", color: "#ff922b" },
   { label: "H2D", color: "#f06595" },
   { label: "onboard", color: "#20c997" },

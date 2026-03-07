@@ -15,7 +15,7 @@ use crate::block_manager::{
 use serde::{Deserialize, Serialize};
 
 use super::{
-    ConnectorSlotManager, SlotManager, SlotState, VllmConnectorSlot,
+    ConnectorSlotManager, SlotError, SlotManager, SlotState, VllmConnectorSlot,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +130,10 @@ impl KvConnectorLeaderCore {
     /// Enter a span linked to the request's trace. Returns the guard (drop to exit).
     /// Falls back to a standalone span if no traceparent is registered.
     fn enter_request_span(&self, request_id: &str, span_name: &'static str) -> tracing::span::EnteredSpan {
+        if !dynamo_runtime::logging::otel_export_enabled() {
+            return tracing::Span::none().entered();
+        }
+
         if let Some(tp) = self.request_traces.get(request_id) {
             dynamo_runtime::logging::make_linked_span(span_name, tp).entered()
         } else {
@@ -143,10 +147,14 @@ impl KvConnectorLeaderCore {
         _request_num_tokens: usize,
         num_computed_tokens: usize,
     ) -> anyhow::Result<(Option<usize>, bool)> {
-        let _span = self.enter_request_span(&request_id, "kvbm.get_matched_tokens");
-        debug_assert!(num_computed_tokens.is_multiple_of(self.block_size));
-
         crate::lock_slot!(self, &request_id => slot);
+        slot.set_request_traceparent(self.request_traceparent(&request_id).map(str::to_string));
+        let _span = slot
+            .as_any_mut()
+            .downcast_mut::<VllmConnectorSlot>()
+            .map(|s| s.request_poll_span().entered())
+            .unwrap_or_else(|| self.enter_request_span(&request_id, "kvbm.request_poll"));
+        debug_assert!(num_computed_tokens.is_multiple_of(self.block_size));
 
         debug_assert!(
             slot.state() != SlotState::Prefilling && slot.state() != SlotState::Decoding,
@@ -182,7 +190,34 @@ impl KvConnectorLeaderCore {
             return Ok((None, false));
         }
 
+        if slot
+            .as_any_mut()
+            .downcast_mut::<VllmConnectorSlot>()
+            .map(|s| s.has_pending_g4_prefetch())
+            .unwrap_or(false)
+        {
+            tracing::debug!(
+                target: "kvbm-g4",
+                request_id = %request_id,
+                "host prefetch still pending; deferring matched-token return"
+            );
+            return Ok((None, false));
+        }
+
         if let SlotState::OnboardStaged(num_external_tokens) = slot.state() {
+            let staged_report = slot
+                .as_any_mut()
+                .downcast_mut::<VllmConnectorSlot>()
+                .and_then(|s| s.staged_match_report());
+            if staged_report.is_none() {
+                tracing::debug!(
+                    target: "kvbm-diag",
+                    request_id = %request_id,
+                    num_external_tokens,
+                    "get_num_new_matched_tokens → OnboardStaged without a pending report; waiting for allocation"
+                );
+                return Ok((None, false));
+            }
             debug_assert!(
                 (num_computed_tokens + num_external_tokens).is_multiple_of(self.block_size)
             );
@@ -211,9 +246,36 @@ impl KvConnectorLeaderCore {
     ) -> anyhow::Result<()> {
         let _span = self.enter_request_span(&request_id, "kvbm.update_state_after_alloc");
         crate::lock_slot!(self, &request_id => slot);
+        slot.set_request_traceparent(self.request_traceparent(&request_id).map(str::to_string));
         slot.append_mutable_device_blocks(&block_ids)?;
 
         if num_external_tokens > 0 {
+            let prefetched_host_ready = slot
+                .as_any_mut()
+                .downcast_mut::<VllmConnectorSlot>()
+                .map(|s| -> Result<bool, SlotError> {
+                    if s.try_stage_prefetched_host_matches()? {
+                        return Ok(true);
+                    }
+                    Ok(s.has_staged_host_blocks())
+                })
+                .transpose()?
+                .unwrap_or(false);
+            if !prefetched_host_ready {
+                anyhow::bail!(
+                    "external tokens were reported before host-prefetch became CPU-ready for request {}",
+                    request_id
+                );
+            }
+            if let Some(slot) = slot.as_any_mut().downcast_mut::<VllmConnectorSlot>() {
+                slot.clear_staged_match_report();
+            }
+            tracing::info!(
+                target: "kvbm-diag",
+                request_id = %request_id,
+                num_external_tokens,
+                "update_state_after_alloc → using prefetched host blocks"
+            );
             let num_computed_tokens = block_ids.len() * self.block_size - num_external_tokens;
             tracing::info!(
                 target: "kvbm-diag",
@@ -247,6 +309,14 @@ impl KvConnectorLeaderCore {
             let to_clean: Vec<String> = self.finishing_requests.drain().collect();
             for request_id in &to_clean {
                 if self.slot_manager().has_slot(request_id) {
+                    {
+                        crate::lock_slot!(self, request_id => slot);
+                        if let Some(vllm_slot) =
+                            slot.as_any_mut().downcast_mut::<VllmConnectorSlot>()
+                        {
+                            let _ = vllm_slot.release_prefetched_host_blocks();
+                        }
+                    }
                     let _ = self.slot_manager().remove_slot(request_id);
                 }
             }
@@ -378,12 +448,18 @@ impl KvConnectorLeaderCore {
 
         match slot.state() {
             SlotState::Finished => {
+                if let Some(vllm_slot) = slot.as_any_mut().downcast_mut::<VllmConnectorSlot>() {
+                    vllm_slot.release_prefetched_host_blocks()?;
+                }
                 self.slot_manager().remove_slot(&request_id)?;
             }
             SlotState::Finishing => {
                 self.finishing_requests.insert(request_id);
             }
             _ => {
+                if let Some(vllm_slot) = slot.as_any_mut().downcast_mut::<VllmConnectorSlot>() {
+                    vllm_slot.release_prefetched_host_blocks()?;
+                }
                 self.slot_manager().remove_slot(&request_id)?;
             }
         }
@@ -414,9 +490,11 @@ impl KvConnectorLeaderCore {
             let _guard = root_span.entered();
             if let Some(ctx) = dynamo_runtime::logging::get_distributed_tracing_context() {
                 self.request_traces
-                    .insert(request_id, ctx.create_traceparent());
+                    .insert(request_id.clone(), ctx.create_traceparent());
             }
         }
+        crate::lock_slot!(self, &request_id => slot);
+        slot.set_request_traceparent(self.request_traceparent(&request_id).map(str::to_string));
         Ok(())
     }
 

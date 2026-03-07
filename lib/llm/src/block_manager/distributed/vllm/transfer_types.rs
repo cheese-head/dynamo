@@ -80,6 +80,7 @@ pub struct LocalOffloadRequest {
     pub operation_id: uuid::Uuid,
     pub sequence_hashes: Vec<u64>,
     pub block_size: usize,
+    pub traceparent: Option<String>,
 }
 
 impl LocalOffloadRequest {
@@ -90,6 +91,7 @@ impl LocalOffloadRequest {
         priorities: Vec<u32>,
         operation_id: uuid::Uuid,
         block_size: usize,
+        traceparent: Option<String>,
     ) -> Self {
         debug_assert!(block_ids.len() == token_blocks.len());
         debug_assert!(block_ids.len() == priorities.len());
@@ -102,6 +104,7 @@ impl LocalOffloadRequest {
             operation_id,
             sequence_hashes,
             block_size,
+            traceparent,
         }
     }
 }
@@ -145,9 +148,10 @@ pub struct RemoteTransferRequest {
 }
 
 impl RemoteTransferRequest {
-    pub fn from_g4_params(params: &super::integration::G4OnboardParams) -> Self {
-        let traceparent = dynamo_runtime::logging::get_distributed_tracing_context()
-            .map(|ctx| ctx.create_traceparent());
+    pub fn from_g4_params(
+        params: &super::integration::G4OnboardParams,
+        traceparent: Option<String>,
+    ) -> Self {
         Self {
             request_id: params.request_id.clone(),
             sequence_hashes: params.sequence_hashes.clone(),
@@ -169,10 +173,9 @@ impl RemoteTransferRequest {
         operation_id: uuid::Uuid,
         block_size: usize,
         pin_id: uuid::Uuid,
+        traceparent: Option<String>,
     ) -> Self {
         debug_assert!(sequence_hashes.len() == host_block_ids.len());
-        let traceparent = dynamo_runtime::logging::get_distributed_tracing_context()
-            .map(|ctx| ctx.create_traceparent());
         Self {
             request_id,
             sequence_hashes,
@@ -200,4 +203,5 @@ pub struct DrainItem {
     pub host_block_ids: Vec<BlockId>,
     pub pin_guard: PinGuard,
     pub block_size: usize,
+    pub traceparent: Option<String>,
 }

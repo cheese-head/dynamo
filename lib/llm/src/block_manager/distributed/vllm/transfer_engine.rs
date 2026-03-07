@@ -7,8 +7,9 @@ use dynamo_runtime::config::environment_names::kvbm::remote_storage as env_g4;
 use dynamo_runtime::utils::task::CriticalTaskExecutionHandle;
 use once_cell::sync::Lazy;
 use tokio::{runtime::Handle, sync::mpsc};
-use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use crate::block_manager::{
     BasicMetadata, BlockMetadata, BlockPool, NixlRegisterableStorage, Storage,
@@ -30,19 +31,11 @@ use super::{DrainItem, LocalOffloadRequest, LocalOnboardRequest, LocalTransferRe
 type VllmBlockManager =
     KvBlockManager<Logical<DistributedLeaderWorkerResources>, BasicMetadata>;
 
-const DEFAULT_MAX_CONCURRENT_H2R: usize = 8;
 const DEFAULT_DRAIN_QUEUE_CAP: usize = 512;
 const DEFAULT_MAX_REMOTE_INFLIGHT: usize = 64;
 const DEFAULT_REMOTE_HIGH_QUEUE_CAP: usize = 256;
 const DEFAULT_REMOTE_LOW_QUEUE_CAP: usize = 512;
 const DEFAULT_G4_TRANSFER_TIMEOUT_SECS: u64 = 30;
-
-static MAX_CONCURRENT_H2R: Lazy<usize> = Lazy::new(|| {
-    std::env::var(env_g4::DYN_KVBM_G4_MAX_CONCURRENT_H2R)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_MAX_CONCURRENT_H2R)
-});
 
 static G4_TRANSFER_TIMEOUT: Lazy<std::time::Duration> = Lazy::new(|| {
     let secs: u64 = std::env::var(env_g4::DYN_KVBM_G4_TRANSFER_TIMEOUT_SECS)
@@ -112,13 +105,11 @@ impl LocalTransferEngine {
             *REMOTE_HIGH_QUEUE_CAP,
             *REMOTE_LOW_QUEUE_CAP,
         );
-        let (drain_tx, mut drain_rx) = mpsc::channel::<DrainItem>(*DRAIN_QUEUE_CAP);
+        let (drain_tx, mut drain_rx) = mpsc::unbounded_channel::<DrainItem>();
 
         let pin_registry = PinRegistry::new();
         let pin_registry_drain = pin_registry.clone();
         let pin_registry_remote = pin_registry.clone();
-        let h2r_semaphore = Arc::new(Semaphore::new(*MAX_CONCURRENT_H2R));
-        let h2r_semaphore_remote = h2r_semaphore.clone();
 
         let block_manager_offload = self.block_manager.clone();
         let block_manager_remote = self.block_manager.clone();
@@ -134,15 +125,36 @@ impl LocalTransferEngine {
 
         let onboard_task = CriticalTaskExecutionHandle::new_with_runtime(
             |cancellation_token_onboard| async move {
-                while let Some(req) = onboard_rx.recv().await {
-                    if cancellation_token_onboard.is_cancelled() {
-                        break;
+                let mut join_set = JoinSet::new();
+
+                loop {
+                    tokio::select! {
+                        _ = cancellation_token_onboard.cancelled() => break,
+                        done = join_set.join_next(), if !join_set.is_empty() => {
+                            if let Some(Err(e)) = done {
+                                tracing::error!("LocalOnboardTask join error: {:?}", e);
+                            }
+                        }
+                        req = onboard_rx.recv() => {
+                            match req {
+                                Some(req) => {
+                                    let leader = Arc::clone(&leader_onboard);
+                                    let metrics = kvbm_metrics_onboard.clone();
+                                    join_set.spawn(async move {
+                                        if let Err(e) = process_onboard_request(req, &leader, metrics).await {
+                                            tracing::error!("LocalOnboardTask error: {:?}", e);
+                                        }
+                                    });
+                                }
+                                None => break,
+                            }
+                        }
                     }
-                    if let Err(e) =
-                        process_onboard_request(req, &leader_onboard, kvbm_metrics_onboard.clone())
-                            .await
-                    {
-                        tracing::error!("LocalOnboardTask error: {:?}", e);
+                }
+
+                while let Some(done) = join_set.join_next().await {
+                    if let Err(e) = done {
+                        tracing::error!("LocalOnboardTask join error: {:?}", e);
                     }
                 }
                 Ok(())
@@ -155,42 +167,65 @@ impl LocalTransferEngine {
 
         let offload_task = CriticalTaskExecutionHandle::new_with_runtime(
             |cancellation_token_offload| async move {
-                while let Some(req) = offload_rx.recv().await {
-                    if cancellation_token_offload.is_cancelled() {
-                        break;
-                    }
+                let mut join_set = JoinSet::new();
 
-                    let request_id = req.request_id.clone();
-                    let operation_id = req.operation_id;
-
-                    if let Err(e) = process_offload_request(
-                        req,
-                        &block_manager_offload,
-                        &leader_offload,
-                        kvbm_metrics_offload.clone(),
-                        &drain_tx_for_offload,
-                    )
-                    .await
-                    {
-                        tracing::error!("LocalOffloadTask error: {:?}", e);
-                        let fake_xfer = BlockTransferRequest {
-                            from_pool: BlockTransferPool::Device,
-                            to_pool: BlockTransferPool::Host,
-                            blocks: vec![],
-                            connector_req: Some(LeaderTransferRequest {
-                                request_id: request_id.clone(),
-                                uuid: operation_id,
-                                requirement: None,
-                                request_type: RequestType::Immediate,
-                                chained: false,
-                            }),
-                            sequence_hashes: None,
-                        };
-                        if let Ok(notify_receiver) =
-                            leader_offload.transfer_blocks_request(fake_xfer).await
-                        {
-                            let _ = notify_receiver.await;
+                loop {
+                    tokio::select! {
+                        _ = cancellation_token_offload.cancelled() => break,
+                        done = join_set.join_next(), if !join_set.is_empty() => {
+                            if let Some(Err(e)) = done {
+                                tracing::error!("LocalOffloadTask join error: {:?}", e);
+                            }
                         }
+                        req = offload_rx.recv() => {
+                            match req {
+                                Some(req) => {
+                                    let request_id = req.request_id.clone();
+                                    let operation_id = req.operation_id;
+                                    let block_manager = block_manager_offload.clone();
+                                    let leader = Arc::clone(&leader_offload);
+                                    let metrics = kvbm_metrics_offload.clone();
+                                    let drain_tx = drain_tx_for_offload.clone();
+
+                                    join_set.spawn(async move {
+                                        if let Err(e) = process_offload_request(
+                                            req,
+                                            &block_manager,
+                                            &leader,
+                                            metrics,
+                                            &drain_tx,
+                                        )
+                                        .await
+                                        {
+                                            tracing::error!("LocalOffloadTask error: {:?}", e);
+                                            let fake_xfer = BlockTransferRequest {
+                                                from_pool: BlockTransferPool::Device,
+                                                to_pool: BlockTransferPool::Host,
+                                                blocks: vec![],
+                                                connector_req: Some(LeaderTransferRequest {
+                                                    request_id: request_id.clone(),
+                                                    uuid: operation_id,
+                                                    requirement: None,
+                                                    request_type: RequestType::Immediate,
+                                                    chained: false,
+                                                }),
+                                                sequence_hashes: None,
+                                            };
+                                            if let Ok(notify_receiver) = leader.transfer_blocks_request(fake_xfer).await {
+                                                let _ = notify_receiver.await;
+                                            }
+                                        }
+                                    });
+                                }
+                                None => break,
+                            }
+                        }
+                    }
+                }
+
+                while let Some(done) = join_set.join_next().await {
+                    if let Err(e) = done {
+                        tracing::error!("LocalOffloadTask join error: {:?}", e);
                     }
                 }
                 Ok(())
@@ -212,7 +247,6 @@ impl LocalTransferEngine {
                         let leader = Arc::clone(&leader_remote);
                         let metrics = kvbm_metrics_remote.clone();
                         let pin_reg = pin_registry_remote.clone();
-                        let semaphore = h2r_semaphore_remote.clone();
                         async move {
                             if let Err(e) = process_remote_transfer_request(
                                 req,
@@ -220,7 +254,6 @@ impl LocalTransferEngine {
                                 &leader,
                                 metrics,
                                 &pin_reg,
-                                &semaphore,
                             )
                             .await
                             {
@@ -246,11 +279,6 @@ impl LocalTransferEngine {
                         item = drain_rx.recv() => match item { Some(item) => item, None => break }
                     };
 
-                    let _permit = match h2r_semaphore.clone().try_acquire_owned() {
-                        Ok(p) => p,
-                        Err(_) => continue,
-                    };
-
                     let h2o_operation_id = uuid::Uuid::new_v4();
                     pin_registry_drain.insert(h2o_operation_id, item.pin_guard);
 
@@ -261,17 +289,17 @@ impl LocalTransferEngine {
                         h2o_operation_id,
                         item.block_size,
                         h2o_operation_id,
+                        item.traceparent,
                     );
 
-                    match remote_tx_for_drain.try_send(TransferPriority::Low, h2o_req) {
-                        Ok(()) => {}
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(_))
-                        | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                            pin_registry_drain.remove(&h2o_operation_id);
-                            continue;
-                        }
+                    if remote_tx_for_drain
+                        .send(TransferPriority::Low, h2o_req)
+                        .await
+                        .is_err()
+                    {
+                        pin_registry_drain.remove(&h2o_operation_id);
+                        continue;
                     }
-                    std::mem::forget(_permit);
                 }
                 Ok(())
             },
@@ -292,7 +320,7 @@ impl LocalTransferEngine {
                             if remote_req.is_onboard {
                                 let _ = remote_tx.send(TransferPriority::High, remote_req).await;
                             } else {
-                                let _ = remote_tx.try_send(TransferPriority::Low, remote_req);
+                                let _ = remote_tx.send(TransferPriority::Low, remote_req).await;
                             }
                         }
                         None => break,
@@ -327,7 +355,7 @@ async fn process_offload_request(
     block_manager: &VllmBlockManager,
     leader: &Arc<KvbmLeader>,
     kvbm_metrics: KvbmMetrics,
-    drain_tx: &mpsc::Sender<DrainItem>,
+    drain_tx: &mpsc::UnboundedSender<DrainItem>,
 ) -> anyhow::Result<()> {
     let request_id = offload_req.request_id.clone();
     let operation_id = offload_req.operation_id;
@@ -376,14 +404,16 @@ async fn process_offload_to_storage<S, L, M>(
     _request_id: &str,
     _operation_id: &uuid::Uuid,
     _storage_name: &str,
-    drain_tx: Option<&mpsc::Sender<DrainItem>>,
+    drain_tx: Option<&mpsc::UnboundedSender<DrainItem>>,
 ) -> anyhow::Result<()>
 where
     S: Storage + NixlRegisterableStorage + 'static,
     L: LocalityProvider + 'static,
     M: BlockMetadata + 'static,
 {
-    let blocks = storage_pool.allocate_blocks(offload_req.block_ids.len()).await?;
+    let blocks = tokio::task::block_in_place(|| {
+        storage_pool.allocate_blocks_blocking(offload_req.block_ids.len())
+    })?;
     let token_blocks = offload_req.token_blocks;
     let allocated_block_ids: Vec<usize> = blocks.iter().map(|b| b.block_id()).collect();
     let block_pairs: Vec<(usize, usize)> = offload_req
@@ -442,8 +472,9 @@ where
                 host_block_ids,
                 pin_guard,
                 block_size: offload_req.block_size,
+                traceparent: offload_req.traceparent.clone(),
             };
-            let _ = drain_tx.try_send(item);
+            let _ = drain_tx.send(item);
             return Ok(());
         }
     }
@@ -512,73 +543,37 @@ async fn process_remote_transfer_request(
     leader: &Arc<KvbmLeader>,
     kvbm_metrics: KvbmMetrics,
     pin_registry: &PinRegistry,
-    h2o_semaphore: &Arc<Semaphore>,
 ) -> anyhow::Result<()> {
     let request_id = &req.request_id;
     let operation_id = &req.operation_id;
     let pin_id = req.pin_id;
-    let is_h2o = req.is_h2o();
     let onboard_token_blocks = req.token_blocks.clone();
+    let process_span = req
+        .traceparent
+        .as_deref()
+        .map(|tp| dynamo_runtime::logging::make_linked_span("kvbm.process_remote_transfer", tp))
+        .unwrap_or_else(|| {
+            tracing::info_span!(
+                "kvbm.process_remote_transfer",
+                request_id = %request_id,
+                operation_id = %operation_id,
+                is_onboard = req.is_onboard,
+                num_blocks = req.sequence_hashes.len(),
+                otel.name = "kvbm.process_remote_transfer",
+            )
+        });
 
-    let release_pin = |pin_registry: &PinRegistry,
-                       pin_id: Option<uuid::Uuid>,
-                       is_h2o: bool,
-                       semaphore: &Arc<Semaphore>| {
+    let release_pin = |pin_registry: &PinRegistry, pin_id: Option<uuid::Uuid>| {
         if let Some(guard) = pin_id.and_then(|id| pin_registry.remove(&id)) {
             tracing::debug!(pin_id = ?pin_id, num_blocks = guard.count(), "released pin guard");
-            if is_h2o {
-                semaphore.add_permits(1);
-            }
         }
     };
 
-    if req.is_onboard {
-        let inflight_receivers = leader.g4_inflight().check_inflight(&req.sequence_hashes);
-        if !inflight_receivers.is_empty() {
-            let waits = inflight_receivers.into_iter().map(|mut rx| async move {
-                let _ = tokio::time::timeout(*G4_TRANSFER_TIMEOUT, rx.changed()).await;
-            });
-            futures::future::join_all(waits).await;
-            if let Some(host_pool) = block_manager.host() {
-                if let Ok(host_matches) = host_pool.match_sequence_hashes(&req.sequence_hashes).await
-                    && host_matches.len() == req.sequence_hashes.len()
-                {
-                    let block_pairs: Vec<(usize, usize)> = host_matches
-                        .iter()
-                        .zip(req.device_block_ids.iter())
-                        .map(|(src, dst)| (src.block_id(), *dst))
-                        .collect();
-                    let block_xfer_req = BlockTransferRequest {
-                        from_pool: BlockTransferPool::Host,
-                        to_pool: BlockTransferPool::Device,
-                        blocks: block_pairs,
-                        connector_req: Some(LeaderTransferRequest {
-                            request_id: request_id.clone(),
-                            uuid: *operation_id,
-                            requirement: None,
-                            request_type: RequestType::Immediate,
-                            chained: false,
-                        }),
-                        sequence_hashes: None,
-                    };
-                    if let Ok(notify_receiver) = leader.transfer_blocks_request(block_xfer_req).await
-                        && notify_receiver.await.is_ok()
-                    {
-                        kvbm_metrics
-                            .onboard_blocks_h2d
-                            .inc_by(req.sequence_hashes.len() as u64);
-                        return Ok(());
-                    }
-                }
-            }
-        }
-    }
-
-    let _inflight_guard = if req.is_onboard {
-        Some(leader.g4_inflight().register(&req.sequence_hashes))
-    } else {
-        None
-    };
+    // Intentionally do not deduplicate concurrent G4 onboard requests.
+    // The previous inflight wait/registration path serialized overlapping
+    // requests at request granularity, which prevented true concurrent
+    // cold-path onboarding. We accept duplicate remote reads here to keep
+    // the transfer path concurrent.
 
     let (hashes_with_positions, filtered_host_ids) = if let Some(handle) = leader.remote_handle() {
         match vllm_int::filter_for_offload(
@@ -592,7 +587,7 @@ async fn process_remote_transfer_request(
         {
             Some(filtered) => filtered,
             None => {
-                release_pin(pin_registry, pin_id, is_h2o, h2o_semaphore);
+                release_pin(pin_registry, pin_id);
                 return Ok(());
             }
         }
@@ -625,6 +620,16 @@ async fn process_remote_transfer_request(
     };
 
     let hashes: Vec<u64> = hashes_with_positions.iter().map(|&(h, _)| h).collect();
+    let _alloc_span = tracing::info_span!(
+        parent: process_span.clone(),
+        "kvbm.remote_transfer_allocate",
+        request_id = %request_id,
+        operation_id = %operation_id,
+        is_onboard = req.is_onboard,
+        num_blocks = num_blocks,
+        otel.name = "kvbm.remote_transfer_allocate",
+    )
+    .entered();
     let (bounce, device, onboard_host_blocks) = if req.is_h2o() {
         let bounce = filtered_host_ids
             .ok_or_else(|| anyhow::anyhow!("H2R transfer requires host_block_ids"))?;
@@ -633,11 +638,24 @@ async fn process_remote_transfer_request(
         let host_pool = block_manager
             .host()
             .ok_or_else(|| anyhow::anyhow!("Host pool not available for bounce buffers"))?;
-        let host_blocks = host_pool.allocate_blocks(num_blocks).await?;
+        let host_blocks =
+            tokio::task::block_in_place(|| host_pool.allocate_blocks_blocking(num_blocks))?;
         let bounce = host_blocks.iter().map(|b| b.block_id()).collect();
         let device = req.device_block_ids.iter().copied().collect();
         (bounce, device, Some(host_blocks))
     };
+    drop(_alloc_span);
+
+    let _pipeline_span = tracing::info_span!(
+        parent: process_span.clone(),
+        "kvbm.remote_transfer_build_pipeline",
+        request_id = %request_id,
+        operation_id = %operation_id,
+        is_onboard = req.is_onboard,
+        num_blocks = num_blocks,
+        otel.name = "kvbm.remote_transfer_build_pipeline",
+    )
+    .entered();
     let pipeline = vllm_int::create_transfer_pipeline(
         &hashes,
         &storage_config,
@@ -649,6 +667,7 @@ async fn process_remote_transfer_request(
         bounce,
         device,
     );
+    drop(_pipeline_span);
 
     let is_chained = !req.is_onboard;
     let mut wire_req = crate::block_manager::distributed::RemoteTransferRequest::new_with_connector_req(
@@ -664,7 +683,19 @@ async fn process_remote_transfer_request(
         },
     );
     wire_req.traceparent = req.traceparent.clone();
-    let notify_receiver = leader.remote_transfer_request(wire_req).await?;
+    let dispatch_span = tracing::info_span!(
+        parent: &process_span,
+        "kvbm.remote_transfer_dispatch",
+        request_id = %request_id,
+        operation_id = %operation_id,
+        is_onboard = req.is_onboard,
+        num_blocks = num_blocks,
+        otel.name = "kvbm.remote_transfer_dispatch",
+    );
+    let notify_receiver = leader
+        .remote_transfer_request(wire_req)
+        .instrument(dispatch_span)
+        .await?;
     let transfer_start = Instant::now();
     let transfer_bytes = (num_blocks as u64).saturating_mul(req.block_size as u64);
 
@@ -738,6 +769,6 @@ async fn process_remote_transfer_request(
         }
     };
 
-    release_pin(pin_registry, pin_id, is_h2o, h2o_semaphore);
+    release_pin(pin_registry, pin_id);
     result
 }

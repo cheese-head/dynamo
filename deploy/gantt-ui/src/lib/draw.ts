@@ -1,5 +1,5 @@
 import type { TraceRow, Span } from "../types";
-import { spanColor } from "./colors";
+import { spanColor, traceColor } from "./colors";
 import { fmtTime } from "./time";
 
 export interface HitRect {
@@ -189,6 +189,23 @@ export function drawGantt(params: DrawParams): HitRect[] {
   for (let ri = 0; ri < rowCount; ri++) {
     const row = rows[ri];
     const rowY = HEADER_H + ri * ROW_H;
+
+    const traceRelS = Number(row.traceStartNs - viewMin);
+    const traceRelE = Number(row.traceEndNs - viewMin);
+    if (!(traceRelE < 0 || traceRelS > viewDur)) {
+      const clampS = Math.max(traceRelS, 0);
+      const clampE = Math.min(traceRelE, viewDur);
+      const xS = LABEL_W + (clampS / viewDur) * chartW;
+      const xE = LABEL_W + (clampE / viewDur) * chartW;
+      if (!isNaN(xS) && !isNaN(xE)) {
+        const w = Math.max(xE - xS, 2);
+        const bandY = rowY + 3;
+        const bandH = ROW_H - 6;
+        ctx.fillStyle = traceColor(row.traceID);
+        roundRect(ctx, xS, bandY, w, bandH, BAR_RADIUS);
+        ctx.fill();
+      }
+    }
 
     for (let si = 0; si < row.spans.length; si++) {
       const span = row.spans[si];

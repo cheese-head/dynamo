@@ -64,8 +64,9 @@ export function parseTraceRows(
         for (const s of ss.spans ?? []) {
           const startNs = BigInt(s.startTimeUnixNano ?? "0");
           const endNs = BigInt(s.endTimeUnixNano ?? "0");
-          const name = s.name ?? "";
           const attrs = extractAttrs(s.attributes);
+          const rawName = s.name ?? "";
+          const name = attrs["otel.name"] || rawName;
 
           if (attrs["request_id"]) reqId = attrs["request_id"];
           Object.assign(mergedAttrs, attrs);
@@ -74,7 +75,14 @@ export function parseTraceRows(
             rootStartNs = startNs;
             rootEndNs = endNs;
           } else if (endNs > startNs) {
-            spans.push({ name, startNs, endNs, durMs: Number(endNs - startNs) / 1e6, attributes: attrs });
+            spans.push({
+              name,
+              rawName,
+              startNs,
+              endNs,
+              durMs: Number(endNs - startNs) / 1e6,
+              attributes: attrs,
+            });
           }
         }
       }
@@ -82,16 +90,41 @@ export function parseTraceRows(
 
     if (spans.length > 0) {
       spans.sort((a, b) => (a.startNs < b.startNs ? -1 : 1));
-      const minNs = spans[0].startNs;
-      const maxNs = spans.reduce((mx, s) => (s.endNs > mx ? s.endNs : mx), spans[0].endNs);
+      const normalizedSpans: TraceRow["spans"] = [];
+      const pollSpans = spans.filter((s) => s.name === "kvbm.request_poll");
+      if (pollSpans.length > 0) {
+        const first = pollSpans[0];
+        const last = pollSpans[pollSpans.length - 1];
+        normalizedSpans.push({
+          ...first,
+          startNs: first.startNs,
+          endNs: last.endNs,
+          durMs: Number(last.endNs - first.startNs) / 1e6,
+          attributes: {
+            ...first.attributes,
+            poll_count: String(pollSpans.length),
+          },
+        });
+      }
+      for (const span of spans) {
+        if (span.name === "kvbm.get_matched_tokens" || span.name === "kvbm.request_poll") {
+          continue;
+        }
+        normalizedSpans.push(span);
+      }
+      normalizedSpans.sort((a, b) => (a.startNs < b.startNs ? -1 : 1));
+      const minNs = normalizedSpans[0].startNs;
+      const maxNs = normalizedSpans.reduce((mx, s) => (s.endNs > mx ? s.endNs : mx), normalizedSpans[0].endNs);
       const totalStart = rootStartNs > 0n ? rootStartNs : minNs;
       const totalEnd = rootEndNs > 0n ? rootEndNs : maxNs;
       rows.push({
         traceID,
         label: reqId || traceID.substring(0, 16),
-        spans,
+        spans: normalizedSpans,
         minNs,
         maxNs,
+        traceStartNs: totalStart,
+        traceEndNs: totalEnd,
         totalDurMs: Number(totalEnd - totalStart) / 1e6,
         attributes: mergedAttrs,
       });

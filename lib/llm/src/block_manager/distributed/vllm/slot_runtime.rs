@@ -18,7 +18,6 @@ use crate::{
             locality::Logical,
             transfer::remote::RemoteKey,
         },
-        config::should_disable_cpu_cache_lookup,
         connector::{
             RequestKey,
             cache_stats::CacheStatsTracker,
@@ -270,8 +269,47 @@ type PendingLookup = PendingG4Lookup<
     Vec<ImmutableBlock<DiskStorage, VllmLocality, BasicMetadata>>,
 >;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum G4HostPrefetchStatus {
+    Pending,
+    Ready,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug)]
+struct G4HostPrefetchState {
+    operation_id: uuid::Uuid,
+    sequence_hashes: Vec<u64>,
+    num_external_tokens: usize,
+    status: G4HostPrefetchStatus,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct StagedMatchReport {
+    pending: Option<usize>,
+}
+
+impl StagedMatchReport {
+    fn arm(&mut self, num_external_tokens: usize) {
+        self.pending = Some(num_external_tokens);
+    }
+
+    fn peek(&self) -> Option<usize> {
+        self.pending
+    }
+
+    fn clear(&mut self) {
+        self.pending = None;
+    }
+}
+
 pub struct VllmConnectorSlot {
     request_id: String,
+    traceparent: Option<String>,
+    request_poll_span: Option<tracing::Span>,
+    host_prefetch: Option<G4HostPrefetchState>,
+    staged_match_report_pending: StagedMatchReport,
 
     /// The state of the slot.
     state: SlotState,
@@ -327,6 +365,11 @@ pub struct VllmConnectorSlot {
     /// Total number of blocks queried from host/disk cache
     total_blocks_queried: usize,
 
+    /// Number of blocks that were satisfied from host only because they were
+    /// prefetched from G4 for this request. These are counted as G4 hits in
+    /// cache stats rather than host hits.
+    prefetched_g4_blocks_used_for_stats: usize,
+
     /// Flag indicating the slot just recovered from a failed transfer.
     /// When true, `apply_scheduler_output` should ignore vLLM's `num_computed_tokens`
     /// since it reflects pre-failure state, not our reset state.
@@ -365,6 +408,10 @@ impl VllmConnectorSlot {
 
         Self {
             request_id,
+            traceparent: None,
+            request_poll_span: None,
+            host_prefetch: None,
+            staged_match_report_pending: StagedMatchReport::default(),
             sequence,
             block_manager,
             block_size,
@@ -382,6 +429,7 @@ impl VllmConnectorSlot {
             g4: G4State::new(),
             performed_cache_lookup: false,
             total_blocks_queried: 0,
+            prefetched_g4_blocks_used_for_stats: 0,
             recovered_from_failed_transfer: false,
             cache_stats,
             offload_min_priority,
@@ -392,6 +440,13 @@ impl VllmConnectorSlot {
 
     pub fn has_pending_g4_lookup(&self) -> bool {
         self.g4.has_pending_lookup()
+    }
+
+    pub fn has_pending_g4_prefetch(&self) -> bool {
+        self.host_prefetch
+            .as_ref()
+            .map(|p| p.status == G4HostPrefetchStatus::Pending)
+            .unwrap_or(false)
     }
 
     fn prepare_onboard_dst(&self, n: usize) -> Vec<BlockId> {
@@ -541,8 +596,12 @@ impl VllmConnectorSlot {
         self.device_blocks.clear();
         self.tokens_cached_from_device = 0;
         crate::all_tiers!(reset self);
+        self.request_poll_span = None;
+        self.host_prefetch = None;
+        self.staged_match_report_pending.clear();
         self.performed_cache_lookup = false;
         self.total_blocks_queried = 0;
+        self.prefetched_g4_blocks_used_for_stats = 0;
     }
 
     fn start_async_g4_lookup(
@@ -672,6 +731,7 @@ impl VllmConnectorSlot {
         self.g4.tier.reset();
         self.performed_cache_lookup = false;
         self.total_blocks_queried = 0;
+        self.prefetched_g4_blocks_used_for_stats = 0;
 
         const MAX_G4_RETRIES: u32 = 3;
         self.g4.retry_count += 1;
@@ -807,10 +867,109 @@ impl VllmConnectorSlot {
 
         self.host.stage_non_empty(host_blocks);
         self.disk.stage_non_empty(disk_blocks);
-        self.g4.tier.stage_non_empty(g4_hashes);
+
+        if !g4_hashes.is_empty() {
+            let start_block =
+                (num_computed_tokens / block_size) + num_matched_host_blocks + num_matched_disk_blocks;
+            let token_blocks = self.sequence.blocks()
+                [start_block..start_block + g4_hashes.len()]
+                .to_vec();
+            if let Ok(operation_id) =
+                self.prefetch_from_g4_to_host(g4_hashes.clone(), token_blocks)
+            {
+                self.host_prefetch = Some(G4HostPrefetchState {
+                    operation_id,
+                    sequence_hashes: g4_hashes,
+                    num_external_tokens: num_new_matched_tokens,
+                    status: G4HostPrefetchStatus::Pending,
+                });
+                return Ok(());
+            }
+            self.g4.tier.stage_non_empty(g4_hashes);
+        }
 
         self.state = SlotState::OnboardStaged(num_new_matched_tokens);
+        self.staged_match_report_pending.arm(num_new_matched_tokens);
         Ok(())
+    }
+
+    fn prefetch_from_g4_to_host(
+        &mut self,
+        sequence_hashes: Vec<u64>,
+        token_blocks: Vec<TokenBlock>,
+    ) -> Result<uuid::Uuid, SlotError> {
+        let (params, worker_req) = vllm_int::onboard_from_g4(
+            self.request_id.clone(),
+            sequence_hashes,
+            vec![],
+            self.block_size,
+            token_blocks,
+        );
+
+        let xfer_req = LocalTransferRequest::Remote(RemoteTransferRequest::from_g4_params(
+            &params,
+            self.traceparent.clone(),
+        ));
+
+        self.xfer_tx.send(xfer_req).map_err(|e| {
+            tracing::error!(target: "kvbm-g4", "failed to send host prefetch request: {:?}", e);
+            SlotError::InvalidOperation(format!("Transfer engine unavailable: {}", e))
+        })?;
+
+        self.append_pending_operation(worker_req);
+
+        Ok(params.operation_id)
+    }
+
+    pub(crate) fn try_stage_prefetched_host_matches(&mut self) -> Result<bool, SlotError> {
+        let Some(prefetch) = self.host_prefetch.as_mut() else {
+            return Ok(false);
+        };
+        if prefetch.status != G4HostPrefetchStatus::Pending {
+            return Ok(false);
+        }
+        let sequence_hashes = prefetch.sequence_hashes.clone();
+        let Some(host_pool) = self.block_manager.host() else {
+            return Ok(false);
+        };
+
+        let matched = host_pool
+            .match_sequence_hashes_blocking(sequence_hashes.as_slice())
+            .map_err(SlotError::BlockPoolError)?;
+        if matched.len() != sequence_hashes.len() {
+            return Ok(false);
+        }
+
+        let matched_len = matched.len();
+        self.host.stage_non_empty(matched);
+        self.prefetched_g4_blocks_used_for_stats = matched_len;
+        prefetch.status = G4HostPrefetchStatus::Ready;
+        self.state = SlotState::OnboardStaged(prefetch.num_external_tokens);
+        self.staged_match_report_pending
+            .arm(prefetch.num_external_tokens);
+        Ok(true)
+    }
+
+    pub(crate) fn restore_prefetched_g4_staging(&mut self) -> bool {
+        let Some(mut prefetch) = self.host_prefetch.take() else {
+            return false;
+        };
+        prefetch.status = G4HostPrefetchStatus::Cancelled;
+        self.staged_match_report_pending.clear();
+        self.g4.tier.stage_non_empty(prefetch.sequence_hashes);
+        true
+    }
+
+    pub(crate) fn staged_match_report(&self) -> Option<usize> {
+        self.staged_match_report_pending.peek()
+    }
+
+    pub(crate) fn clear_staged_match_report(&mut self) {
+        self.staged_match_report_pending.clear();
+    }
+
+    pub(crate) fn has_staged_host_blocks(&self) -> bool {
+        self.host.staging.is_some()
     }
 
     fn mark_as_skipped_prefill(&mut self) -> Result<(), SlotError> {
@@ -1106,14 +1265,18 @@ impl Slot for VllmConnectorSlot {
         if self.performed_cache_lookup {
             let block_size = self.block_size;
 
-            let (host_blocks, disk_blocks, object_blocks) =
+            let (host_blocks_raw, disk_blocks, object_blocks_raw) =
                 crate::all_tiers!(cache_stats self, block_size);
+            let prefetched_g4_blocks = self.prefetched_g4_blocks_used_for_stats;
+            let host_blocks = host_blocks_raw.saturating_sub(prefetched_g4_blocks);
+            let object_blocks = object_blocks_raw.max(prefetched_g4_blocks);
 
             tracing::debug!(
                 request_id = %self.request_id,
                 host_blocks = host_blocks,
                 disk_blocks = disk_blocks,
                 object_blocks = object_blocks,
+                prefetched_g4_blocks = prefetched_g4_blocks,
                 total_blocks_queried = self.total_blocks_queried,
                 "Reporting cache stats"
             );
@@ -1202,6 +1365,24 @@ impl Slot for VllmConnectorSlot {
             return Ok(());
         }
 
+        if self.has_pending_g4_prefetch() {
+            if self.try_stage_prefetched_host_matches()? {
+                tracing::debug!(
+                    target: "kvbm-g4",
+                    request_id = %self.request_id,
+                    state = ?self.state,
+                    "prefetched G4 blocks are now resident in host memory"
+                );
+            } else {
+                tracing::debug!(
+                    target: "kvbm-g4",
+                    request_id = %self.request_id,
+                    "prefetched G4 blocks not yet resident in host memory"
+                );
+            }
+            return Ok(());
+        }
+
         if self.maybe_recover_onboarding_timeout()? {
             return Ok(());
         }
@@ -1270,23 +1451,12 @@ impl Slot for VllmConnectorSlot {
         //     disk.touch_blocks_blocking(&sequence_hashes)?;
         // }
 
-        let disable_cpu_lookup = should_disable_cpu_cache_lookup();
-        if disable_cpu_lookup {
-            tracing::info!(
-                request_id = %self.request_id,
-                "cpu cache lookup disabled via dev flag; skipping host pool match"
-            );
-        }
-
-        let host_blocks = if disable_cpu_lookup {
-            Vec::new()
-        } else {
-            self.block_manager
-                .host()
-                .map(|host| host.match_sequence_hashes_blocking(blocks_to_lookup))
-                .transpose()?
-                .unwrap_or_default()
-        };
+        let host_blocks = self
+            .block_manager
+            .host()
+            .map(|host| host.match_sequence_hashes_blocking(blocks_to_lookup))
+            .transpose()?
+            .unwrap_or_default();
 
         let num_matched_host_blocks = host_blocks.len();
         self.record_cached_host_tokens(num_matched_host_blocks * block_size);
@@ -1450,9 +1620,79 @@ impl ExternallyManagedDeviceSlot for VllmConnectorSlot {
 
         Ok(())
     }
+
+    fn set_request_traceparent(&mut self, traceparent: Option<String>) {
+        if self.traceparent != traceparent {
+            self.request_poll_span = None;
+        }
+        self.traceparent = traceparent;
+    }
 }
 
 impl VllmConnectorSlot {
+    pub(crate) fn request_poll_span(&mut self) -> tracing::Span {
+        if let Some(span) = &self.request_poll_span {
+            return span.clone();
+        }
+
+        let span = if !dynamo_runtime::logging::otel_export_enabled() {
+            tracing::Span::none()
+        } else if let Some(tp) = self.traceparent.as_deref() {
+            dynamo_runtime::logging::make_linked_span("kvbm.request_poll", tp)
+        } else {
+            tracing::info_span!(
+                "kvbm_request_poll",
+                otel.name = "kvbm.request_poll",
+                request_id = %self.request_id,
+            )
+        };
+        self.request_poll_span = Some(span.clone());
+        span
+    }
+
+    pub(crate) fn release_prefetched_host_blocks(&mut self) -> Result<(), SlotError> {
+        let Some(prefetch) = self.host_prefetch.take() else {
+            return Ok(());
+        };
+
+        self.host.clear_staging(&self.request_id, "prefetched host blocks");
+        self.staged_match_report_pending.clear();
+        self.prefetched_g4_blocks_used_for_stats = 0;
+
+        let Some(host_pool) = self.block_manager.host() else {
+            return Ok(());
+        };
+
+        let response = host_pool
+            .reset_blocks_blocking(prefetch.sequence_hashes.as_slice())
+            .map_err(|e| {
+                SlotError::InvalidOperation(format!(
+                    "Failed to reset prefetched host blocks for {}: {}",
+                    self.request_id, e
+                ))
+            })?;
+
+        tracing::info!(
+            request_id = %self.request_id,
+            operation_id = %prefetch.operation_id,
+            reset_blocks = response.reset_blocks.len(),
+            not_found = response.not_found.len(),
+            not_reset = response.not_reset.len(),
+            "released prefetched host blocks"
+        );
+
+        if !response.not_reset.is_empty() {
+            tracing::warn!(
+                request_id = %self.request_id,
+                operation_id = %prefetch.operation_id,
+                not_reset = response.not_reset.len(),
+                "some prefetched host blocks could not be reset"
+            );
+        }
+
+        Ok(())
+    }
+
     /// this method does two things which are related:
     /// 1. creates transfer engine offload request
     /// 2. creates matching connector worker transfer request
@@ -1484,6 +1724,7 @@ impl VllmConnectorSlot {
             priorities.to_vec(),
             operation_id,
             self.block_size,
+            self.traceparent.clone(),
         ));
 
         let worker_req = WorkerTransferRequest {
@@ -1673,7 +1914,10 @@ impl VllmConnectorSlot {
             token_blocks,
         );
 
-        let xfer_req = LocalTransferRequest::Remote(RemoteTransferRequest::from_g4_params(&params));
+        let xfer_req = LocalTransferRequest::Remote(RemoteTransferRequest::from_g4_params(
+            &params,
+            self.traceparent.clone(),
+        ));
 
         self.xfer_tx.send(xfer_req).map_err(|e| {
             tracing::error!(target: "kvbm-g4", "failed to send request: {:?}", e);
@@ -1687,14 +1931,26 @@ impl VllmConnectorSlot {
     fn append_pending_operation(&mut self, operation: WorkerTransferRequest) {
         self.operation_tracker.append_pending(operation);
     }
+
+    pub fn set_request_traceparent(&mut self, traceparent: Option<String>) {
+        self.traceparent = traceparent;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block_manager::distributed::vllm::integration::G4OnboardParams;
     use crate::block_manager::block::transfer::remote::{
         RemoteBlockDescriptor, RemoteTransferPipeline,
     };
+    use crate::tokens::{TokenBlock, TokenBlockSequence, Tokens};
+
+    fn make_token_blocks(tokens: &[u32]) -> Vec<TokenBlock> {
+        TokenBlockSequence::new(Tokens::from(tokens), 1, Some(0))
+            .blocks()
+            .to_vec()
+    }
 
     /// Test that RemoteTransferRequest::new_h2o creates the correct request structure.
     #[test]
@@ -1713,6 +1969,7 @@ mod tests {
             operation_id,
             block_size,
             pin_id,
+            None,
         );
 
         assert!(!req.is_onboard);
@@ -1723,6 +1980,42 @@ mod tests {
         assert_eq!(req.block_size, block_size);
         assert_eq!(req.request_id, request_id);
         assert_eq!(req.pin_id, Some(pin_id));
+    }
+
+    /// Test that G4 onboard request construction preserves the host-prefetch
+    /// contract: onboard direction, no host block IDs, and request traceparent.
+    #[test]
+    fn test_g4_onboard_request_creation_for_host_prefetch() {
+        let request_id = "test-request-g4-prefetch".to_string();
+        let sequence_hashes = vec![0x1111, 0x2222, 0x3333];
+        let device_block_ids = vec![]; // Host-prefetch-only path
+        let operation_id = uuid::Uuid::new_v4();
+        let block_size = 16;
+        let token_blocks = make_token_blocks(&[0x1111, 0x2222, 0x3333]);
+        let traceparent =
+            Some("00-0123456789abcdef0123456789abcdef-0123456789abcdef-01".to_string());
+
+        let params = G4OnboardParams {
+            request_id: request_id.clone(),
+            sequence_hashes: sequence_hashes.clone(),
+            device_block_ids: device_block_ids.clone(),
+            operation_id,
+            block_size,
+            token_blocks: token_blocks.clone(),
+        };
+
+        let req = RemoteTransferRequest::from_g4_params(&params, traceparent.clone());
+
+        assert!(req.is_onboard);
+        assert!(!req.is_h2o());
+        assert_eq!(req.request_id, request_id);
+        assert_eq!(req.sequence_hashes, sequence_hashes);
+        assert_eq!(req.device_block_ids, device_block_ids);
+        assert_eq!(req.host_block_ids, None);
+        assert_eq!(req.operation_id, operation_id);
+        assert_eq!(req.block_size, block_size);
+        assert_eq!(req.token_blocks, Some(token_blocks));
+        assert_eq!(req.traceparent, traceparent);
     }
 
     /// Test that H2R pipeline uses offload_with_bounce correctly.
@@ -1764,13 +2057,80 @@ mod tests {
             request_id: request_id.clone(),
             block_ids: block_ids.clone(),
             token_blocks: vec![], // Empty for this unit test
+            priorities: vec![],
             operation_id,
             sequence_hashes: vec![0x1234, 0x5678, 0x9ABC],
             block_size,
+            traceparent: None,
         };
 
         assert_eq!(req.block_size, block_size);
         assert_eq!(req.block_ids.len(), 3);
+    }
+
+    /// Test that LocalOffloadRequest::new wires the full offload cycle inputs
+    /// correctly, including derived sequence hashes and trace context.
+    #[test]
+    fn test_local_offload_request_new_derives_sequence_hashes_and_traceparent() {
+        let request_id = "test-offload-request".to_string();
+        let block_ids = vec![7, 8];
+        let operation_id = uuid::Uuid::new_v4();
+        let block_size = 16;
+        let traceparent =
+            Some("00-fedcba9876543210fedcba9876543210-fedcba9876543210-01".to_string());
+
+        let token_blocks = make_token_blocks(&[0xAAAA, 0xBBBB]);
+        let priorities = vec![10, 20];
+
+        let req = LocalOffloadRequest::new(
+            request_id.clone(),
+            block_ids.clone(),
+            token_blocks.clone(),
+            priorities.clone(),
+            operation_id,
+            block_size,
+            traceparent.clone(),
+        );
+
+        assert_eq!(req.request_id, request_id);
+        assert_eq!(req.block_ids, block_ids);
+        assert_eq!(req.operation_id, operation_id);
+        assert_eq!(req.block_size, block_size);
+        assert_eq!(req.priorities, priorities);
+        assert_eq!(req.traceparent, traceparent);
+        assert_eq!(
+            req.sequence_hashes,
+            token_blocks.iter().map(|tb| tb.sequence_hash()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_staged_match_report_persists_until_cleared() {
+        let mut report = StagedMatchReport::default();
+
+        assert_eq!(report.peek(), None);
+
+        report.arm(60064);
+        assert_eq!(report.peek(), Some(60064));
+        assert_eq!(report.peek(), Some(60064));
+        assert_eq!(report.peek(), Some(60064));
+
+        report.clear();
+        assert_eq!(report.peek(), None);
+    }
+
+    #[test]
+    fn test_staged_match_report_rearms_after_clear() {
+        let mut report = StagedMatchReport::default();
+
+        report.arm(48);
+        assert_eq!(report.peek(), Some(48));
+
+        report.clear();
+        assert_eq!(report.peek(), None);
+
+        report.arm(96);
+        assert_eq!(report.peek(), Some(96));
     }
 
     /// Test H2R filtering logic: already-stored hashes are removed.

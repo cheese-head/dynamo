@@ -1,6 +1,6 @@
 import { useGanttStore } from "../store";
 import { spanColor } from "../lib/colors";
-import { fmtDuration } from "../lib/time";
+import { fmtDuration, fmtTime } from "../lib/time";
 
 export function Tooltip() {
   const hover = useGanttStore((s) => s.hoverData);
@@ -8,6 +8,7 @@ export function Tooltip() {
 
   const { span, row, x, y } = hover;
   const color = spanColor(span.name);
+  const requestId = row.attributes.request_id || row.label;
 
   return (
     <div
@@ -29,8 +30,9 @@ export function Tooltip() {
         </span>
       </div>
       <div className="flex flex-col gap-0.5 text-[11px] text-text-secondary">
+        <span>Start: <span className="font-mono text-text-primary">{fmtTime(span.startNs)}</span></span>
         <span>Duration: <span className="text-text-primary">{fmtDuration(span.durMs)}</span></span>
-        <span>Request: <span className="font-mono text-text-primary">{row.label}</span></span>
+        <span>Request ID: <span className="font-mono text-text-primary">{requestId}</span></span>
       </div>
     </div>
   );
