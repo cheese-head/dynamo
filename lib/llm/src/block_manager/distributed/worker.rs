@@ -1001,6 +1001,7 @@ impl KvbmWorker {
 /// - `DYN_KVBM_REMOTE_STORAGE_TYPE`: "object", "disk", or "auto" (default: "auto")
 /// - `DYN_KVBM_OBJECT_BUCKET` or `AWS_DEFAULT_BUCKET`: Bucket name for object storage
 /// - `DYN_KVBM_REMOTE_DISK_PATH`: Base path for disk storage
+/// - `DYN_KVBM_REMOTE_DISK_PATHS`: Comma-separated base paths for disk storage
 /// - `DYN_KVBM_REMOTE_DISK_USE_GDS`: Enable GPU Direct Storage for disk (default: true)
 ///
 /// Auto-detection logic:
@@ -1031,9 +1032,22 @@ fn remote_storage_config(worker_id: usize) -> Option<RemoteStorageConfig> {
         .ok();
 
     // Get disk storage config
-    let disk_path = std::env::var("DYN_KVBM_REMOTE_DISK_PATH")
+    let disk_paths = std::env::var("DYN_KVBM_REMOTE_DISK_PATHS")
         .ok()
-        .map(|p| p.replace("{worker_id}", &worker_id.to_string()));
+        .map(|paths| {
+            paths
+                .split(',')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(|p| p.replace("{worker_id}", &worker_id.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .filter(|paths| !paths.is_empty())
+        .or_else(|| {
+            std::env::var("DYN_KVBM_REMOTE_DISK_PATH")
+                .ok()
+                .map(|p| vec![p.replace("{worker_id}", &worker_id.to_string())])
+        });
 
     let disk_use_gds = std::env::var("DYN_KVBM_REMOTE_DISK_USE_GDS")
         .map(|v| v == "1" || v.to_lowercase() == "true")
@@ -1054,30 +1068,29 @@ fn remote_storage_config(worker_id: usize) -> Option<RemoteStorageConfig> {
 
     match storage_type.as_str() {
         "disk" => {
-            if let Some(path) = disk_path {
+            if let Some(paths) = disk_paths {
                 tracing::info!(
                     worker_id = worker_id,
-                    base_path = %path,
+                    base_paths = ?paths,
                     use_gds = disk_use_gds,
                     "Creating remote context for disk storage (explicit)"
                 );
 
-                if let Err(e) = fs::create_dir_all(&path) {
-                    tracing::warn!(
-                        worker_id = worker_id,
-                        base_path = %path,
-                        error = %e,
-                        "Failed to create remote disk base path; remote transfers may fail"
-                    );
+                for path in &paths {
+                    if let Err(e) = fs::create_dir_all(path) {
+                        tracing::warn!(
+                            worker_id = worker_id,
+                            base_path = %path,
+                            error = %e,
+                            "Failed to create remote disk base path; remote transfers may fail"
+                        );
+                    }
                 }
 
-                Some(RemoteStorageConfig::Disk {
-                    base_path: path,
-                    transfer_flags: disk_flags,
-                })
+                Some(RemoteStorageConfig::disk_paths(paths, disk_flags))
             } else {
                 tracing::warn!(
-                    "DYN_KVBM_REMOTE_STORAGE_TYPE=disk but DYN_KVBM_REMOTE_DISK_PATH not set"
+                    "DYN_KVBM_REMOTE_STORAGE_TYPE=disk but no DYN_KVBM_REMOTE_DISK_PATH(S) set"
                 );
                 None
             }
@@ -1095,12 +1108,12 @@ fn remote_storage_config(worker_id: usize) -> Option<RemoteStorageConfig> {
                 region: object_region,
             })
         }
-        _ => match (&bucket, &disk_path) {
-            (Some(_), Some(path)) => {
+        _ => match (&bucket, &disk_paths) {
+            (Some(_), Some(paths)) => {
                 tracing::info!(
                     worker_id = worker_id,
                     bucket = ?bucket,
-                    disk_path = %path,
+                    disk_paths = ?paths,
                     "Both object and disk storage configured, defaulting to object"
                 );
                 Some(RemoteStorageConfig::Object {
@@ -1122,32 +1135,31 @@ fn remote_storage_config(worker_id: usize) -> Option<RemoteStorageConfig> {
                     region: object_region,
                 })
             }
-            (None, Some(path)) => {
+            (None, Some(paths)) => {
                 tracing::info!(
                     worker_id = worker_id,
-                    base_path = %path,
+                    base_paths = ?paths,
                     use_gds = disk_use_gds,
                     "Creating remote context for disk storage (auto-detected)"
                 );
 
-                if let Err(e) = fs::create_dir_all(&path) {
-                    tracing::warn!(
-                        worker_id = worker_id,
-                        base_path = %path,
-                        error = %e,
-                        "Failed to create remote disk base path; remote transfers may fail"
-                    );
+                for path in paths {
+                    if let Err(e) = fs::create_dir_all(path) {
+                        tracing::warn!(
+                            worker_id = worker_id,
+                            base_path = %path,
+                            error = %e,
+                            "Failed to create remote disk base path; remote transfers may fail"
+                        );
+                    }
                 }
 
-                Some(RemoteStorageConfig::Disk {
-                    base_path: path.clone(),
-                    transfer_flags: disk_flags,
-                })
+                Some(RemoteStorageConfig::disk_paths(paths.clone(), disk_flags))
             }
             (None, None) => {
                 tracing::debug!(
                     worker_id = worker_id,
-                    "No remote storage configured (set DYN_KVBM_OBJECT_BUCKET or DYN_KVBM_REMOTE_DISK_PATH)"
+                    "No remote storage configured (set DYN_KVBM_OBJECT_BUCKET or DYN_KVBM_REMOTE_DISK_PATH(S))"
                 );
                 None
             }

@@ -390,7 +390,7 @@ pub enum RemoteStorageConfig {
         region: Option<String>,
     },
     Disk {
-        base_path: String,
+        base_paths: Vec<String>,
         transfer_flags: DiskTransferFlags,
     },
 }
@@ -418,8 +418,28 @@ impl RemoteStorageConfig {
 
     pub fn disk(base_path: impl Into<String>, transfer_flags: DiskTransferFlags) -> Self {
         Self::Disk {
-            base_path: base_path.into(),
+            base_paths: vec![base_path.into()],
             transfer_flags,
+        }
+    }
+
+    pub fn disk_paths(
+        base_paths: Vec<String>,
+        transfer_flags: DiskTransferFlags,
+    ) -> Self {
+        Self::Disk {
+            base_paths,
+            transfer_flags,
+        }
+    }
+
+    pub fn select_disk_base_path(&self, hash: u64) -> Option<&str> {
+        match self {
+            Self::Disk { base_paths, .. } if !base_paths.is_empty() => {
+                let idx = (hash as usize) % base_paths.len();
+                base_paths.get(idx).map(String::as_str)
+            }
+            _ => None,
         }
     }
 }
@@ -484,7 +504,7 @@ impl RemoteTransferContext {
         Self {
             base,
             config: RemoteStorageConfig::Disk {
-                base_path,
+                base_paths: vec![base_path],
                 transfer_flags,
             },
             worker_id: 0,
@@ -536,7 +556,14 @@ impl RemoteTransferContext {
 
     pub fn base_path(&self) -> Option<&str> {
         match &self.config {
-            RemoteStorageConfig::Disk { base_path, .. } => Some(base_path),
+            RemoteStorageConfig::Disk { base_paths, .. } => base_paths.first().map(String::as_str),
+            _ => None,
+        }
+    }
+
+    pub fn base_paths(&self) -> Option<&[String]> {
+        match &self.config {
+            RemoteStorageConfig::Disk { base_paths, .. } => Some(base_paths),
             _ => None,
         }
     }
@@ -669,10 +696,10 @@ mod tests {
             let config = RemoteStorageConfig::disk("/mnt/kv-cache", DISK_FLAGS_POSIX_BOTH);
             match config {
                 RemoteStorageConfig::Disk {
-                    base_path,
+                    base_paths,
                     transfer_flags,
                 } => {
-                    assert_eq!(base_path, "/mnt/kv-cache");
+                    assert_eq!(base_paths, vec!["/mnt/kv-cache".to_string()]);
                     assert_eq!(transfer_flags, DISK_FLAGS_POSIX_BOTH);
                 }
                 _ => panic!("Expected Disk variant"),
@@ -684,10 +711,10 @@ mod tests {
             let config = RemoteStorageConfig::disk("/mnt/nvme", DISK_FLAGS_GDS_BOTH);
             match config {
                 RemoteStorageConfig::Disk {
-                    base_path,
+                    base_paths,
                     transfer_flags,
                 } => {
-                    assert_eq!(base_path, "/mnt/nvme");
+                    assert_eq!(base_paths, vec!["/mnt/nvme".to_string()]);
                     assert_eq!(transfer_flags, DISK_FLAGS_GDS_BOTH);
                 }
                 _ => panic!("Expected Disk variant"),
@@ -699,15 +726,53 @@ mod tests {
             let config = RemoteStorageConfig::disk("/mnt/nfs", DISK_FLAGS_GDS_READS_ONLY);
             match config {
                 RemoteStorageConfig::Disk {
-                    base_path,
+                    base_paths,
                     transfer_flags,
                 } => {
-                    assert_eq!(base_path, "/mnt/nfs");
+                    assert_eq!(base_paths, vec!["/mnt/nfs".to_string()]);
                     assert_eq!(transfer_flags & DISK_FLAG_GDS_READ, DISK_FLAG_GDS_READ);
                     assert_eq!(transfer_flags & DISK_FLAG_GDS_WRITE, 0);
                 }
                 _ => panic!("Expected Disk variant"),
             }
+        }
+
+        #[test]
+        fn test_disk_config_multiple_paths() {
+            let config = RemoteStorageConfig::disk_paths(
+                vec!["/mnt/a".to_string(), "/mnt/b".to_string()],
+                DISK_FLAGS_POSIX_BOTH,
+            );
+            match config {
+                RemoteStorageConfig::Disk {
+                    base_paths,
+                    transfer_flags,
+                } => {
+                    assert_eq!(base_paths, vec!["/mnt/a".to_string(), "/mnt/b".to_string()]);
+                    assert_eq!(transfer_flags, DISK_FLAGS_POSIX_BOTH);
+                }
+                _ => panic!("Expected Disk variant"),
+            }
+        }
+
+        #[test]
+        fn test_select_disk_base_path_is_deterministic() {
+            let config = RemoteStorageConfig::disk_paths(
+                vec![
+                    "/mnt/a".to_string(),
+                    "/mnt/b".to_string(),
+                    "/mnt/c".to_string(),
+                ],
+                DISK_FLAGS_POSIX_BOTH,
+            );
+
+            let first = config.select_disk_base_path(0x1234).unwrap().to_string();
+            let second = config.select_disk_base_path(0x1234).unwrap().to_string();
+            let other = config.select_disk_base_path(0x1235).unwrap().to_string();
+
+            assert_eq!(first, second);
+            assert!(["/mnt/a", "/mnt/b", "/mnt/c"].contains(&first.as_str()));
+            assert!(["/mnt/a", "/mnt/b", "/mnt/c"].contains(&other.as_str()));
         }
 
         #[test]
@@ -768,10 +833,10 @@ mod tests {
             assert_eq!(config.worker_id, 7);
             match config.remote_storage_config {
                 RemoteStorageConfig::Disk {
-                    base_path,
+                    base_paths,
                     transfer_flags,
                 } => {
-                    assert_eq!(base_path, "/data/cache");
+                    assert_eq!(base_paths, vec!["/data/cache".to_string()]);
                     assert_eq!(transfer_flags, DISK_FLAGS_GDS_BOTH);
                 }
                 _ => panic!("Expected Disk variant"),

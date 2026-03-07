@@ -453,16 +453,11 @@ where
 
         for desc in descriptors.iter() {
             // Get file path from descriptor's DiskKey.
-            // Use ctx.base_path() (the per-worker path) rather than
-            // disk_key.full_path(), which bakes in the leader's rank-0 path
-            // and causes all workers to write to the same directory.
+            // The descriptor's DiskKey.path is the authoritative per-block mount
+            // choice, so reads and writes land on the same POSIX mount.
             let file_path = match desc.key() {
                 RemoteKey::Disk(disk_key) => {
-                    if let Some(base_path) = ctx.base_path() {
-                        format!("{}/{}", base_path, disk_key.key)
-                    } else {
-                        disk_key.full_path()
-                    }
+                    disk_key.full_path()
                 }
                 _ => {
                     return Err(TransferError::IncompatibleTypes(

@@ -23,9 +23,12 @@ pub fn create_descriptors(
                 .map(|&hash| RemoteBlockDescriptor::object_from_hash(bucket, hash, block_size))
                 .collect()
         }
-        RemoteStorageConfig::Disk { base_path, .. } => hashes
+        RemoteStorageConfig::Disk { .. } => hashes
             .iter()
             .map(|&hash| {
+                let base_path = storage_config
+                    .select_disk_base_path(hash)
+                    .expect("disk storage config must provide at least one base path");
                 RemoteBlockDescriptor::disk_from_hash(
                     base_path, hash, block_size, worker_id, world_size,
                 )

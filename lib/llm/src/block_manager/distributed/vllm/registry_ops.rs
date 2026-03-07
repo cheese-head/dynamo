@@ -147,19 +147,20 @@ fn build_entries(
                 })
                 .collect()
         }
-        RemoteStorageConfig::Disk { base_path, .. } => {
-            let path = base_path.replace("{worker_id}", &worker_id.to_string());
-            hashes_with_positions
-                .iter()
-                .map(|&(hash, pos)| {
-                    let key = RemoteKey::Disk(DiskKey {
-                        path: path.clone(),
-                        key: format!("{:016x}_{}_{}", hash, worker_id, world_size),
-                    });
-                    (hash, pos, key)
-                })
-                .collect()
-        }
+        RemoteStorageConfig::Disk { .. } => hashes_with_positions
+            .iter()
+            .map(|&(hash, pos)| {
+                let path = storage_config
+                    .select_disk_base_path(hash)
+                    .expect("disk storage config must provide at least one base path")
+                    .replace("{worker_id}", &worker_id.to_string());
+                let key = RemoteKey::Disk(DiskKey {
+                    path,
+                    key: format!("{:016x}_{}_{}", hash, worker_id, world_size),
+                });
+                (hash, pos, key)
+            })
+            .collect(),
     }
 }
 
