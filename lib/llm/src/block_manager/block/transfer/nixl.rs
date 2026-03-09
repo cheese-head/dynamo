@@ -12,9 +12,141 @@ use nixl_sys::{
     Agent as NixlAgent, MemType, MemoryRegion, NixlDescriptor, OptArgs, XferDescList, XferOp,
     XferRequest, XferStatus,
 };
+use once_cell::sync::Lazy;
+use parking_lot::Mutex as SyncMutex;
+use std::collections::HashMap;
 use std::future::Future;
 use std::time::Duration;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
+
+const DEFAULT_REMOTE_DISK_FD_CACHE_MAX_ENTRIES: usize = 50_000;
+
+static REMOTE_DISK_FD_CACHE_MAX_ENTRIES: Lazy<usize> = Lazy::new(|| {
+    std::env::var("DYN_KVBM_REMOTE_DISK_FD_CACHE_MAX_ENTRIES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_REMOTE_DISK_FD_CACHE_MAX_ENTRIES)
+});
+
+static REMOTE_DISK_FD_CACHE: Lazy<AsyncMutex<RemoteDiskFdCache>> =
+    Lazy::new(|| AsyncMutex::new(RemoteDiskFdCache::new(*REMOTE_DISK_FD_CACHE_MAX_ENTRIES)));
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RemoteDiskFdCacheKey {
+    path: String,
+    use_odirect: bool,
+}
+
+#[derive(Debug)]
+struct RemoteDiskFdCacheEntry {
+    storage: Arc<SyncMutex<RemoteDiskStorage>>,
+    last_access_tick: u64,
+}
+
+#[derive(Debug)]
+struct RemoteDiskFdCache {
+    entries: HashMap<RemoteDiskFdCacheKey, RemoteDiskFdCacheEntry>,
+    access_tick: u64,
+    max_entries: usize,
+}
+
+impl RemoteDiskFdCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            access_tick: 0,
+            max_entries,
+        }
+    }
+
+    fn next_tick(&mut self) -> u64 {
+        self.access_tick = self.access_tick.wrapping_add(1);
+        self.access_tick
+    }
+
+    fn get(&mut self, key: &RemoteDiskFdCacheKey) -> Option<Arc<SyncMutex<RemoteDiskStorage>>> {
+        let tick = self.next_tick();
+        let entry = self.entries.get_mut(key)?;
+        entry.last_access_tick = tick;
+        Some(entry.storage.clone())
+    }
+
+    fn insert(
+        &mut self,
+        key: RemoteDiskFdCacheKey,
+        storage: Arc<SyncMutex<RemoteDiskStorage>>,
+    ) -> Arc<SyncMutex<RemoteDiskStorage>> {
+        if self.max_entries > 0 && self.entries.len() >= self.max_entries {
+            self.evict_lru();
+        }
+
+        let tick = self.next_tick();
+        self.entries.insert(
+            key,
+            RemoteDiskFdCacheEntry {
+                storage: storage.clone(),
+                last_access_tick: tick,
+            },
+        );
+        storage
+    }
+
+    fn evict_lru(&mut self) {
+        let Some(lru_key) = self
+            .entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_access_tick)
+            .map(|(k, _)| k.clone())
+        else {
+            return;
+        };
+
+        self.entries.remove(&lru_key);
+    }
+}
+
+async fn get_or_open_remote_disk_storage(
+    agent: &NixlAgent,
+    path: &str,
+    block_size: usize,
+    create: bool,
+    use_odirect: bool,
+) -> Result<Arc<SyncMutex<RemoteDiskStorage>>, TransferError> {
+    let key = RemoteDiskFdCacheKey {
+        path: path.to_string(),
+        use_odirect,
+    };
+
+    {
+        let mut cache = REMOTE_DISK_FD_CACHE.lock().await;
+        if let Some(storage) = cache.get(&key) {
+            return Ok(storage);
+        }
+    }
+
+    let mut storage =
+        RemoteDiskStorage::open(path, block_size, create, use_odirect).map_err(|e| {
+            TransferError::ExecutionError(format!(
+                "Failed to {} RemoteDiskStorage at {}: {:?}",
+                if create { "create" } else { "open" },
+                path,
+                e
+            ))
+        })?;
+    storage.nixl_register(agent, None).map_err(|e| {
+        TransferError::ExecutionError(format!("Failed to register disk storage {}: {:?}", path, e))
+    })?;
+
+    let storage = Arc::new(SyncMutex::new(storage));
+
+    let mut cache = REMOTE_DISK_FD_CACHE.lock().await;
+    if let Some(existing) = cache.get(&key) {
+        return Ok(existing);
+    }
+
+    Ok(cache.insert(key, storage))
+}
 
 /// Poll transfer status inline with cancellation support.
 ///
@@ -449,7 +581,8 @@ where
     // (OptArgs contains NonNull which is !Send)
     let (xfer_req, still_pending, disk_storages) = {
         // Dynamically create/open and register disk storage for each block
-        let mut disk_storages: Vec<RemoteDiskStorage> = Vec::with_capacity(num_blocks);
+        let mut disk_storages: Vec<Arc<SyncMutex<RemoteDiskStorage>>> =
+            Vec::with_capacity(num_blocks);
 
         for desc in descriptors.iter() {
             // Get file path from descriptor's DiskKey.
@@ -471,27 +604,14 @@ where
                 }
             };
 
-            // Open a short-lived RemoteDiskStorage handle for this transfer.
-            // RemoteDiskStorage holds an OwnedFd that closes automatically on
-            // drop, preventing fd accumulation across high-throughput transfers.
-            let mut disk_storage =
-                RemoteDiskStorage::open(&file_path, block_size, create_files, use_odirect)
-                    .map_err(|e| {
-                        TransferError::ExecutionError(format!(
-                            "Failed to {} RemoteDiskStorage at {}: {:?}",
-                            if create_files { "create" } else { "open" },
-                            file_path,
-                            e
-                        ))
-                    })?;
-
-            // Register with NIXL - this makes it available for transfers
-            disk_storage.nixl_register(agent, None).map_err(|e| {
-                TransferError::ExecutionError(format!(
-                    "Failed to register disk storage {}: {:?}",
-                    file_path, e
-                ))
-            })?;
+            let disk_storage = get_or_open_remote_disk_storage(
+                agent,
+                &file_path,
+                block_size,
+                create_files,
+                use_odirect,
+            )
+            .await?;
 
             disk_storages.push(disk_storage);
         }
@@ -512,7 +632,7 @@ where
             let _ = src_dl.add_desc(addr, block_size, 0);
 
             // Add FILE destination descriptor using the actual file descriptor
-            let fd = disk_storage.fd();
+            let fd = disk_storage.lock().fd();
             let _ = dst_dl.add_desc(0, block_size, fd);
         }
 
@@ -593,7 +713,8 @@ where
     // the committed data.  This is a no-op for GDS writes and for onboard.
     if create_files && !gds_write {
         for ds in &disk_storages {
-            ds.fdatasync()
+            ds.lock()
+                .fdatasync()
                 .map_err(|e| TransferError::ExecutionError(format!("fdatasync failed: {:?}", e)))?;
         }
     }
