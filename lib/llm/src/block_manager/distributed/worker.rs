@@ -212,10 +212,13 @@ async fn perform_allocation_and_build_handler(
 ) -> anyhow::Result<BlockTransferHandler> {
     // Determine if GDS_MT backend should be enabled:
     // - For local disk cache (G3): enabled if disk blocks are configured
-    // - For remote disk storage (G4): enabled if DYN_KVBM_REMOTE_DISK_PATH is set
+    // - For remote disk storage (G4): enabled if DYN_KVBM_REMOTE_DISK_PATH(S) is set
     //   and DYN_KVBM_REMOTE_DISK_USE_GDS is true (default: true)
     let use_gds_for_local_disk = leader_meta.num_disk_blocks > 0;
-    let use_gds_for_remote_disk = std::env::var("DYN_KVBM_REMOTE_DISK_PATH").is_ok()
+    let has_remote_disk = std::env::var("DYN_KVBM_REMOTE_DISK_PATH")
+        .or_else(|_| std::env::var("DYN_KVBM_REMOTE_DISK_PATHS"))
+        .is_ok();
+    let use_gds_for_remote_disk = has_remote_disk
         && std::env::var("DYN_KVBM_REMOTE_DISK_USE_GDS")
             .map(|v| v == "1" || v.to_lowercase() == "true")
             .unwrap_or(true);
@@ -1030,9 +1033,18 @@ fn remote_storage_config(worker_id: usize) -> Option<RemoteStorageConfig> {
         .or_else(|_| std::env::var("AWS_REGION"))
         .ok();
 
-    // Get disk storage config
+    // Get disk storage config (accept both singular and plural env vars;
+    // singular DYN_KVBM_REMOTE_DISK_PATH takes precedence, then the first
+    // entry of comma-separated DYN_KVBM_REMOTE_DISK_PATHS is used).
     let disk_path = std::env::var("DYN_KVBM_REMOTE_DISK_PATH")
         .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::env::var("DYN_KVBM_REMOTE_DISK_PATHS")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|paths| paths.split(',').next().map(|s| s.trim().to_string()))
+        })
         .map(|p| p.replace("{worker_id}", &worker_id.to_string()));
 
     let disk_use_gds = std::env::var("DYN_KVBM_REMOTE_DISK_USE_GDS")
@@ -1077,7 +1089,7 @@ fn remote_storage_config(worker_id: usize) -> Option<RemoteStorageConfig> {
                 })
             } else {
                 tracing::warn!(
-                    "DYN_KVBM_REMOTE_STORAGE_TYPE=disk but DYN_KVBM_REMOTE_DISK_PATH not set"
+                    "DYN_KVBM_REMOTE_STORAGE_TYPE=disk but neither DYN_KVBM_REMOTE_DISK_PATH nor DYN_KVBM_REMOTE_DISK_PATHS is set"
                 );
                 None
             }
@@ -1147,7 +1159,7 @@ fn remote_storage_config(worker_id: usize) -> Option<RemoteStorageConfig> {
             (None, None) => {
                 tracing::debug!(
                     worker_id = worker_id,
-                    "No remote storage configured (set DYN_KVBM_OBJECT_BUCKET or DYN_KVBM_REMOTE_DISK_PATH)"
+                    "No remote storage configured (set DYN_KVBM_OBJECT_BUCKET or DYN_KVBM_REMOTE_DISK_PATH/PATHS)"
                 );
                 None
             }

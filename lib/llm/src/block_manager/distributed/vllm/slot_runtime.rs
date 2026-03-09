@@ -11,23 +11,20 @@ use std::{
 
 use crate::{
     block_manager::{
-        BasicMetadata, DiskStorage, ImmutableBlock, PinnedStorage,
         block::{
-            BlockId,
             data::logical::distributed_leader_worker::DistributedLeaderWorkerResources,
-            locality::Logical,
-            transfer::remote::RemoteKey,
+            locality::Logical, transfer::remote::RemoteKey, BlockId,
         },
         connector::{
-            RequestKey,
             cache_stats::CacheStatsTracker,
             protocol::{RequestType, TransferType, WorkerTransferRequest},
             tier::{G4State, TierState},
+            RequestKey,
         },
         distributed::registry::{NoMetadata, PositionalKey},
-        distributed::{KvbmLeader, RemoteHashOperationsSync, vllm as vllm_int},
+        distributed::{vllm as vllm_int, KvbmLeader, RemoteHashOperationsSync},
         metrics_kvbm::KvbmMetrics,
-        KvBlockManager,
+        BasicMetadata, DiskStorage, ImmutableBlock, KvBlockManager, PinnedStorage,
     },
     tokens::{SaltHash, TokenBlock, TokenBlockSequence, Tokens},
 };
@@ -36,11 +33,10 @@ use tokio::{runtime::Handle, sync::mpsc};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    AnyBlocks, AnyImmutableBlocks, LocalOffloadRequest, LocalOnboardRequest, LocalTransferEngine,
-    LocalTransferRequest, PendingG4Lookup,
-    RemoteTransferRequest, OperationTracker, compute_tp_consensus_hashes, flush_batch_size,
-    g4_min_candidate_blocks, g4_transfer_timeout,
-    ExternallyManagedDeviceSlot, Slot, SlotError, SlotManager, SlotState,
+    compute_tp_consensus_hashes, flush_batch_size, g4_min_candidate_blocks, g4_transfer_timeout,
+    AnyBlocks, AnyImmutableBlocks, ExternallyManagedDeviceSlot, LocalOffloadRequest,
+    LocalOnboardRequest, LocalTransferEngine, LocalTransferRequest, OperationTracker,
+    PendingG4Lookup, RemoteTransferRequest, Slot, SlotError, SlotManager, SlotState,
 };
 
 type VllmBlockManager = KvBlockManager<Logical<DistributedLeaderWorkerResources>, BasicMetadata>;
@@ -869,13 +865,12 @@ impl VllmConnectorSlot {
         self.disk.stage_non_empty(disk_blocks);
 
         if !g4_hashes.is_empty() {
-            let start_block =
-                (num_computed_tokens / block_size) + num_matched_host_blocks + num_matched_disk_blocks;
-            let token_blocks = self.sequence.blocks()
-                [start_block..start_block + g4_hashes.len()]
-                .to_vec();
-            if let Ok(operation_id) =
-                self.prefetch_from_g4_to_host(g4_hashes.clone(), token_blocks)
+            let start_block = (num_computed_tokens / block_size)
+                + num_matched_host_blocks
+                + num_matched_disk_blocks;
+            let token_blocks =
+                self.sequence.blocks()[start_block..start_block + g4_hashes.len()].to_vec();
+            if let Ok(operation_id) = self.prefetch_from_g4_to_host(g4_hashes.clone(), token_blocks)
             {
                 self.host_prefetch = Some(G4HostPrefetchState {
                     operation_id,
@@ -1010,7 +1005,6 @@ impl VllmConnectorSlot {
             }
         }
     }
-
 }
 
 impl std::fmt::Debug for VllmConnectorSlot {
@@ -1529,9 +1523,13 @@ impl Slot for VllmConnectorSlot {
         }
 
         debug_assert_eq!(self.evaluated_blocks, 0);
-        debug_assert_eq!(self.current_position % self.block_size, 0);
         debug_assert_eq!(num_external_tokens % self.block_size, 0);
 
+        // Reset evaluated_blocks to current_position only; the onboard_*_tier
+        // macros below will each += their staged block count, which together
+        // cover all external blocks. Previously this line also added
+        // external_blocks, which double-counted when the macros ran.
+        let external_blocks = num_external_tokens / self.block_size;
         self.evaluated_blocks = self.current_position / self.block_size;
 
         tracing::info!(
@@ -1540,6 +1538,8 @@ impl Slot for VllmConnectorSlot {
             has_disk_staged = self.disk.staging.is_some(),
             has_g4_staged = self.g4.tier.staging.is_some(),
             evaluated_blocks = self.evaluated_blocks,
+            external_blocks,
+            current_position = self.current_position,
             "trigger_onboarding: dispatching transfers"
         );
 
@@ -1547,8 +1547,18 @@ impl Slot for VllmConnectorSlot {
         crate::onboard_local_tier!(self, disk, DiskStorage);
         crate::onboard_remote_tier!(self);
 
+        debug_assert_eq!(
+            self.evaluated_blocks,
+            self.current_position / self.block_size + external_blocks,
+            "after onboarding, evaluated_blocks should equal current_position/block_size + external_blocks"
+        );
+
         self.state = SlotState::Onboarding(num_external_tokens);
-        self.advance_computed_position(num_external_tokens)?;
+        // NOTE: Do NOT advance current_position here. The external tokens are
+        // being loaded asynchronously — they aren't computed yet. vLLM's scheduler
+        // will report the correct num_computed_tokens (which includes external tokens)
+        // in apply_scheduler_output, and current_position will be set via
+        // max(current_position, vllm_num_computed_tokens).
 
         Ok(())
     }
@@ -1655,7 +1665,8 @@ impl VllmConnectorSlot {
             return Ok(());
         };
 
-        self.host.clear_staging(&self.request_id, "prefetched host blocks");
+        self.host
+            .clear_staging(&self.request_id, "prefetched host blocks");
         self.staged_match_report_pending.clear();
         self.prefetched_g4_blocks_used_for_stats = 0;
 
@@ -1940,10 +1951,10 @@ impl VllmConnectorSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block_manager::distributed::vllm::integration::G4OnboardParams;
     use crate::block_manager::block::transfer::remote::{
         RemoteBlockDescriptor, RemoteTransferPipeline,
     };
+    use crate::block_manager::distributed::vllm::integration::G4OnboardParams;
     use crate::tokens::{TokenBlock, TokenBlockSequence, Tokens};
 
     fn make_token_blocks(tokens: &[u32]) -> Vec<TokenBlock> {
@@ -2100,7 +2111,10 @@ mod tests {
         assert_eq!(req.traceparent, traceparent);
         assert_eq!(
             req.sequence_hashes,
-            token_blocks.iter().map(|tb| tb.sequence_hash()).collect::<Vec<_>>()
+            token_blocks
+                .iter()
+                .map(|tb| tb.sequence_hash())
+                .collect::<Vec<_>>()
         );
     }
 

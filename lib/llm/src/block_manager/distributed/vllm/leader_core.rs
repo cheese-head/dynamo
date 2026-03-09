@@ -287,7 +287,12 @@ impl KvConnectorLeaderCore {
                 "update_state_after_alloc → triggering onboarding"
             );
             slot.record_cached_device_tokens(num_computed_tokens);
-            slot.advance_computed_position(num_computed_tokens)?;
+            // NOTE: Do NOT advance_computed_position here.
+            // vLLM's scheduler will report these tokens via num_computed_tokens
+            // in apply_scheduler_output, which uses max(current_position, vllm_computed)
+            // to advance. Advancing here would double-count: once from this call,
+            // and again when vLLM's num_scheduled_tokens covers the remaining tokens
+            // for the forward pass.
             slot.trigger_onboarding(num_external_tokens)?;
             self.onboarding_slots.insert(request_id);
         }
