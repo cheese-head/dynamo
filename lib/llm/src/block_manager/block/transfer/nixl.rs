@@ -21,6 +21,10 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_REMOTE_DISK_FD_CACHE_MAX_ENTRIES: usize = 50_000;
+const REMOTE_DISK_O_DIRECT_KEY: &str = "DYN_KVBM_REMOTE_DISK_O_DIRECT";
+const REMOTE_DISK_ALIGNMENT_VALIDATE_KEY: &str = "DYN_KVBM_REMOTE_DISK_VALIDATE_ALIGNMENT";
+const REMOTE_DISK_ALIGNMENT_OVERRIDE_KEY: &str = "DYN_KVBM_REMOTE_DISK_ALIGNMENT_BYTES";
+const DEFAULT_O_DIRECT_ALIGNMENT_FALLBACK: usize = 4096;
 
 static REMOTE_DISK_FD_CACHE_MAX_ENTRIES: Lazy<usize> = Lazy::new(|| {
     std::env::var("DYN_KVBM_REMOTE_DISK_FD_CACHE_MAX_ENTRIES")
@@ -31,6 +35,41 @@ static REMOTE_DISK_FD_CACHE_MAX_ENTRIES: Lazy<usize> = Lazy::new(|| {
 
 static REMOTE_DISK_FD_CACHE: Lazy<AsyncMutex<RemoteDiskFdCache>> =
     Lazy::new(|| AsyncMutex::new(RemoteDiskFdCache::new(*REMOTE_DISK_FD_CACHE_MAX_ENTRIES)));
+
+#[derive(Debug, Clone, Copy)]
+struct RemoteDiskAlignmentConfig {
+    quantum: usize,
+    validate: bool,
+}
+
+static REMOTE_DISK_ALIGNMENT_CONFIG: Lazy<RemoteDiskAlignmentConfig> = Lazy::new(|| {
+    let page_size = nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE)
+        .ok()
+        .flatten()
+        .and_then(|v| usize::try_from(v).ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_O_DIRECT_ALIGNMENT_FALLBACK);
+
+    let alignment_override = std::env::var(REMOTE_DISK_ALIGNMENT_OVERRIDE_KEY)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|v| *v > 0);
+
+    let quantum = alignment_override.unwrap_or(page_size);
+    let validate = std::env::var(REMOTE_DISK_ALIGNMENT_VALIDATE_KEY)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    tracing::info!(
+        target: "kvbm-g4",
+        page_size,
+        alignment_quantum = quantum,
+        validate_alignment = validate,
+        "remote disk alignment config initialized"
+    );
+
+    RemoteDiskAlignmentConfig { quantum, validate }
+});
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RemoteDiskFdCacheKey {
@@ -570,12 +609,31 @@ where
     // Resolve the GDS_MT backend handle once (None if not loaded in agent).
     let gds_backend = agent.get_backend("GDS_MT");
 
-    // O_DIRECT is required for GDS; POSIX works without it.
-    let use_odirect = if create_files {
+    // Optional: allow POSIX backend to also open files with O_DIRECT.
+    // This is independent from backend selection (GDS_MT vs POSIX).
+    let posix_odirect = std::env::var(REMOTE_DISK_O_DIRECT_KEY)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    // Determine whether this direction will use GDS backend.
+    let use_gds_backend = if create_files {
         gds_write
     } else {
         gds_read && gds_backend.is_some()
     };
+
+    // Enable O_DIRECT when using GDS backend, and optionally for POSIX when
+    // DYN_KVBM_REMOTE_DISK_O_DIRECT is set.
+    let use_odirect = use_gds_backend || (!use_gds_backend && posix_odirect);
+
+    let alignment_cfg = *REMOTE_DISK_ALIGNMENT_CONFIG;
+    if use_odirect && alignment_cfg.validate && !block_size.is_multiple_of(alignment_cfg.quantum) {
+        return Err(TransferError::ExecutionError(format!(
+            "O_DIRECT alignment validation failed: block_size must be {}-byte aligned (got {}). \
+             Set {}=false to disable validation.",
+            alignment_cfg.quantum, block_size, REMOTE_DISK_ALIGNMENT_VALIDATE_KEY
+        )));
+    }
 
     // Use a scope block to ensure all non-Send types are dropped before await
     // (OptArgs contains NonNull which is !Send)
@@ -627,6 +685,15 @@ where
         for (block, disk_storage) in local_blocks.iter().zip(disk_storages.iter()) {
             let block_view = block.block_data().block_view()?;
             let addr = unsafe { block_view.as_ptr() as usize };
+
+            if use_odirect && alignment_cfg.validate && !addr.is_multiple_of(alignment_cfg.quantum)
+            {
+                return Err(TransferError::ExecutionError(format!(
+                    "O_DIRECT alignment validation failed: host buffer address must be {}-byte aligned; got 0x{:x}. \
+                     Set {}=false to disable validation.",
+                    alignment_cfg.quantum, addr, REMOTE_DISK_ALIGNMENT_VALIDATE_KEY
+                )));
+            }
 
             // Add DRAM source descriptor
             let _ = src_dl.add_desc(addr, block_size, 0);
