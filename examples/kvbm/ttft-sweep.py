@@ -1043,7 +1043,7 @@ def run_scenario(
                         completion_tokens=r.get("completion_tokens"),
                         seed=r.get("seed"),
                     )
-                if clear_between and not skip_cpu_flush:
+                if clear_between and not skip_cpu_flush and mgmt_url:
                     time.sleep(5)
                     ensure_clear_cpu_pool(mgmt_url)
         else:
@@ -1124,11 +1124,11 @@ def setup_cold(
     seed: int | None = None,
 ):
     """Scenario 1: clear CPU pool but keep CPU lookup enabled."""
-    if not skip_cpu_flush:
+    if not skip_cpu_flush and mgmt_url:
         ensure_clear_cpu_pool(mgmt_url)
     send_request(url, model, messages, 1, seed=seed)
     time.sleep(5)
-    if not skip_cpu_flush:
+    if not skip_cpu_flush and mgmt_url:
         ensure_clear_cpu_pool(mgmt_url)
 
 
@@ -1193,7 +1193,7 @@ def print_comparison(cold: list[dict], warm: list[dict]):
 def main():
     parser = argparse.ArgumentParser(description="TTFT sweep")
     parser.add_argument("--url", default="http://localhost:19000", help="vLLM base URL")
-    parser.add_argument("--mgmt", default="http://localhost:19881", help="KVBM management URL")
+    parser.add_argument("--mgmt", default=None, help="KVBM management URL (omit to skip all CPU pool management)")
     parser.add_argument("--model", default="openai/gpt-oss-120b", help="Model name")
     parser.add_argument(
         "--isls", type=int, nargs="+",
@@ -1260,7 +1260,7 @@ def main():
     print(f"\n  TTFT Sweep")
     print(f"  Model:       {args.model}")
     print(f"  Endpoint:    {args.url}")
-    print(f"  Mgmt:        {args.mgmt}")
+    print(f"  Mgmt:        {args.mgmt or '(disabled)'}")
     print(f"  ISLs:        {', '.join(fmt_isl(i) for i in args.isls)}")
     print(f"  N/ISL:       {args.n}")
     print(f"  Concurrency: {args.concurrency}")
@@ -1283,12 +1283,14 @@ def main():
         os.environ["SEND_TRACEPARENT"] = "1"
     determinism.strict_text_match = args.strict_determinism
 
-    if not check_health(args.mgmt):
-        print(f"\n  ERROR: Management API not reachable at {args.mgmt}")
-        print(f"  Make sure KVBM_DEV_MODE=TRUE is set and the port is correct.")
-        sys.exit(1)
-
-    print(f"\n  Management API: OK")
+    if args.mgmt:
+        if not check_health(args.mgmt):
+            print(f"\n  ERROR: Management API not reachable at {args.mgmt}")
+            print(f"  Make sure KVBM_DEV_MODE=TRUE is set and the port is correct.")
+            sys.exit(1)
+        print(f"\n  Management API: OK")
+    else:
+        print(f"\n  Management API: disabled (CPU pool operations skipped)")
 
     scenario_map = {
         "cold": ("Scenario 1: Cold (CPU cache cleared)", setup_cold),
@@ -1300,8 +1302,9 @@ def main():
         name, setup_fn = scenario_map[scenario_key]
         print(f"\n  ▸ Running: {name}...")
 
-        clear_all_pools(args.mgmt)
-        time.sleep(1)
+        if args.mgmt:
+            clear_all_pools(args.mgmt)
+            time.sleep(1)
 
         results = run_scenario(
             scenario_key, args.url, args.model, args.mgmt,
