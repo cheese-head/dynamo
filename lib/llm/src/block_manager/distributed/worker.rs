@@ -38,6 +38,7 @@ use dynamo_runtime::utils::task::CriticalTaskExecutionHandle;
 use tokio::sync::{Mutex, RwLock, oneshot};
 
 const DEFAULT_REMOTE_TRANSFER_CONTEXT_POOL_SIZE: usize = 64;
+const NIXL_POSIX_API_KEY: &str = "DYN_KVBM_NIXL_POSIX_API";
 
 fn remote_transfer_context_pool_size() -> usize {
     std::env::var("DYN_KVBM_REMOTE_TRANSFER_CONTEXT_POOL_SIZE")
@@ -127,8 +128,77 @@ fn build_agent(worker_id: usize, use_gds: bool) -> anyhow::Result<NixlAgent> {
         }
     }
 
-    // Add POSIX backend (always required)
-    let (_, posix_params) = agent.get_plugin_params("POSIX")?;
+    // Add POSIX backend (always required). Allow forcing the POSIX queue API.
+    // Supported values:
+    // - auto (default): plugin chooses (typically linux_aio first)
+    // - uring: force io_uring
+    // - aio: force linux_aio (libaio)
+    // - posix_aio: force POSIX aio
+    let (_, default_posix_params) = agent.get_plugin_params("POSIX")?;
+    let mut posix_params = default_posix_params
+        .clone()
+        .map_err(|e| anyhow::anyhow!("Failed to clone POSIX default params: {}", e))?;
+    if let Ok(raw_api) = std::env::var(NIXL_POSIX_API_KEY) {
+        let api = raw_api.trim().to_ascii_lowercase();
+        match api.as_str() {
+            "" | "auto" => {
+                tracing::info!(
+                    worker_id = worker_id,
+                    api = raw_api.as_str(),
+                    "Using NIXL POSIX default queue selection"
+                );
+            }
+            "uring" | "io_uring" => {
+                posix_params
+                    .set("use_aio", "false")
+                    .map_err(|e| anyhow::anyhow!("Failed to set POSIX param use_aio: {}", e))?;
+                posix_params
+                    .set("use_uring", "true")
+                    .map_err(|e| anyhow::anyhow!("Failed to set POSIX param use_uring: {}", e))?;
+                posix_params
+                    .set("use_posix_aio", "false")
+                    .map_err(|e| anyhow::anyhow!("Failed to set POSIX param use_posix_aio: {}", e))?;
+                tracing::info!(worker_id = worker_id, "Configured NIXL POSIX queue API: io_uring");
+            }
+            "aio" | "linux_aio" | "libaio" => {
+                posix_params
+                    .set("use_aio", "true")
+                    .map_err(|e| anyhow::anyhow!("Failed to set POSIX param use_aio: {}", e))?;
+                posix_params
+                    .set("use_uring", "false")
+                    .map_err(|e| anyhow::anyhow!("Failed to set POSIX param use_uring: {}", e))?;
+                posix_params
+                    .set("use_posix_aio", "false")
+                    .map_err(|e| anyhow::anyhow!("Failed to set POSIX param use_posix_aio: {}", e))?;
+                tracing::info!(
+                    worker_id = worker_id,
+                    "Configured NIXL POSIX queue API: linux_aio"
+                );
+            }
+            "posix_aio" => {
+                posix_params
+                    .set("use_aio", "false")
+                    .map_err(|e| anyhow::anyhow!("Failed to set POSIX param use_aio: {}", e))?;
+                posix_params
+                    .set("use_uring", "false")
+                    .map_err(|e| anyhow::anyhow!("Failed to set POSIX param use_uring: {}", e))?;
+                posix_params
+                    .set("use_posix_aio", "true")
+                    .map_err(|e| anyhow::anyhow!("Failed to set POSIX param use_posix_aio: {}", e))?;
+                tracing::info!(
+                    worker_id = worker_id,
+                    "Configured NIXL POSIX queue API: posix_aio"
+                );
+            }
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "Invalid {} value '{}'. Supported: auto, uring, aio, posix_aio",
+                    NIXL_POSIX_API_KEY,
+                    raw_api
+                ));
+            }
+        }
+    }
     agent.create_backend("POSIX", &posix_params)?;
     tracing::debug!(
         worker_id = worker_id,
