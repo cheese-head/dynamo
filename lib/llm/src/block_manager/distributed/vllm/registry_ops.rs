@@ -133,9 +133,10 @@ fn build_entries(
     world_size: usize,
 ) -> Vec<(SequenceHash, u32, RemoteKey)> {
     match storage_config {
-        RemoteStorageConfig::Object { default_bucket, .. } => {
-            let template = default_bucket.as_deref().unwrap_or("dynamo-kv-cache");
-            let bucket = template.replace("{worker_id}", &worker_id.to_string());
+        RemoteStorageConfig::Object { .. } => {
+            let bucket = storage_config
+                .resolve_bucket(worker_id)
+                .unwrap_or_else(|| "dynamo-kv-cache".to_string());
             hashes_with_positions
                 .iter()
                 .map(|&(hash, pos)| {

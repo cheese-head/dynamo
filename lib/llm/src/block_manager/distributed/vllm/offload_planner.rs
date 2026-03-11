@@ -16,21 +16,26 @@ pub fn create_descriptors(
     world_size: usize,
 ) -> Vec<RemoteBlockDescriptor> {
     match storage_config {
-        RemoteStorageConfig::Object { default_bucket, .. } => {
-            let bucket = default_bucket.as_deref().unwrap_or("dynamo-kv-cache");
+        RemoteStorageConfig::Object { .. } => {
+            let bucket = storage_config
+                .resolve_bucket(worker_id)
+                .unwrap_or_else(|| "dynamo-kv-cache".to_string());
             hashes
                 .iter()
-                .map(|&hash| RemoteBlockDescriptor::object_from_hash(bucket, hash, block_size))
+                .map(|&hash| RemoteBlockDescriptor::object_from_hash(&bucket, hash, block_size))
                 .collect()
         }
-        RemoteStorageConfig::Disk { base_path, .. } => hashes
-            .iter()
-            .map(|&hash| {
-                RemoteBlockDescriptor::disk_from_hash(
-                    base_path, hash, block_size, worker_id, world_size,
-                )
-            })
-            .collect(),
+        RemoteStorageConfig::Disk { base_path, .. } => {
+            let path = base_path.replace("{worker_id}", &worker_id.to_string());
+            hashes
+                .iter()
+                .map(|&hash| {
+                    RemoteBlockDescriptor::disk_from_hash(
+                        &path, hash, block_size, worker_id, world_size,
+                    )
+                })
+                .collect()
+        }
     }
 }
 

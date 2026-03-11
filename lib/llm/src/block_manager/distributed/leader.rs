@@ -313,11 +313,11 @@ impl KvbmLeader {
             .unwrap_or_else(|_| "auto".to_string())
             .to_lowercase();
 
-        // Get object storage config
-        let bucket = std::env::var("DYN_KVBM_OBJECT_BUCKET")
+        // Get object storage config — keep raw template; {worker_id} is resolved
+        // at transfer / registry time so register_tp can derive per-worker buckets.
+        let bucket_template = std::env::var("DYN_KVBM_OBJECT_BUCKET")
             .or_else(|_| std::env::var("AWS_DEFAULT_BUCKET"))
-            .ok()
-            .map(|b| b.replace("{worker_id}", &worker_id.to_string()));
+            .ok();
 
         let object_endpoint = std::env::var("DYN_KVBM_OBJECT_ENDPOINT")
             .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
@@ -328,10 +328,25 @@ impl KvbmLeader {
             .or_else(|_| std::env::var("AWS_REGION"))
             .ok();
 
-        // Get disk storage config
-        let disk_path = std::env::var("DYN_KVBM_REMOTE_DISK_PATH")
-            .ok()
-            .map(|p| p.replace("{worker_id}", &worker_id.to_string()));
+        let object_access_key = std::env::var("DYN_KVBM_OBJECT_ACCESS_KEY")
+            .or_else(|_| std::env::var("AWS_ACCESS_KEY_ID"))
+            .ok();
+        let object_secret_key = std::env::var("DYN_KVBM_OBJECT_SECRET_KEY")
+            .or_else(|_| std::env::var("AWS_SECRET_ACCESS_KEY"))
+            .ok();
+        let object_session_token = std::env::var("DYN_KVBM_OBJECT_SESSION_TOKEN")
+            .or_else(|_| std::env::var("AWS_SESSION_TOKEN"))
+            .ok();
+        let object_scheme = std::env::var("DYN_KVBM_OBJECT_SCHEME").ok();
+        let object_use_virtual_addressing =
+            std::env::var("DYN_KVBM_OBJECT_USE_VIRTUAL_ADDRESSING")
+                .ok()
+                .map(|v| v == "1" || v.to_lowercase() == "true");
+        let object_req_checksum = std::env::var("DYN_KVBM_OBJECT_REQ_CHECKSUM").ok();
+        let object_ca_bundle = std::env::var("DYN_KVBM_OBJECT_CA_BUNDLE").ok();
+
+        // Get disk storage config — keep raw template
+        let disk_path = std::env::var("DYN_KVBM_REMOTE_DISK_PATH").ok();
 
         let disk_use_gds = std::env::var("DYN_KVBM_REMOTE_DISK_USE_GDS")
             .map(|v| v == "1" || v.to_lowercase() == "true")
@@ -350,22 +365,27 @@ impl KvbmLeader {
             DISK_FLAG_GDS_WRITE | DISK_FLAG_GDS_READ
         };
 
+        let make_object = || RemoteStorageConfig::Object {
+            bucket_template: bucket_template.clone(),
+            endpoint: object_endpoint.clone(),
+            region: object_region.clone(),
+            access_key: object_access_key.clone(),
+            secret_key: object_secret_key.clone(),
+            session_token: object_session_token.clone(),
+            scheme: object_scheme.clone(),
+            use_virtual_addressing: object_use_virtual_addressing,
+            req_checksum: object_req_checksum.clone(),
+            ca_bundle: object_ca_bundle.clone(),
+        };
+
         match storage_type.as_str() {
             "disk" => disk_path.map(|path| RemoteStorageConfig::Disk {
                 base_path: path,
                 transfer_flags: disk_flags,
             }),
-            "object" => Some(RemoteStorageConfig::Object {
-                default_bucket: bucket,
-                endpoint: object_endpoint,
-                region: object_region,
-            }),
-            _ => match (&bucket, &disk_path) {
-                (Some(_), Some(_)) | (Some(_), None) => Some(RemoteStorageConfig::Object {
-                    default_bucket: bucket,
-                    endpoint: object_endpoint,
-                    region: object_region,
-                }),
+            "object" => Some(make_object()),
+            _ => match (&bucket_template, &disk_path) {
+                (Some(_), Some(_)) | (Some(_), None) => Some(make_object()),
                 (None, Some(path)) => Some(RemoteStorageConfig::Disk {
                     base_path: path.clone(),
                     transfer_flags: disk_flags,

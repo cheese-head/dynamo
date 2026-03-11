@@ -384,10 +384,22 @@ pub const DISK_FLAGS_GDS_READS_ONLY: DiskTransferFlags = DISK_FLAG_GDS_READ;
 
 #[derive(Clone, Debug)]
 pub enum RemoteStorageConfig {
+    /// Object storage (S3-compatible).
+    ///
+    /// `bucket_template` may contain `{worker_id}` which is resolved per-TP-rank
+    /// at transfer / registry time.  It must NOT be resolved early so that
+    /// `register_tp` can derive the correct bucket for every worker.
     Object {
-        default_bucket: Option<String>,
+        bucket_template: Option<String>,
         endpoint: Option<String>,
         region: Option<String>,
+        access_key: Option<String>,
+        secret_key: Option<String>,
+        session_token: Option<String>,
+        scheme: Option<String>,
+        use_virtual_addressing: Option<bool>,
+        req_checksum: Option<String>,
+        ca_bundle: Option<String>,
     },
     Disk {
         base_path: String,
@@ -398,9 +410,16 @@ pub enum RemoteStorageConfig {
 impl RemoteStorageConfig {
     pub fn object(bucket: impl Into<String>) -> Self {
         Self::Object {
-            default_bucket: Some(bucket.into()),
+            bucket_template: Some(bucket.into()),
             endpoint: None,
             region: None,
+            access_key: None,
+            secret_key: None,
+            session_token: None,
+            scheme: None,
+            use_virtual_addressing: None,
+            req_checksum: None,
+            ca_bundle: None,
         }
     }
 
@@ -410,9 +429,28 @@ impl RemoteStorageConfig {
         region: Option<String>,
     ) -> Self {
         Self::Object {
-            default_bucket: bucket,
+            bucket_template: bucket,
             endpoint,
             region,
+            access_key: None,
+            secret_key: None,
+            session_token: None,
+            scheme: None,
+            use_virtual_addressing: None,
+            req_checksum: None,
+            ca_bundle: None,
+        }
+    }
+
+    /// Resolve `{worker_id}` in the bucket template for a specific TP rank.
+    pub fn resolve_bucket(&self, worker_id: usize) -> Option<String> {
+        match self {
+            Self::Object {
+                bucket_template, ..
+            } => bucket_template
+                .as_deref()
+                .map(|t| t.replace("{worker_id}", &worker_id.to_string())),
+            _ => None,
         }
     }
 
@@ -441,15 +479,11 @@ pub struct RemoteContextConfig {
 }
 
 impl RemoteTransferContext {
-    pub fn for_object(base: Arc<TransferContext>, default_bucket: Option<String>) -> Self {
+    pub fn for_object(base: Arc<TransferContext>, bucket_template: Option<String>) -> Self {
         let tx = spawn_notification_handler(base.async_rt_handle());
         Self {
             base,
-            config: RemoteStorageConfig::Object {
-                default_bucket,
-                endpoint: None,
-                region: None,
-            },
+            config: RemoteStorageConfig::object_with_options(bucket_template, None, None),
             worker_id: 0,
             tx_notifications: Some(tx),
         }
@@ -457,7 +491,7 @@ impl RemoteTransferContext {
 
     pub fn for_object_with_options(
         base: Arc<TransferContext>,
-        default_bucket: Option<String>,
+        bucket_template: Option<String>,
         endpoint: Option<String>,
         region: Option<String>,
         worker_id: u64,
@@ -465,11 +499,7 @@ impl RemoteTransferContext {
         let tx = spawn_notification_handler(base.async_rt_handle());
         Self {
             base,
-            config: RemoteStorageConfig::Object {
-                default_bucket,
-                endpoint,
-                region,
-            },
+            config: RemoteStorageConfig::object_with_options(bucket_template, endpoint, region),
             worker_id,
             tx_notifications: Some(tx),
         }
@@ -527,9 +557,11 @@ impl RemoteTransferContext {
         self.worker_id
     }
 
-    pub fn default_bucket(&self) -> Option<&str> {
+    pub fn bucket_template(&self) -> Option<&str> {
         match &self.config {
-            RemoteStorageConfig::Object { default_bucket, .. } => default_bucket.as_deref(),
+            RemoteStorageConfig::Object {
+                bucket_template, ..
+            } => bucket_template.as_deref(),
             _ => None,
         }
     }
@@ -614,11 +646,12 @@ mod tests {
             let config = RemoteStorageConfig::object("my-bucket");
             match config {
                 RemoteStorageConfig::Object {
-                    default_bucket,
+                    bucket_template,
                     endpoint,
                     region,
+                    ..
                 } => {
-                    assert_eq!(default_bucket, Some("my-bucket".to_string()));
+                    assert_eq!(bucket_template, Some("my-bucket".to_string()));
                     assert!(endpoint.is_none());
                     assert!(region.is_none());
                 }
@@ -635,11 +668,12 @@ mod tests {
             );
             match config {
                 RemoteStorageConfig::Object {
-                    default_bucket,
+                    bucket_template,
                     endpoint,
                     region,
+                    ..
                 } => {
-                    assert_eq!(default_bucket, Some("test-bucket".to_string()));
+                    assert_eq!(bucket_template, Some("test-bucket".to_string()));
                     assert_eq!(endpoint, Some("http://localhost:9000".to_string()));
                     assert_eq!(region, Some("us-west-2".to_string()));
                 }
@@ -652,16 +686,31 @@ mod tests {
             let config = RemoteStorageConfig::object_with_options(None, None, None);
             match config {
                 RemoteStorageConfig::Object {
-                    default_bucket,
+                    bucket_template,
                     endpoint,
                     region,
+                    ..
                 } => {
-                    assert!(default_bucket.is_none());
+                    assert!(bucket_template.is_none());
                     assert!(endpoint.is_none());
                     assert!(region.is_none());
                 }
                 _ => panic!("Expected Object variant"),
             }
+        }
+
+        #[test]
+        fn test_resolve_bucket_with_worker_id() {
+            let config = RemoteStorageConfig::object("kvcache-{worker_id}");
+            assert_eq!(config.resolve_bucket(0), Some("kvcache-0".to_string()));
+            assert_eq!(config.resolve_bucket(3), Some("kvcache-3".to_string()));
+        }
+
+        #[test]
+        fn test_resolve_bucket_without_template() {
+            let config = RemoteStorageConfig::object("flat-bucket");
+            assert_eq!(config.resolve_bucket(0), Some("flat-bucket".to_string()));
+            assert_eq!(config.resolve_bucket(5), Some("flat-bucket".to_string()));
         }
 
         #[test]
@@ -717,10 +766,12 @@ mod tests {
             match (config, cloned) {
                 (
                     RemoteStorageConfig::Object {
-                        default_bucket: b1, ..
+                        bucket_template: b1,
+                        ..
                     },
                     RemoteStorageConfig::Object {
-                        default_bucket: b2, ..
+                        bucket_template: b2,
+                        ..
                     },
                 ) => {
                     assert_eq!(b1, b2);
@@ -749,8 +800,10 @@ mod tests {
             };
             assert_eq!(config.worker_id, 42);
             match config.remote_storage_config {
-                RemoteStorageConfig::Object { default_bucket, .. } => {
-                    assert_eq!(default_bucket, Some("test-bucket".to_string()));
+                RemoteStorageConfig::Object {
+                    bucket_template, ..
+                } => {
+                    assert_eq!(bucket_template, Some("test-bucket".to_string()));
                 }
                 _ => panic!("Expected Object variant"),
             }

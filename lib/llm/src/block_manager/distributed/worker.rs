@@ -206,48 +206,65 @@ fn build_agent(worker_id: usize, use_gds: bool) -> anyhow::Result<NixlAgent> {
         "Created NIXL agent with POSIX backend"
     );
 
-    // Add OBJ backend if bucket is configured via DYN_KVBM_OBJECT_BUCKET
+    // Add OBJ backend if bucket is configured via DYN_KVBM_OBJECT_BUCKET.
+    // Resolve {worker_id} here for the NIXL backend (this process's rank).
     if let Ok(bucket_template) = std::env::var("DYN_KVBM_OBJECT_BUCKET") {
-        // Apply worker_id templating to bucket name
-        // This allows per-worker buckets like "kvcache-worker-{worker_id}" -> "kvcache-worker-0"
-        let templated_bucket = bucket_template.replace("{worker_id}", &worker_id.to_string());
+        let resolved_bucket = bucket_template.replace("{worker_id}", &worker_id.to_string());
 
         match agent.get_plugin_params("OBJ") {
             Ok((_, default_params)) => {
-                // Log default params for debugging (helps verify correct param names)
-                tracing::debug!(
-                    worker_id = worker_id,
-                    default_params = ?(&default_params).into_iter().collect::<Vec<_>>(),
-                    "OBJ plugin default params"
-                );
-
-                // Clone default params and add custom overrides using the new Params API
                 let mut params = default_params
                     .clone()
                     .map_err(|e| anyhow::anyhow!("Failed to clone OBJ default params: {}", e))?;
 
-                // Set bucket name
                 params
-                    .set("bucket", &templated_bucket)
+                    .set("bucket", &resolved_bucket)
                     .map_err(|e| anyhow::anyhow!("Failed to set bucket param: {}", e))?;
 
-                // Add endpoint override if configured
-                if let Ok(endpoint) = std::env::var("DYN_KVBM_OBJECT_ENDPOINT") {
-                    params.set("endpoint_override", &endpoint).map_err(|e| {
-                        anyhow::anyhow!("Failed to set endpoint_override param: {}", e)
-                    })?;
-                    tracing::debug!(
-                        worker_id = worker_id,
-                        endpoint_override = %endpoint,
-                        "Configuring OBJ backend with custom endpoint"
-                    );
+                // Map environment variables to NIXL OBJ backend parameters.
+                let obj_env_mappings: &[(&str, &str)] = &[
+                    ("DYN_KVBM_OBJECT_ENDPOINT", "endpoint_override"),
+                    ("DYN_KVBM_OBJECT_ACCESS_KEY", "access_key"),
+                    ("DYN_KVBM_OBJECT_SECRET_KEY", "secret_key"),
+                    ("DYN_KVBM_OBJECT_SESSION_TOKEN", "session_token"),
+                    ("DYN_KVBM_OBJECT_SCHEME", "scheme"),
+                    ("DYN_KVBM_OBJECT_REGION", "region"),
+                    ("DYN_KVBM_OBJECT_USE_VIRTUAL_ADDRESSING", "use_virtual_addressing"),
+                    ("DYN_KVBM_OBJECT_REQ_CHECKSUM", "req_checksum"),
+                    ("DYN_KVBM_OBJECT_CA_BUNDLE", "ca_bundle"),
+                    ("DYN_KVBM_OBJECT_NUM_THREADS", "num_threads"),
+                ];
+                for &(env_var, param_name) in obj_env_mappings {
+                    if let Ok(val) = std::env::var(env_var) {
+                        params.set(param_name, &val).map_err(|e| {
+                            anyhow::anyhow!("Failed to set {} param: {}", param_name, e)
+                        })?;
+                    }
+                }
+
+                // Fall back to AWS SDK env vars when DYN_KVBM_ variants are not set.
+                let aws_fallbacks: &[(&str, &str, &str)] = &[
+                    ("DYN_KVBM_OBJECT_ENDPOINT", "AWS_ENDPOINT_URL", "endpoint_override"),
+                    ("DYN_KVBM_OBJECT_ACCESS_KEY", "AWS_ACCESS_KEY_ID", "access_key"),
+                    ("DYN_KVBM_OBJECT_SECRET_KEY", "AWS_SECRET_ACCESS_KEY", "secret_key"),
+                    ("DYN_KVBM_OBJECT_SESSION_TOKEN", "AWS_SESSION_TOKEN", "session_token"),
+                    ("DYN_KVBM_OBJECT_REGION", "AWS_REGION", "region"),
+                ];
+                for &(primary, fallback, param_name) in aws_fallbacks {
+                    if std::env::var(primary).is_err() {
+                        if let Ok(val) = std::env::var(fallback) {
+                            params.set(param_name, &val).map_err(|e| {
+                                anyhow::anyhow!("Failed to set {} param: {}", param_name, e)
+                            })?;
+                        }
+                    }
                 }
 
                 match agent.create_backend("OBJ", &params) {
                     Ok(_) => {
                         tracing::info!(
                             worker_id = worker_id,
-                            bucket = %templated_bucket,
+                            bucket = %resolved_bucket,
                             "Created OBJ backend for object storage"
                         );
                     }
@@ -1088,11 +1105,11 @@ fn remote_storage_config(worker_id: usize) -> Option<RemoteStorageConfig> {
         std::env::var("DYN_KVBM_REMOTE_STORAGE_TYPE").unwrap_or_else(|_| "auto".to_string());
     let storage_type = storage_type.to_lowercase();
 
-    // Get object storage config
-    let bucket = std::env::var("DYN_KVBM_OBJECT_BUCKET")
+    // Get object storage config — keep raw template; {worker_id} is resolved
+    // at transfer / registry time so register_tp can derive per-worker buckets.
+    let bucket_template = std::env::var("DYN_KVBM_OBJECT_BUCKET")
         .or_else(|_| std::env::var("AWS_DEFAULT_BUCKET"))
-        .ok()
-        .map(|b| b.replace("{worker_id}", &worker_id.to_string()));
+        .ok();
 
     let object_endpoint = std::env::var("DYN_KVBM_OBJECT_ENDPOINT")
         .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
@@ -1103,9 +1120,27 @@ fn remote_storage_config(worker_id: usize) -> Option<RemoteStorageConfig> {
         .or_else(|_| std::env::var("AWS_REGION"))
         .ok();
 
+    let object_access_key = std::env::var("DYN_KVBM_OBJECT_ACCESS_KEY")
+        .or_else(|_| std::env::var("AWS_ACCESS_KEY_ID"))
+        .ok();
+    let object_secret_key = std::env::var("DYN_KVBM_OBJECT_SECRET_KEY")
+        .or_else(|_| std::env::var("AWS_SECRET_ACCESS_KEY"))
+        .ok();
+    let object_session_token = std::env::var("DYN_KVBM_OBJECT_SESSION_TOKEN")
+        .or_else(|_| std::env::var("AWS_SESSION_TOKEN"))
+        .ok();
+    let object_scheme = std::env::var("DYN_KVBM_OBJECT_SCHEME").ok();
+    let object_use_virtual_addressing =
+        std::env::var("DYN_KVBM_OBJECT_USE_VIRTUAL_ADDRESSING")
+            .ok()
+            .map(|v| v == "1" || v.to_lowercase() == "true");
+    let object_req_checksum = std::env::var("DYN_KVBM_OBJECT_REQ_CHECKSUM").ok();
+    let object_ca_bundle = std::env::var("DYN_KVBM_OBJECT_CA_BUNDLE").ok();
+
     // Get disk storage config (accept both singular and plural env vars;
     // singular DYN_KVBM_REMOTE_DISK_PATH takes precedence, then the first
     // entry of comma-separated DYN_KVBM_REMOTE_DISK_PATHS is used).
+    // Keep raw template — {worker_id} resolved at transfer time.
     let disk_path = std::env::var("DYN_KVBM_REMOTE_DISK_PATH")
         .ok()
         .filter(|s| !s.is_empty())
@@ -1114,8 +1149,7 @@ fn remote_storage_config(worker_id: usize) -> Option<RemoteStorageConfig> {
                 .ok()
                 .filter(|s| !s.is_empty())
                 .and_then(|paths| paths.split(',').next().map(|s| s.trim().to_string()))
-        })
-        .map(|p| p.replace("{worker_id}", &worker_id.to_string()));
+        });
 
     let disk_use_gds = std::env::var("DYN_KVBM_REMOTE_DISK_USE_GDS")
         .map(|v| v == "1" || v.to_lowercase() == "true")
@@ -1134,6 +1168,19 @@ fn remote_storage_config(worker_id: usize) -> Option<RemoteStorageConfig> {
         DISK_FLAG_GDS_WRITE | DISK_FLAG_GDS_READ
     };
 
+    let make_object = || RemoteStorageConfig::Object {
+        bucket_template: bucket_template.clone(),
+        endpoint: object_endpoint.clone(),
+        region: object_region.clone(),
+        access_key: object_access_key.clone(),
+        secret_key: object_secret_key.clone(),
+        session_token: object_session_token.clone(),
+        scheme: object_scheme.clone(),
+        use_virtual_addressing: object_use_virtual_addressing,
+        req_checksum: object_req_checksum.clone(),
+        ca_bundle: object_ca_bundle.clone(),
+    };
+
     match storage_type.as_str() {
         "disk" => {
             if let Some(path) = disk_path {
@@ -1144,10 +1191,11 @@ fn remote_storage_config(worker_id: usize) -> Option<RemoteStorageConfig> {
                     "Creating remote context for disk storage (explicit)"
                 );
 
-                if let Err(e) = fs::create_dir_all(&path) {
+                let resolved = path.replace("{worker_id}", &worker_id.to_string());
+                if let Err(e) = fs::create_dir_all(&resolved) {
                     tracing::warn!(
                         worker_id = worker_id,
-                        base_path = %path,
+                        base_path = %resolved,
                         error = %e,
                         "Failed to create remote disk base path; remote transfers may fail"
                     );
@@ -1167,42 +1215,30 @@ fn remote_storage_config(worker_id: usize) -> Option<RemoteStorageConfig> {
         "object" => {
             tracing::info!(
                 worker_id = worker_id,
-                bucket = ?bucket,
+                bucket_template = ?bucket_template,
                 endpoint = ?object_endpoint,
                 "Creating remote context for object storage (explicit)"
             );
-            Some(RemoteStorageConfig::Object {
-                default_bucket: bucket,
-                endpoint: object_endpoint,
-                region: object_region,
-            })
+            Some(make_object())
         }
-        _ => match (&bucket, &disk_path) {
+        _ => match (&bucket_template, &disk_path) {
             (Some(_), Some(path)) => {
                 tracing::info!(
                     worker_id = worker_id,
-                    bucket = ?bucket,
+                    bucket_template = ?bucket_template,
                     disk_path = %path,
                     "Both object and disk storage configured, defaulting to object"
                 );
-                Some(RemoteStorageConfig::Object {
-                    default_bucket: bucket,
-                    endpoint: object_endpoint,
-                    region: object_region,
-                })
+                Some(make_object())
             }
             (Some(_), None) => {
                 tracing::info!(
                     worker_id = worker_id,
-                    bucket = ?bucket,
+                    bucket_template = ?bucket_template,
                     endpoint = ?object_endpoint,
                     "Creating remote context for object storage (auto-detected)"
                 );
-                Some(RemoteStorageConfig::Object {
-                    default_bucket: bucket,
-                    endpoint: object_endpoint,
-                    region: object_region,
-                })
+                Some(make_object())
             }
             (None, Some(path)) => {
                 tracing::info!(
@@ -1212,10 +1248,11 @@ fn remote_storage_config(worker_id: usize) -> Option<RemoteStorageConfig> {
                     "Creating remote context for disk storage (auto-detected)"
                 );
 
-                if let Err(e) = fs::create_dir_all(&path) {
+                let resolved = path.replace("{worker_id}", &worker_id.to_string());
+                if let Err(e) = fs::create_dir_all(&resolved) {
                     tracing::warn!(
                         worker_id = worker_id,
-                        base_path = %path,
+                        base_path = %resolved,
                         error = %e,
                         "Failed to create remote disk base path; remote transfers may fail"
                     );

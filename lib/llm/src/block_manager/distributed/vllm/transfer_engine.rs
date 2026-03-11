@@ -603,9 +603,16 @@ async fn process_remote_transfer_request(
 
     let num_blocks = hashes_with_positions.len();
     let storage_config = leader.remote_storage_config().unwrap_or_else(|| RemoteStorageConfig::Object {
-        default_bucket: std::env::var("AWS_DEFAULT_BUCKET").ok(),
+        bucket_template: std::env::var("AWS_DEFAULT_BUCKET").ok(),
         endpoint: None,
         region: None,
+        access_key: None,
+        secret_key: None,
+        session_token: None,
+        scheme: None,
+        use_virtual_addressing: None,
+        req_checksum: None,
+        ca_bundle: None,
     });
     let backend_label = match &storage_config {
         RemoteStorageConfig::Object { .. } => "object",

@@ -468,7 +468,7 @@ where
     <LB as StorageTypeProvider>::StorageType: NixlDescriptor,
 {
     let num_blocks = descriptors.len();
-    let _default_bucket = ctx.default_bucket().unwrap_or("default");
+    let _bucket_template = ctx.bucket_template().unwrap_or("default");
 
     // Use a scope block to ensure all non-Send types are dropped before await
     let (xfer_req, still_pending) = {
