@@ -34,6 +34,12 @@ pub struct WorkerMetadata {
 pub struct LeaderMetadata {
     pub num_host_blocks: usize,
     pub num_disk_blocks: usize,
+    #[serde(default = "default_world_size")]
+    pub world_size: usize,
+}
+
+fn default_world_size() -> usize {
+    1
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Copy)]

@@ -380,7 +380,7 @@ async fn perform_allocation_and_build_handler(
     // Create remote context if we have host blocks (for bounce buffers)
     // Supports both Object storage (S3/MinIO) and Disk storage (shared filesystem)
     let remote_context_pool = if host_blocks.is_some() {
-        create_remote_context_pool(transfer_context.clone(), worker_id)?
+        create_remote_context_pool(transfer_context.clone(), worker_id, leader_meta.world_size)?
     } else {
         None
     };
@@ -1137,10 +1137,10 @@ fn remote_storage_config(worker_id: usize) -> Option<RemoteStorageConfig> {
     let object_req_checksum = std::env::var("DYN_KVBM_OBJECT_REQ_CHECKSUM").ok();
     let object_ca_bundle = std::env::var("DYN_KVBM_OBJECT_CA_BUNDLE").ok();
 
-    // Get disk storage config (accept both singular and plural env vars;
-    // singular DYN_KVBM_REMOTE_DISK_PATH takes precedence, then the first
-    // entry of comma-separated DYN_KVBM_REMOTE_DISK_PATHS is used).
-    // Keep raw template — {worker_id} resolved at transfer time.
+    // Get disk storage config (accept both singular and plural env vars).
+    // Singular DYN_KVBM_REMOTE_DISK_PATH (may contain {worker_id} template)
+    // takes precedence. Plural DYN_KVBM_REMOTE_DISK_PATHS is a comma-separated
+    // list of explicit per-worker paths; index by worker_id.
     let disk_path = std::env::var("DYN_KVBM_REMOTE_DISK_PATH")
         .ok()
         .filter(|s| !s.is_empty())
@@ -1148,7 +1148,13 @@ fn remote_storage_config(worker_id: usize) -> Option<RemoteStorageConfig> {
             std::env::var("DYN_KVBM_REMOTE_DISK_PATHS")
                 .ok()
                 .filter(|s| !s.is_empty())
-                .and_then(|paths| paths.split(',').next().map(|s| s.trim().to_string()))
+                .and_then(|paths| {
+                    let entries: Vec<&str> = paths.split(',').collect();
+                    entries
+                        .get(worker_id)
+                        .or(entries.first())
+                        .map(|s| s.trim().to_string())
+                })
         });
 
     let disk_use_gds = std::env::var("DYN_KVBM_REMOTE_DISK_USE_GDS")
@@ -1192,6 +1198,14 @@ fn remote_storage_config(worker_id: usize) -> Option<RemoteStorageConfig> {
                 );
 
                 let resolved = path.replace("{worker_id}", &worker_id.to_string());
+                tracing::info!(
+                    worker_id = worker_id,
+                    raw_path = %path,
+                    resolved_path = %resolved,
+                    use_gds = disk_use_gds,
+                    gds_reads_only = disk_gds_reads_only,
+                    "Disk storage configured for worker"
+                );
                 if let Err(e) = fs::create_dir_all(&resolved) {
                     tracing::warn!(
                         worker_id = worker_id,
@@ -1277,6 +1291,7 @@ fn remote_storage_config(worker_id: usize) -> Option<RemoteStorageConfig> {
 fn create_remote_context_pool(
     transfer_context: Arc<crate::block_manager::block::transfer::TransferContext>,
     worker_id: usize,
+    world_size: usize,
 ) -> anyhow::Result<Option<Arc<RemoteTransferContextPool>>> {
     let Some(storage_config) = remote_storage_config(worker_id) else {
         return Ok(None);
@@ -1297,7 +1312,7 @@ fn create_remote_context_pool(
         )?);
         contexts.push(Arc::new(
             RemoteTransferContext::new(base, storage_config.clone())
-                .with_worker_id(worker_id as u64),
+                .with_topology(worker_id as u64, world_size),
         ));
     }
 

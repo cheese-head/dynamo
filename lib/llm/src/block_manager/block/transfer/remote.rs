@@ -110,6 +110,7 @@ impl DiskKey {
     pub fn full_path(&self) -> String {
         format!("{}/{}", self.path, self.key)
     }
+
 }
 
 impl RemoteKey {

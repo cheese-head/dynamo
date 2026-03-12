@@ -936,7 +936,11 @@ impl VllmConnectorSlot {
         }
 
         let matched_len = matched.len();
-        self.host.stage_non_empty(matched);
+        if let Some(existing) = self.host.staging.as_mut() {
+            existing.extend(matched);
+        } else {
+            self.host.stage_non_empty(matched);
+        }
         self.prefetched_g4_blocks_used_for_stats = matched_len;
         prefetch.status = G4HostPrefetchStatus::Ready;
         self.state = SlotState::OnboardStaged(prefetch.num_external_tokens);

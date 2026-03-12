@@ -345,8 +345,20 @@ impl KvbmLeader {
         let object_req_checksum = std::env::var("DYN_KVBM_OBJECT_REQ_CHECKSUM").ok();
         let object_ca_bundle = std::env::var("DYN_KVBM_OBJECT_CA_BUNDLE").ok();
 
-        // Get disk storage config — keep raw template
-        let disk_path = std::env::var("DYN_KVBM_REMOTE_DISK_PATH").ok();
+        // Get disk storage config — keep raw template.
+        // Singular DYN_KVBM_REMOTE_DISK_PATH (may contain {worker_id} template)
+        // takes precedence. Plural DYN_KVBM_REMOTE_DISK_PATHS uses first entry
+        // so the leader knows disk storage is configured; each worker selects its
+        // own mount by indexing into the list at transfer time.
+        let disk_path = std::env::var("DYN_KVBM_REMOTE_DISK_PATH")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                std::env::var("DYN_KVBM_REMOTE_DISK_PATHS")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .and_then(|paths| paths.split(',').next().map(|s| s.trim().to_string()))
+            });
 
         let disk_use_gds = std::env::var("DYN_KVBM_REMOTE_DISK_USE_GDS")
             .map(|v| v == "1" || v.to_lowercase() == "true")
@@ -450,6 +462,7 @@ impl KvbmLeader {
                     LeaderMetadata {
                         num_host_blocks,
                         num_disk_blocks,
+                        world_size,
                     }
                 },
             )

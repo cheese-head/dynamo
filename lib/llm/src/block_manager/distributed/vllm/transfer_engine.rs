@@ -602,18 +602,21 @@ async fn process_remote_transfer_request(
     };
 
     let num_blocks = hashes_with_positions.len();
-    let storage_config = leader.remote_storage_config().unwrap_or_else(|| RemoteStorageConfig::Object {
-        bucket_template: std::env::var("AWS_DEFAULT_BUCKET").ok(),
-        endpoint: None,
-        region: None,
-        access_key: None,
-        secret_key: None,
-        session_token: None,
-        scheme: None,
-        use_virtual_addressing: None,
-        req_checksum: None,
-        ca_bundle: None,
-    });
+    let storage_config = match leader.remote_storage_config() {
+        Some(cfg) => cfg,
+        None => {
+            tracing::warn!(
+                request_id = %request_id,
+                "No remote storage configured (check DYN_KVBM_REMOTE_STORAGE_TYPE, \
+                 DYN_KVBM_REMOTE_DISK_PATH(S), or DYN_KVBM_OBJECT_BUCKET). \
+                 Cannot execute remote transfer."
+            );
+            release_pin(pin_registry, pin_id);
+            return Err(anyhow::anyhow!(
+                "Remote storage not configured — set DYN_KVBM_REMOTE_DISK_PATH(S) or DYN_KVBM_OBJECT_BUCKET"
+            ));
+        }
+    };
     let backend_label = match &storage_config {
         RemoteStorageConfig::Object { .. } => "object",
         RemoteStorageConfig::Disk { transfer_flags, .. } => {

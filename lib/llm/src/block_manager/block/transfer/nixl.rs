@@ -591,6 +591,16 @@ where
     <LB as StorageTypeProvider>::StorageType: NixlDescriptor,
 {
     let num_blocks = descriptors.len();
+    let op = if matches!(direction, RemoteTransferDirection::Offload) { "write" } else { "read" };
+    let base = ctx.base_path().unwrap_or("(none)");
+    tracing::info!(
+        target: "kvbm-diag",
+        direction = op,
+        base_path = base,
+        num_blocks,
+        block_size,
+        "Disk transfer starting"
+    );
 
     // For Offload (write): create files
     // For Onboard (read): open existing files
@@ -642,18 +652,19 @@ where
         let mut disk_storages: Vec<Arc<SyncMutex<RemoteDiskStorage>>> =
             Vec::with_capacity(num_blocks);
 
+        let worker_id = ctx.worker_id() as usize;
+        let world_size = ctx.world_size();
+
         for desc in descriptors.iter() {
-            // Get file path from descriptor's DiskKey.
-            // Use ctx.base_path() (the per-worker path) rather than
-            // disk_key.full_path(), which bakes in the leader's rank-0 path
-            // and causes all workers to write to the same directory.
             let file_path = match desc.key() {
                 RemoteKey::Disk(disk_key) => {
-                    if let Some(base_path) = ctx.base_path() {
-                        format!("{}/{}", base_path, disk_key.key)
-                    } else {
-                        disk_key.full_path()
-                    }
+                    let hash = desc.sequence_hash().ok_or_else(|| {
+                        TransferError::ExecutionError(
+                            "Disk descriptor missing sequence_hash metadata".to_string(),
+                        )
+                    })?;
+                    let base = ctx.base_path().unwrap_or(&disk_key.path);
+                    format!("{}/{:016x}_{}_{}", base, hash, worker_id, world_size)
                 }
                 _ => {
                     return Err(TransferError::IncompatibleTypes(
@@ -661,6 +672,16 @@ where
                     ));
                 }
             };
+
+            if disk_storages.is_empty() {
+                tracing::info!(
+                    target: "kvbm-diag",
+                    direction = op,
+                    first_file = %file_path,
+                    num_blocks,
+                    "Disk transfer files (showing first)"
+                );
+            }
 
             let disk_storage = get_or_open_remote_disk_storage(
                 agent,

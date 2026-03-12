@@ -467,6 +467,7 @@ pub struct RemoteTransferContext {
     base: Arc<TransferContext>,
     config: RemoteStorageConfig,
     worker_id: u64,
+    world_size: usize,
     /// Sender for registering transfer completion notifications.
     /// When set, transfers use async background polling instead of inline polling.
     tx_notifications: Option<NixlNotificationSender>,
@@ -485,6 +486,7 @@ impl RemoteTransferContext {
             base,
             config: RemoteStorageConfig::object_with_options(bucket_template, None, None),
             worker_id: 0,
+            world_size: 1,
             tx_notifications: Some(tx),
         }
     }
@@ -501,6 +503,7 @@ impl RemoteTransferContext {
             base,
             config: RemoteStorageConfig::object_with_options(bucket_template, endpoint, region),
             worker_id,
+            world_size: 1,
             tx_notifications: Some(tx),
         }
     }
@@ -518,6 +521,7 @@ impl RemoteTransferContext {
                 transfer_flags,
             },
             worker_id: 0,
+            world_size: 1,
             tx_notifications: Some(tx),
         }
     }
@@ -528,12 +532,14 @@ impl RemoteTransferContext {
             base,
             config,
             worker_id: 0,
+            world_size: 1,
             tx_notifications: Some(tx),
         }
     }
 
-    pub fn with_worker_id(mut self, worker_id: u64) -> Self {
+    pub fn with_topology(mut self, worker_id: u64, world_size: usize) -> Self {
         self.worker_id = worker_id;
+        self.world_size = world_size;
         self
     }
 
@@ -555,6 +561,10 @@ impl RemoteTransferContext {
 
     pub fn worker_id(&self) -> u64 {
         self.worker_id
+    }
+
+    pub fn world_size(&self) -> usize {
+        self.world_size
     }
 
     pub fn bucket_template(&self) -> Option<&str> {
