@@ -12,7 +12,7 @@ use zmq::*;
 use derive_builder::Builder;
 use dashmap::DashMap;
 use parking_lot::RwLock;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -195,8 +195,10 @@ pub struct KvbmLeader {
     /// Handle for remote registry operations (e.g., G4 object storage).
     /// Uses channels to avoid blocking Tokio worker threads.
     remote_handle: RwLock<Option<PositionalRemoteHandle>>,
-    /// Tracks request IDs with failed G4 transfers for explicit failure detection.
-    failed_g4_requests: RwLock<HashSet<String>>,
+    /// Tracks request IDs with failed G4 transfers and the recovery action to apply.
+    failed_g4_requests: RwLock<HashMap<String, G4FailureMode>>,
+    /// Tracks finalized G4 host-prefetch prefix lengths for partial windowed onboarding.
+    g4_prefetch_prefixes: RwLock<HashMap<String, usize>>,
     /// Tracks in-flight G4 onboard transfers to deduplicate concurrent requests.
     g4_inflight: G4InflightTracker,
 }
@@ -210,7 +212,8 @@ impl KvbmLeader {
             zmq_leader: Arc::new(tokio::sync::OnceCell::new()),
             config,
             remote_handle: RwLock::new(None),
-            failed_g4_requests: RwLock::new(HashSet::new()),
+            failed_g4_requests: RwLock::new(HashMap::new()),
+            g4_prefetch_prefixes: RwLock::new(HashMap::new()),
             g4_inflight: G4InflightTracker::new(),
         };
 
@@ -519,25 +522,43 @@ impl KvbmLeader {
         }
     }
 
-    /// Mark a request as having a failed G4 transfer.
+    /// Mark a request as having a failed G4 transfer that may be retried.
     pub fn mark_g4_failed(&self, request_id: &str) {
         self.failed_g4_requests
             .write()
-            .insert(request_id.to_string());
+            .insert(request_id.to_string(), G4FailureMode::Retry);
     }
 
-    /// Check if a request has a failed G4 transfer.
-    pub fn has_g4_failed(&self, request_id: &str) -> bool {
-        self.failed_g4_requests.read().contains(request_id)
+    /// Mark a request as having a failed G4 transfer that should skip G4 immediately.
+    pub fn mark_g4_failed_skip_retry(&self, request_id: &str) {
+        self.failed_g4_requests
+            .write()
+            .insert(request_id.to_string(), G4FailureMode::Skip);
     }
 
-    /// Clear the G4 failure flag for a request (called after recovery).
-    pub fn clear_g4_failed(&self, request_id: &str) {
-        self.failed_g4_requests.write().remove(request_id);
+    /// Take and clear the G4 failure mode for a request (called after recovery).
+    pub fn take_g4_failure(&self, request_id: &str) -> Option<G4FailureMode> {
+        self.failed_g4_requests.write().remove(request_id)
+    }
+
+    pub fn set_g4_prefetch_prefix(&self, request_id: &str, prefix_len: usize) {
+        self.g4_prefetch_prefixes
+            .write()
+            .insert(request_id.to_string(), prefix_len);
+    }
+
+    pub fn take_g4_prefetch_prefix(&self, request_id: &str) -> Option<usize> {
+        self.g4_prefetch_prefixes.write().remove(request_id)
     }
 
     /// Get the G4 in-flight transfer tracker for deduplication.
     pub fn g4_inflight(&self) -> &G4InflightTracker {
         &self.g4_inflight
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum G4FailureMode {
+    Retry,
+    Skip,
 }

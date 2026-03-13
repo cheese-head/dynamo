@@ -579,10 +579,20 @@ impl BlockTransferHandler {
             tokio::spawn(
                 async move {
                     let sub_pipeline = RemoteTransferPipeline::onboard_direct(chunk_descs);
+                    let chunk_start = std::time::Instant::now();
                     let result = sub_pipeline
                         .execute(&chunk_bounce, &ctx, &cancel)
                         .await
                         .map_err(|e| anyhow::anyhow!("R2H chunk {}: {}", chunk_idx, e));
+                    tracing::info!(
+                        target: "kvbm-g4",
+                        request_id = %request_id,
+                        chunk_idx,
+                        chunk_blocks = end - start,
+                        elapsed_ms = chunk_start.elapsed().as_millis(),
+                        success = result.is_ok(),
+                        "chunk R2H transfer finished"
+                    );
                     let _ = done_tx.send((chunk_idx, start, end, result));
                 }
                 .instrument(chunk_span),

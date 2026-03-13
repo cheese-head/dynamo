@@ -1174,4 +1174,48 @@ mod tests {
         assert_eq!(pool.available_blocks(), count - 1);
         assert_eq!(duplicate.block_id(), primary_id);
     }
+
+    #[test]
+    fn test_pinned_block_can_be_matched_while_reset_is_blocked() {
+        let layout = setup_layout(None).unwrap();
+        let blocks = Blocks::<_, BasicMetadata>::new(layout, 42, 0)
+            .unwrap()
+            .into_blocks()
+            .unwrap();
+
+        let async_runtime = tokio::runtime::Runtime::new().unwrap();
+        let pool = ManagedBlockPool::builder()
+            .blocks(blocks)
+            .async_runtime(async_runtime.handle().clone())
+            .build()
+            .unwrap();
+
+        let primary = create_block(&pool);
+        let sequence_hash = primary.sequence_hash();
+        let pin_guard =
+            crate::block_manager::pool::PinGuard::new(vec![primary.clone()]);
+
+        let matched = pool
+            .match_sequence_hashes_blocking(&[sequence_hash])
+            .unwrap();
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].sequence_hash(), sequence_hash);
+
+        let reset_while_pinned = pool.reset_blocks_blocking(&[sequence_hash]).unwrap();
+        assert!(reset_while_pinned.reset_blocks.is_empty());
+        assert_eq!(reset_while_pinned.not_reset, vec![sequence_hash]);
+
+        drop(matched);
+        drop(primary);
+
+        let reset_still_pinned = pool.reset_blocks_blocking(&[sequence_hash]).unwrap();
+        assert!(reset_still_pinned.reset_blocks.is_empty());
+        assert_eq!(reset_still_pinned.not_reset, vec![sequence_hash]);
+
+        drop(pin_guard);
+
+        let reset_after_release = pool.reset_blocks_blocking(&[sequence_hash]).unwrap();
+        assert_eq!(reset_after_release.reset_blocks, vec![sequence_hash]);
+        assert!(reset_after_release.not_reset.is_empty());
+    }
 }

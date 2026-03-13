@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::time::Instant;
+
 use crate::block_manager::{
     BlockMetadata, DiskStorage, ImmutableBlock, PinnedStorage, Storage,
     block::{BlockId, locality::LocalityProvider},
@@ -204,4 +206,5 @@ pub struct DrainItem {
     pub pin_guard: PinGuard,
     pub block_size: usize,
     pub traceparent: Option<String>,
+    pub enqueued_at: Instant,
 }

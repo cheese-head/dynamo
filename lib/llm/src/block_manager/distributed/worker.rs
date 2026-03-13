@@ -110,22 +110,20 @@ fn build_agent(worker_id: usize, use_gds: bool) -> anyhow::Result<NixlAgent> {
 
     // Add GDS_MT backend if requested (for GPU Direct Storage)
     if use_gds {
-        match agent.get_plugin_params("GDS_MT") {
-            Ok((_, gds_params)) => {
-                agent.create_backend("GDS_MT", &gds_params)?;
-                tracing::info!(
-                    worker_id = worker_id,
-                    "Created GDS_MT backend for multi-threaded file I/O"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    worker_id = worker_id,
-                    error = %e,
-                    "GDS_MT plugin not available, falling back to POSIX only"
-                );
-            }
-        }
+
+        let (_, default_gds_mt_params) = agent.get_plugin_params("GDS_MT")?;
+
+        let mut gds_params = default_gds_mt_params
+            .clone()
+            .map_err(|e| anyhow::anyhow!("Failed to clone GDS_MT default params: {}", e))?;
+
+        // gds_params.set("thread_count", "16")?;
+
+        agent.create_backend("GDS_MT", &gds_params)?;
+        tracing::info!(
+            worker_id = worker_id,
+            "Created GDS_MT backend for multi-threaded file I/O"
+        );
     }
 
     // Add POSIX backend (always required). Allow forcing the POSIX queue API.

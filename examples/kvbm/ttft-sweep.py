@@ -670,8 +670,17 @@ def mgmt_post(mgmt_url: str, path: str, body: dict | None = None) -> dict | None
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             return json.loads(resp.read()) if resp.status == 200 else None
+    except urllib.error.HTTPError as e:
+        error_body = ""
+        if e.fp:
+            try:
+                error_body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                pass
+        print(f"  [mgmt] {path} HTTP {e.code}: {error_body or e.reason}", file=sys.stderr)
+        return None
     except Exception as e:
         print(f"  [mgmt] {path} failed: {e}", file=sys.stderr)
         return None
@@ -695,16 +704,25 @@ def clear_all_pools(mgmt_url: str):
     mgmt_post(mgmt_url, "/v1/cache/clear_all")
 
 
-def ensure_clear_cpu_pool(mgmt_url: str, retries: int = 3, delay_s: float = 2.0):
-    last_error = None
-    for attempt in range(1, retries + 1):
+def ensure_clear_cpu_pool(mgmt_url: str, timeout_s: float = 60.0):
+    """Clear the CPU pool, retrying with backoff while the server rejects due to active requests."""
+    deadline = time.monotonic() + timeout_s
+    delay = 1.0
+    attempt = 0
+    while True:
+        attempt += 1
         result = mgmt_post(mgmt_url, "/v1/cache/clear", {"pool": "cpu"})
         if result is not None:
             return
-        last_error = f"CPU cache clear failed on attempt {attempt}/{retries}"
-        if attempt < retries:
-            time.sleep(delay_s)
-    raise RuntimeError(last_error or "CPU cache clear failed")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                f"CPU cache clear still rejected after {timeout_s:.0f}s "
+                f"({attempt} attempts) — active requests may not have drained"
+            )
+        wait = min(delay, remaining)
+        time.sleep(wait)
+        delay = min(delay * 1.5, 5.0)
 
 
 def check_health(mgmt_url: str) -> bool:
@@ -967,12 +985,14 @@ def run_scenario(
     stream: bool = False,
     ttft_mode: str = "either",
     warmup_rounds: int = 0,
+    drain_timeout: float = 60.0,
 ) -> list[dict]:
     """Run a scenario: for each ISL, call setup_fn then send n requests.
 
     When concurrency > 1, requests are sent in parallel using a thread pool.
-    When clear_between is True, CPU pool is cleared after each request
-    (and a short wait allows offload to G4 before clearing).
+    When clear_between is True, CPU pool is cleared after each batch
+    (the server may reject the clear while requests are still draining;
+    ensure_clear_cpu_pool retries with backoff up to drain_timeout seconds).
     When warmup_rounds > 0, that many untimed requests are sent first per ISL
     to burn off JIT/CUDA-graph warmup before the timed measurement begins.
     """
@@ -985,19 +1005,58 @@ def run_scenario(
         all_messages = [make_prompt(isl, variant=i) for i in range(variant_count)]
 
         if setup_fn is not None:
-            for v in range(min(concurrency, len(all_messages))):
-                setup_fn(mgmt_url, url, model, all_messages[v], isl, skip_cpu_flush, seed)
+            setup_variants = list(range(min(concurrency, len(all_messages))))
+            if len(setup_variants) <= 1:
+                for v in setup_variants:
+                    setup_fn(mgmt_url, url, model, all_messages[v], isl, skip_cpu_flush, seed, drain_timeout)
+            else:
+                # Running setup_fn per-thread deadlocks for cold scenarios:
+                # each thread tries to clear the pool while other threads'
+                # requests are still inflight. Instead, bracket the parallel
+                # sends with a single pre/post clear.
+                if clear_between and not skip_cpu_flush and mgmt_url:
+                    ensure_clear_cpu_pool(mgmt_url, timeout_s=drain_timeout)
+                print(f"    [{name}] ISL={fmt_isl(isl)}: warming up {len(setup_variants)} variants in parallel...")
+                with concurrent.futures.ThreadPoolExecutor(max_workers=len(setup_variants)) as pool:
+                    futs = [
+                        pool.submit(send_request, url, model, all_messages[v], 1, seed)
+                        for v in setup_variants
+                    ]
+                    concurrent.futures.wait(futs)
+                    for fut in futs:
+                        fut.result()
+                if clear_between and not skip_cpu_flush and mgmt_url:
+                    time.sleep(2)
+                    ensure_clear_cpu_pool(mgmt_url, timeout_s=drain_timeout)
             time.sleep(0.5)
 
         if warmup_rounds > 0:
-            print(f"    [{name}] ISL={fmt_isl(isl)}: {warmup_rounds} warmup round(s)...")
-            for w in range(warmup_rounds):
-                wr = send_request(
-                    url, model, all_messages[0], max_tokens,
-                    seed=seed, stream=stream, ttft_mode=ttft_mode,
-                )
-                label = fmt_time(wr["ttft"]) if not wr["error"] else f"ERROR {wr['error']}"
-                print(f"    [{name}] ISL={fmt_isl(isl)} warmup {w+1}/{warmup_rounds}: {label}")
+            warmup_concurrent = max(1, concurrency)
+            print(f"    [{name}] ISL={fmt_isl(isl)}: {warmup_rounds} warmup round(s), concurrency={warmup_concurrent}...")
+            for batch_start in range(0, warmup_rounds, warmup_concurrent):
+                batch_end = min(batch_start + warmup_concurrent, warmup_rounds)
+                batch_count = batch_end - batch_start
+                if batch_count <= 1:
+                    wr = send_request(
+                        url, model, all_messages[0], max_tokens,
+                        seed=seed, stream=stream, ttft_mode=ttft_mode,
+                    )
+                    label = fmt_time(wr["ttft"]) if not wr["error"] else f"ERROR {wr['error']}"
+                    print(f"    [{name}] ISL={fmt_isl(isl)} warmup {batch_start+1}/{warmup_rounds}: {label}")
+                else:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=batch_count) as pool:
+                        futs = [
+                            pool.submit(
+                                send_request, url, model,
+                                all_messages[i % variant_count], max_tokens,
+                                seed, stream, ttft_mode,
+                            )
+                            for i in range(batch_start, batch_end)
+                        ]
+                        for idx, fut in enumerate(concurrent.futures.as_completed(futs)):
+                            wr = fut.result()
+                            label = fmt_time(wr["ttft"]) if not wr["error"] else f"ERROR {wr['error']}"
+                            print(f"    [{name}] ISL={fmt_isl(isl)} warmup {batch_start+idx+1}/{warmup_rounds}: {label}")
             print(f"    [{name}] ISL={fmt_isl(isl)}: warmup done, starting timed runs")
 
         ttfts = []
@@ -1044,58 +1103,67 @@ def run_scenario(
                         seed=r.get("seed"),
                     )
                 if clear_between and not skip_cpu_flush and mgmt_url:
-                    time.sleep(5)
-                    ensure_clear_cpu_pool(mgmt_url)
+                    time.sleep(2)
+                    ensure_clear_cpu_pool(mgmt_url, timeout_s=drain_timeout)
         else:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
-                future_meta = {}
-                for i in range(n):
-                    variant = i % variant_count
-                    fut = pool.submit(
-                        send_request,
-                        url,
-                        model,
-                        all_messages[variant],
-                        max_tokens,
-                        seed,
-                        stream,
-                        ttft_mode,
-                    )
-                    future_meta[fut] = variant
-                for i, fut in enumerate(concurrent.futures.as_completed(future_meta)):
-                    r = fut.result()
-                    if r["error"]:
-                        errors += 1
-                        print(
-                            f"    [{name}] ISL={fmt_isl(isl)} req {i+1}/{n}: ERROR {r['error']} trace_id={r.get('trace_id')}",
-                            file=sys.stderr,
+            batch_size = concurrency
+            req_done = 0
+            for batch_start in range(0, n, batch_size):
+                batch_end = min(batch_start + batch_size, n)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+                    future_meta = {}
+                    for i in range(batch_start, batch_end):
+                        variant = i % variant_count
+                        fut = pool.submit(
+                            send_request,
+                            url,
+                            model,
+                            all_messages[variant],
+                            max_tokens,
+                            seed,
+                            stream,
+                            ttft_mode,
                         )
-                    else:
-                        ttfts.append(r["ttft"])
-                        print(
-                            f"    [{name}] ISL={fmt_isl(isl)} req {i+1}/{n}: TTFT={fmt_time(r['ttft'])} trace_id={r.get('trace_id')} prompt=v{future_meta[fut]}"
-                        )
-                        determinism.record(
-                            name,
-                            isl,
-                            r["completion"],
-                            prompt_key=f"v{future_meta[fut]}",
-                            reasoning=r.get("reasoning"),
-                            traceparent=r.get("traceparent"),
-                            trace_id=r.get("trace_id"),
-                            response_id=r.get("response_id"),
-                            finish_reason=r.get("finish_reason"),
-                            stop_reason=r.get("stop_reason"),
-                            tool_calls=r.get("tool_calls"),
-                            refusal=r.get("refusal"),
-                            has_reasoning=bool(r.get("reasoning")),
-                            first_event_ttft=r.get("first_event_ttft"),
-                            first_reasoning_ttft=r.get("first_reasoning_ttft"),
-                            first_content_ttft=r.get("first_content_ttft"),
-                            prompt_tokens=r.get("prompt_tokens"),
-                            completion_tokens=r.get("completion_tokens"),
-                            seed=r.get("seed"),
-                        )
+                        future_meta[fut] = variant
+                    for fut in concurrent.futures.as_completed(future_meta):
+                        req_done += 1
+                        r = fut.result()
+                        variant = future_meta[fut]
+                        if r["error"]:
+                            errors += 1
+                            print(
+                                f"    [{name}] ISL={fmt_isl(isl)} req {req_done}/{n}: ERROR {r['error']} trace_id={r.get('trace_id')}",
+                                file=sys.stderr,
+                            )
+                        else:
+                            ttfts.append(r["ttft"])
+                            print(
+                                f"    [{name}] ISL={fmt_isl(isl)} req {req_done}/{n}: TTFT={fmt_time(r['ttft'])} trace_id={r.get('trace_id')} prompt=v{variant}"
+                            )
+                            determinism.record(
+                                name,
+                                isl,
+                                r["completion"],
+                                prompt_key=f"v{variant}",
+                                reasoning=r.get("reasoning"),
+                                traceparent=r.get("traceparent"),
+                                trace_id=r.get("trace_id"),
+                                response_id=r.get("response_id"),
+                                finish_reason=r.get("finish_reason"),
+                                stop_reason=r.get("stop_reason"),
+                                tool_calls=r.get("tool_calls"),
+                                refusal=r.get("refusal"),
+                                has_reasoning=bool(r.get("reasoning")),
+                                first_event_ttft=r.get("first_event_ttft"),
+                                first_reasoning_ttft=r.get("first_reasoning_ttft"),
+                                first_content_ttft=r.get("first_content_ttft"),
+                                prompt_tokens=r.get("prompt_tokens"),
+                                completion_tokens=r.get("completion_tokens"),
+                                seed=r.get("seed"),
+                            )
+                if clear_between and not skip_cpu_flush and mgmt_url and batch_end < n:
+                    time.sleep(2)
+                    ensure_clear_cpu_pool(mgmt_url, timeout_s=drain_timeout)
 
         determinism.check_isl(name, isl)
 
@@ -1122,14 +1190,15 @@ def setup_cold(
     isl,
     skip_cpu_flush: bool = False,
     seed: int | None = None,
+    drain_timeout: float = 60.0,
 ):
     """Scenario 1: clear CPU pool but keep CPU lookup enabled."""
     if not skip_cpu_flush and mgmt_url:
-        ensure_clear_cpu_pool(mgmt_url)
+        ensure_clear_cpu_pool(mgmt_url, timeout_s=drain_timeout)
     send_request(url, model, messages, 1, seed=seed)
-    time.sleep(5)
     if not skip_cpu_flush and mgmt_url:
-        ensure_clear_cpu_pool(mgmt_url)
+        time.sleep(2)
+        ensure_clear_cpu_pool(mgmt_url, timeout_s=drain_timeout)
 
 
 def setup_warm(
@@ -1140,10 +1209,11 @@ def setup_warm(
     isl,
     skip_cpu_flush: bool = False,
     seed: int | None = None,
+    drain_timeout: float = 60.0,
 ):
     """Scenario 2: ensure CPU pool is populated (host cache hit)."""
     send_request(url, model, messages, 1, seed=seed)
-    time.sleep(5)
+    time.sleep(2)
 
 
 # ── Output ───────────────────────────────────────────────────────────────
@@ -1255,6 +1325,12 @@ def main():
         default=15.0,
         help="Seconds to wait/retry for Tempo traces to become complete enough",
     )
+    parser.add_argument(
+        "--drain-timeout",
+        type=float,
+        default=60.0,
+        help="Max seconds to wait for active requests to drain before each CPU pool clear (default: 60)",
+    )
     args = parser.parse_args()
 
     print(f"\n  TTFT Sweep")
@@ -1273,6 +1349,7 @@ def main():
     if args.fetch_traces:
         print(f"  Tempo URL:   {args.tempo_url}")
     print(f"  Seed:        {args.seed if args.seed is not None else '-'}")
+    print(f"  Drain wait:  {args.drain_timeout:.0f}s")
     print(f"  Strict det:  {args.strict_determinism}")
 
     if args.fetch_traces and not args.send_traceparent:
@@ -1304,7 +1381,7 @@ def main():
 
         if args.mgmt:
             clear_all_pools(args.mgmt)
-            time.sleep(1)
+            time.sleep(2)
 
         results = run_scenario(
             scenario_key, args.url, args.model, args.mgmt,
@@ -1315,6 +1392,7 @@ def main():
             seed=args.seed,
             stream=args.stream,
             ttft_mode=args.ttft_mode,
+            drain_timeout=args.drain_timeout,
         )
         all_results[scenario_key] = results
         print_table(name, results, args.concurrency)

@@ -79,14 +79,13 @@ pub fn priority_channel<T>(
     )
 }
 
-/// Run a bounded-concurrency worker loop over a priority queue.
+/// Run an unbounded-concurrency worker loop over a priority queue.
 ///
 /// - Never blocks waiting for queue capacity.
 /// - High-priority lane is preferred over low-priority lane.
 pub async fn run_priority_worker<T, F, Fut>(
     cancellation_token: CancellationToken,
     mut receiver: PriorityReceiver<T>,
-    _max_inflight: usize,
     mut worker: F,
 ) where
     T: Send + 'static,

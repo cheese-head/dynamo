@@ -21,7 +21,7 @@ use crate::block_manager::{
     connector::protocol::{LeaderTransferRequest, RequestType},
     distributed::{BlockTransferPool, BlockTransferRequest, KvbmLeader, vllm as vllm_int},
     metrics_kvbm::KvbmMetrics,
-    pool::PinRegistry,
+    pool::{BlockPoolError, PinRegistry},
     transfer_orchestrator::{TransferPriority, priority_channel, run_priority_worker},
 };
 use crate::block_manager::KvBlockManager;
@@ -32,7 +32,6 @@ type VllmBlockManager =
     KvBlockManager<Logical<DistributedLeaderWorkerResources>, BasicMetadata>;
 
 const DEFAULT_DRAIN_QUEUE_CAP: usize = 512;
-const DEFAULT_MAX_REMOTE_INFLIGHT: usize = 64;
 const DEFAULT_REMOTE_HIGH_QUEUE_CAP: usize = 256;
 const DEFAULT_REMOTE_LOW_QUEUE_CAP: usize = 512;
 const DEFAULT_G4_TRANSFER_TIMEOUT_SECS: u64 = 30;
@@ -50,13 +49,6 @@ static DRAIN_QUEUE_CAP: Lazy<usize> = Lazy::new(|| {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_DRAIN_QUEUE_CAP)
-});
-
-static MAX_REMOTE_INFLIGHT: Lazy<usize> = Lazy::new(|| {
-    std::env::var("DYN_KVBM_G4_MAX_REMOTE_INFLIGHT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_MAX_REMOTE_INFLIGHT)
 });
 
 static REMOTE_HIGH_QUEUE_CAP: Lazy<usize> = Lazy::new(|| {
@@ -101,7 +93,11 @@ impl LocalTransferEngine {
     ) -> anyhow::Result<()> {
         let (onboard_tx, mut onboard_rx) = mpsc::unbounded_channel::<LocalOnboardRequest>();
         let (offload_tx, mut offload_rx) = mpsc::unbounded_channel::<LocalOffloadRequest>();
-        let (remote_tx, remote_rx) = priority_channel::<RemoteTransferRequest>(
+        let (remote_onboard_tx, remote_onboard_rx) = priority_channel::<RemoteTransferRequest>(
+            *REMOTE_HIGH_QUEUE_CAP,
+            *REMOTE_LOW_QUEUE_CAP,
+        );
+        let (remote_offload_tx, remote_offload_rx) = priority_channel::<RemoteTransferRequest>(
             *REMOTE_HIGH_QUEUE_CAP,
             *REMOTE_LOW_QUEUE_CAP,
         );
@@ -109,19 +105,23 @@ impl LocalTransferEngine {
 
         let pin_registry = PinRegistry::new();
         let pin_registry_drain = pin_registry.clone();
-        let pin_registry_remote = pin_registry.clone();
+        let pin_registry_remote_onboard = pin_registry.clone();
+        let pin_registry_remote_offload = pin_registry.clone();
 
         let block_manager_offload = self.block_manager.clone();
-        let block_manager_remote = self.block_manager.clone();
+        let block_manager_remote_onboard = self.block_manager.clone();
+        let block_manager_remote_offload = self.block_manager.clone();
         let leader_offload = Arc::clone(&self.leader);
         let leader_onboard = Arc::clone(&self.leader);
-        let leader_remote = Arc::clone(&self.leader);
+        let leader_remote_onboard = Arc::clone(&self.leader);
+        let leader_remote_offload = Arc::clone(&self.leader);
         let drain_tx_for_offload = drain_tx.clone();
-        let remote_tx_for_drain = remote_tx.clone();
+        let remote_offload_tx_for_drain = remote_offload_tx.clone();
 
         let kvbm_metrics_onboard = kvbm_metrics.clone();
         let kvbm_metrics_offload = kvbm_metrics.clone();
-        let kvbm_metrics_remote = kvbm_metrics.clone();
+        let kvbm_metrics_remote_onboard = kvbm_metrics.clone();
+        let kvbm_metrics_remote_offload = kvbm_metrics.clone();
 
         let onboard_task = CriticalTaskExecutionHandle::new_with_runtime(
             |cancellation_token_onboard| async move {
@@ -236,18 +236,18 @@ impl LocalTransferEngine {
         )
         .unwrap();
 
-        let remote_task = CriticalTaskExecutionHandle::new_with_runtime(
+        let remote_onboard_task = CriticalTaskExecutionHandle::new_with_runtime(
             |cancellation_token_remote| async move {
                 run_priority_worker(
                     cancellation_token_remote,
-                    remote_rx,
-                    *MAX_REMOTE_INFLIGHT,
+                    remote_onboard_rx,
                     move |req| {
-                        let block_manager = block_manager_remote.clone();
-                        let leader = Arc::clone(&leader_remote);
-                        let metrics = kvbm_metrics_remote.clone();
-                        let pin_reg = pin_registry_remote.clone();
+                        let block_manager = block_manager_remote_onboard.clone();
+                        let leader = Arc::clone(&leader_remote_onboard);
+                        let metrics = kvbm_metrics_remote_onboard.clone();
+                        let pin_reg = pin_registry_remote_onboard.clone();
                         async move {
+                            let request_id = req.request_id.clone();
                             if let Err(e) = process_remote_transfer_request(
                                 req,
                                 &block_manager,
@@ -258,6 +258,14 @@ impl LocalTransferEngine {
                             .await
                             {
                                 tracing::error!("RemoteTransferTask error: {:?}", e);
+                                if matches!(
+                                    e.downcast_ref::<BlockPoolError>(),
+                                    Some(BlockPoolError::NotEnoughBlocksAvailable(_, _))
+                                ) {
+                                    leader.mark_g4_failed_skip_retry(&request_id);
+                                } else {
+                                    leader.mark_g4_failed(&request_id);
+                                }
                             }
                         }
                     },
@@ -266,7 +274,50 @@ impl LocalTransferEngine {
                 Ok(())
             },
             task_token.clone(),
-            "RemoteTransferTask",
+            "RemoteOnboardTransferTask",
+            &task_handle,
+        )
+        .unwrap();
+
+        let remote_offload_task = CriticalTaskExecutionHandle::new_with_runtime(
+            |cancellation_token_remote| async move {
+                run_priority_worker(
+                    cancellation_token_remote,
+                    remote_offload_rx,
+                    move |req| {
+                        let block_manager = block_manager_remote_offload.clone();
+                        let leader = Arc::clone(&leader_remote_offload);
+                        let metrics = kvbm_metrics_remote_offload.clone();
+                        let pin_reg = pin_registry_remote_offload.clone();
+                        async move {
+                            let request_id = req.request_id.clone();
+                            if let Err(e) = process_remote_transfer_request(
+                                req,
+                                &block_manager,
+                                &leader,
+                                metrics,
+                                &pin_reg,
+                            )
+                            .await
+                            {
+                                tracing::error!("RemoteTransferTask error: {:?}", e);
+                                if matches!(
+                                    e.downcast_ref::<BlockPoolError>(),
+                                    Some(BlockPoolError::NotEnoughBlocksAvailable(_, _))
+                                ) {
+                                    leader.mark_g4_failed_skip_retry(&request_id);
+                                } else {
+                                    leader.mark_g4_failed(&request_id);
+                                }
+                            }
+                        }
+                    },
+                )
+                .await;
+                Ok(())
+            },
+            task_token.clone(),
+            "RemoteOffloadTransferTask",
             &task_handle,
         )
         .unwrap();
@@ -279,8 +330,11 @@ impl LocalTransferEngine {
                         item = drain_rx.recv() => match item { Some(item) => item, None => break }
                     };
 
+                    let drain_wait_ms = item.enqueued_at.elapsed().as_millis();
                     let h2o_operation_id = uuid::Uuid::new_v4();
                     pin_registry_drain.insert(h2o_operation_id, item.pin_guard);
+                    let request_id = item.request_id.clone();
+                    let num_blocks = item.sequence_hashes.len();
 
                     let h2o_req = RemoteTransferRequest::new_h2o(
                         item.request_id,
@@ -292,7 +346,7 @@ impl LocalTransferEngine {
                         item.traceparent,
                     );
 
-                    if remote_tx_for_drain
+                    if remote_offload_tx_for_drain
                         .send(TransferPriority::Low, h2o_req)
                         .await
                         .is_err()
@@ -300,6 +354,14 @@ impl LocalTransferEngine {
                         pin_registry_drain.remove(&h2o_operation_id);
                         continue;
                     }
+                    tracing::info!(
+                        target: "kvbm-g4",
+                        request_id = %request_id,
+                        operation_id = %h2o_operation_id,
+                        num_blocks,
+                        drain_wait_ms,
+                        "background H2O drain dispatched"
+                    );
                 }
                 Ok(())
             },
@@ -318,9 +380,9 @@ impl LocalTransferEngine {
                         Some(LocalTransferRequest::Onboard(onboard_req)) => { let _ = onboard_tx.send(onboard_req); }
                         Some(LocalTransferRequest::Remote(remote_req)) => {
                             if remote_req.is_onboard {
-                                let _ = remote_tx.send(TransferPriority::High, remote_req).await;
+                                let _ = remote_onboard_tx.send(TransferPriority::High, remote_req).await;
                             } else {
-                                let _ = remote_tx.send(TransferPriority::Low, remote_req).await;
+                                let _ = remote_offload_tx.send(TransferPriority::Low, remote_req).await;
                             }
                         }
                         None => break,
@@ -331,14 +393,17 @@ impl LocalTransferEngine {
 
         drop(onboard_tx);
         drop(offload_tx);
-        drop(remote_tx);
+        drop(remote_onboard_tx);
+        drop(remote_offload_tx);
         onboard_task.cancel();
         offload_task.cancel();
-        remote_task.cancel();
+        remote_onboard_task.cancel();
+        remote_offload_task.cancel();
         drain_task.cancel();
         let _ = onboard_task.join().await;
         let _ = offload_task.join().await;
-        let _ = remote_task.join().await;
+        let _ = remote_onboard_task.join().await;
+        let _ = remote_offload_task.join().await;
         let _ = drain_task.join().await;
         Ok(())
     }
@@ -411,9 +476,19 @@ where
     L: LocalityProvider + 'static,
     M: BlockMetadata + 'static,
 {
+    let allocate_start = Instant::now();
     let blocks = tokio::task::block_in_place(|| {
         storage_pool.allocate_blocks_blocking(offload_req.block_ids.len())
     })?;
+    tracing::info!(
+        target: "kvbm-g4",
+        request_id = %offload_req.request_id,
+        operation_id = %offload_req.operation_id,
+        transfer_pool = ?transfer_pool,
+        num_blocks = offload_req.block_ids.len(),
+        elapsed_ms = allocate_start.elapsed().as_millis(),
+        "offload storage allocation complete"
+    );
     let token_blocks = offload_req.token_blocks;
     let allocated_block_ids: Vec<usize> = blocks.iter().map(|b| b.block_id()).collect();
     let block_pairs: Vec<(usize, usize)> = offload_req
@@ -456,11 +531,31 @@ where
         sequence_hashes,
     };
     let notify_receiver = leader.transfer_blocks_request(block_xfer_req).await?;
+    let transfer_start = Instant::now();
     notify_receiver
         .await
         .map_err(|_| anyhow::anyhow!("offload transfer completion failed"))?;
+    tracing::info!(
+        target: "kvbm-g4",
+        request_id = %offload_req.request_id,
+        operation_id = %offload_req.operation_id,
+        transfer_pool = ?transfer_pool,
+        num_blocks = offload_req.sequence_hashes.len(),
+        elapsed_ms = transfer_start.elapsed().as_millis(),
+        "offload transfer completion notification received"
+    );
 
+    let register_start = Instant::now();
     let immutable_blocks = storage_pool.register_blocks(blocks_to_register).await?;
+    tracing::info!(
+        target: "kvbm-g4",
+        request_id = %offload_req.request_id,
+        operation_id = %offload_req.operation_id,
+        transfer_pool = ?transfer_pool,
+        num_blocks = immutable_blocks.len(),
+        elapsed_ms = register_start.elapsed().as_millis(),
+        "offload storage registration complete"
+    );
     let is_host_transfer = transfer_pool == BlockTransferPool::Host;
     if is_host_transfer && leader.remote_registry_enabled() {
         if let Some(drain_tx) = drain_tx {
@@ -473,7 +568,15 @@ where
                 pin_guard,
                 block_size: offload_req.block_size,
                 traceparent: offload_req.traceparent.clone(),
+                enqueued_at: Instant::now(),
             };
+            tracing::info!(
+                target: "kvbm-g4",
+                request_id = %item.request_id,
+                operation_id = %offload_req.operation_id,
+                num_blocks = item.sequence_hashes.len(),
+                "enqueuing host blocks for background H2O drain"
+            );
             let _ = drain_tx.send(item);
             return Ok(());
         }
@@ -576,6 +679,7 @@ async fn process_remote_transfer_request(
     // the transfer path concurrent.
 
     let (hashes_with_positions, filtered_host_ids) = if let Some(handle) = leader.remote_handle() {
+        let filter_start = Instant::now();
         match vllm_int::filter_for_offload(
             &handle,
             &req.sequence_hashes,
@@ -585,8 +689,29 @@ async fn process_remote_transfer_request(
         )
         .await
         {
-            Some(filtered) => filtered,
+            Some(filtered) => {
+                tracing::info!(
+                    target: "kvbm-g4",
+                    request_id = %request_id,
+                    operation_id = %operation_id,
+                    is_onboard = req.is_onboard,
+                    requested_blocks = req.sequence_hashes.len(),
+                    filtered_blocks = filtered.0.len(),
+                    elapsed_ms = filter_start.elapsed().as_millis(),
+                    "remote registry offload filter complete"
+                );
+                filtered
+            }
             None => {
+                tracing::info!(
+                    target: "kvbm-g4",
+                    request_id = %request_id,
+                    operation_id = %operation_id,
+                    is_onboard = req.is_onboard,
+                    requested_blocks = req.sequence_hashes.len(),
+                    elapsed_ms = filter_start.elapsed().as_millis(),
+                    "remote registry offload filter skipped all blocks"
+                );
                 release_pin(pin_registry, pin_id);
                 return Ok(());
             }
@@ -630,31 +755,65 @@ async fn process_remote_transfer_request(
     };
 
     let hashes: Vec<u64> = hashes_with_positions.iter().map(|&(h, _)| h).collect();
-    let _alloc_span = tracing::info_span!(
-        parent: process_span.clone(),
-        "kvbm.remote_transfer_allocate",
-        request_id = %request_id,
-        operation_id = %operation_id,
-        is_onboard = req.is_onboard,
-        num_blocks = num_blocks,
-        otel.name = "kvbm.remote_transfer_allocate",
-    )
-    .entered();
-    let (bounce, device, onboard_host_blocks) = if req.is_h2o() {
-        let bounce = filtered_host_ids
-            .ok_or_else(|| anyhow::anyhow!("H2R transfer requires host_block_ids"))?;
-        (bounce, vec![], None)
-    } else {
-        let host_pool = block_manager
-            .host()
-            .ok_or_else(|| anyhow::anyhow!("Host pool not available for bounce buffers"))?;
-        let host_blocks =
-            tokio::task::block_in_place(|| host_pool.allocate_blocks_blocking(num_blocks))?;
-        let bounce = host_blocks.iter().map(|b| b.block_id()).collect();
-        let device = req.device_block_ids.iter().copied().collect();
-        (bounce, device, Some(host_blocks))
+
+    let (bounce, device, onboard_host_blocks) = {
+        let _alloc_span = tracing::info_span!(
+            parent: process_span.clone(),
+            "kvbm.remote_transfer_allocate",
+            request_id = %request_id,
+            operation_id = %operation_id,
+            is_onboard = req.is_onboard,
+            num_blocks = num_blocks,
+            otel.name = "kvbm.remote_transfer_allocate",
+        )
+        .entered();
+
+        if req.is_h2o() {
+            let bounce = filtered_host_ids
+                .ok_or_else(|| anyhow::anyhow!("H2R transfer requires host_block_ids"))?;
+            (bounce, vec![], None)
+        } else {
+            let host_pool = block_manager
+                .host()
+                .ok_or_else(|| anyhow::anyhow!("Host pool not available for bounce buffers"))?;
+            let alloc_start = Instant::now();
+            let available_before = host_pool.available_blocks();
+            if available_before < num_blocks as u64 {
+                tracing::warn!(
+                    target: "kvbm-g4",
+                    request_id = %request_id,
+                    operation_id = %operation_id,
+                    is_onboard = req.is_onboard,
+                    num_blocks,
+                    block_size = req.block_size,
+                    available_before,
+                    "insufficient host bounce capacity for G4 transfer; skipping to recompute"
+                );
+                return Err(BlockPoolError::NotEnoughBlocksAvailable(
+                    num_blocks,
+                    available_before as usize,
+                )
+                .into());
+            }
+            let host_blocks =
+                tokio::task::block_in_place(|| host_pool.allocate_blocks_blocking(num_blocks))?;
+            tracing::info!(
+                target: "kvbm-g4",
+                request_id = %request_id,
+                operation_id = %operation_id,
+                is_onboard = req.is_onboard,
+                num_blocks,
+                block_size = req.block_size,
+                available_before,
+                available_after = host_pool.available_blocks(),
+                elapsed_ms = alloc_start.elapsed().as_millis(),
+                "host bounce block allocation complete"
+            );
+            let bounce = host_blocks.iter().map(|b| b.block_id()).collect();
+            let device = req.device_block_ids.iter().copied().collect();
+            (bounce, device, Some(host_blocks))
+        }
     };
-    drop(_alloc_span);
 
     let _pipeline_span = tracing::info_span!(
         parent: process_span.clone(),
@@ -679,19 +838,28 @@ async fn process_remote_transfer_request(
     );
     drop(_pipeline_span);
 
+    let is_host_prefetch_only = req.is_onboard && req.device_block_ids.is_empty();
     let is_chained = !req.is_onboard;
-    let mut wire_req = crate::block_manager::distributed::RemoteTransferRequest::new_with_connector_req(
-        req.request_id.clone(),
-        req.operation_id,
-        &pipeline,
-        LeaderTransferRequest {
-            request_id: request_id.clone(),
-            uuid: *operation_id,
-            requirement: None,
-            request_type: RequestType::Immediate,
-            chained: is_chained,
-        },
-    );
+    let mut wire_req = if is_host_prefetch_only {
+        crate::block_manager::distributed::RemoteTransferRequest::new(
+            req.request_id.clone(),
+            req.operation_id,
+            &pipeline,
+        )
+    } else {
+        crate::block_manager::distributed::RemoteTransferRequest::new_with_connector_req(
+            req.request_id.clone(),
+            req.operation_id,
+            &pipeline,
+            LeaderTransferRequest {
+                request_id: request_id.clone(),
+                uuid: *operation_id,
+                requirement: None,
+                request_type: RequestType::Immediate,
+                chained: is_chained,
+            },
+        )
+    };
     wire_req.traceparent = req.traceparent.clone();
     let dispatch_span = tracing::info_span!(
         parent: &process_span,
@@ -711,6 +879,17 @@ async fn process_remote_transfer_request(
 
     let result = match tokio::time::timeout(*G4_TRANSFER_TIMEOUT, notify_receiver).await {
         Ok(Ok(_)) => {
+            tracing::info!(
+                target: "kvbm-g4",
+                request_id = %request_id,
+                operation_id = %operation_id,
+                is_onboard = req.is_onboard,
+                num_blocks,
+                transfer_bytes,
+                backend = backend_label,
+                elapsed_ms = transfer_start.elapsed().as_millis(),
+                "remote transfer completion notification received"
+            );
             crate::record_remote_metrics!(
                 kvbm_metrics,
                 req.is_onboard,
@@ -723,6 +902,7 @@ async fn process_remote_transfer_request(
 
             if !req.is_onboard {
                 if let Some(handle) = leader.remote_handle() {
+                    let publish_start = Instant::now();
                     vllm_int::register_tp(
                         &handle,
                         &hashes_with_positions,
@@ -730,6 +910,14 @@ async fn process_remote_transfer_request(
                         leader.world_size(),
                     )
                     .await;
+                    tracing::info!(
+                        target: "kvbm-g4",
+                        request_id = %request_id,
+                        operation_id = %operation_id,
+                        num_blocks = hashes_with_positions.len(),
+                        elapsed_ms = publish_start.elapsed().as_millis(),
+                        "remote registry publication complete"
+                    );
                 }
             }
 
@@ -745,7 +933,22 @@ async fn process_remote_transfer_request(
                     }
                 }
                 if !blocks_to_register.is_empty() {
+                    let register_count = blocks_to_register.len();
+                    let register_start = Instant::now();
                     let _ = host_pool.register_blocks(blocks_to_register).await;
+                    tracing::info!(
+                        target: "kvbm-g4",
+                        request_id = %request_id,
+                        operation_id = %operation_id,
+                        num_blocks = register_count,
+                        block_size = req.block_size,
+                        elapsed_ms = register_start.elapsed().as_millis(),
+                        available_after = host_pool.available_blocks(),
+                        "host onboarding block registration complete"
+                    );
+                }
+                if req.device_block_ids.is_empty() {
+                    leader.set_g4_prefetch_prefix(request_id, hashes.len());
                 }
             }
             Ok(())

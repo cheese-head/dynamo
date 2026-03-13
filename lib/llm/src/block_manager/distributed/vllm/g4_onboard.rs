@@ -22,8 +22,10 @@ pub fn onboard_from_g4(
     device_block_ids: Vec<usize>,
     block_size: usize,
     token_blocks: Vec<TokenBlock>,
-) -> (G4OnboardParams, WorkerTransferRequest) {
+) -> (G4OnboardParams, Vec<WorkerTransferRequest>) {
     let num_blocks = sequence_hashes.len();
+    debug_assert!(device_block_ids.is_empty() || device_block_ids.len() == num_blocks);
+    debug_assert!(token_blocks.is_empty() || token_blocks.len() == num_blocks);
     let operation_id = uuid::Uuid::new_v4();
 
     tracing::debug!(
@@ -44,13 +46,17 @@ pub fn onboard_from_g4(
         token_blocks,
     };
 
-    let worker_req = WorkerTransferRequest {
-        request_id,
-        uuid: operation_id,
-        transfer_type: TransferType::Load,
-        request_type: RequestType::Immediate,
-        block_ids: device_block_ids,
+    let worker_reqs = if device_block_ids.is_empty() {
+        Vec::new()
+    } else {
+        vec![WorkerTransferRequest {
+            request_id: request_id.clone(),
+            uuid: operation_id,
+            transfer_type: TransferType::Load,
+            request_type: RequestType::Immediate,
+            block_ids: device_block_ids,
+        }]
     };
 
-    (params, worker_req)
+    (params, worker_reqs)
 }

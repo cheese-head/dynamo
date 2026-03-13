@@ -21,8 +21,9 @@ use crate::{
             tier::{G4State, TierState},
             RequestKey,
         },
+        distributed::leader::G4FailureMode,
         distributed::registry::{NoMetadata, PositionalKey},
-        distributed::{vllm as vllm_int, KvbmLeader, RemoteHashOperationsSync},
+        distributed::{KvbmLeader, RemoteHashOperationsSync, vllm as vllm_int},
         metrics_kvbm::KvbmMetrics,
         BasicMetadata, DiskStorage, ImmutableBlock, KvBlockManager, PinnedStorage,
     },
@@ -144,24 +145,8 @@ impl<R: RequestKey> ConnectorSlotManager<R> {
 impl<R: RequestKey> ConnectorSlotManager<R> {
     /// Clear (wipe) all KV cache entries from a specific pool.
     ///
-    /// This drops **all** tracked slots (releasing block references) and then
-    /// resets the target pool, returning every block to the empty state.
-    ///
     /// `pool` must be one of: `"gpu"` / `"device"`, `"cpu"` / `"host"`, or `"disk"`.
     pub fn clear_pool(&self, pool: &str) -> Result<(), SlotError> {
-        // Step 1: Drop all slots so block references are released back to the pool.
-        {
-            let mut slots = self.slots.lock().unwrap();
-            let count = slots.len();
-            if count > 0 {
-                tracing::warn!(
-                    "clear_pool({pool}): dropping {count} active connector slots to release block references"
-                );
-                slots.clear();
-            }
-        }
-
-        // Step 2: Reset the target pool.
         match pool.to_lowercase().as_str() {
             "gpu" | "device" => {
                 if let Some(device) = self.block_manager.device() {
@@ -201,6 +186,10 @@ impl<R: RequestKey> ConnectorSlotManager<R> {
         }
 
         Ok(())
+    }
+
+    pub fn active_slot_count(&self) -> usize {
+        self.slots.lock().unwrap().len()
     }
 }
 
@@ -663,13 +652,16 @@ impl VllmConnectorSlot {
             return Ok(false);
         }
 
+        let g4_failure = self.leader.take_g4_failure(&self.request_id);
+        let g4_failed = g4_failure.is_some();
+
         let elapsed = self
             .g4
             .onboarding_started_at
             .map(|t| t.elapsed())
             .unwrap_or(Duration::ZERO);
         let timeout = g4_transfer_timeout();
-        if elapsed < timeout {
+        if !g4_failed && elapsed < timeout {
             tracing::debug!(
                 target: "kvbm-g4",
                 request_id = %self.request_id,
@@ -702,6 +694,7 @@ impl VllmConnectorSlot {
             }
         }
 
+        let reason = if g4_failed { "G4 TRANSFER FAILED" } else { "ONBOARD TIMEOUT" };
         tracing::error!(
             target: "kvbm-diag",
             request_id = %self.request_id,
@@ -711,7 +704,7 @@ impl VllmConnectorSlot {
             retry_count = self.g4.retry_count,
             device_blocks = self.device_blocks.len(),
             current_position = self.current_position,
-            "ONBOARD TIMEOUT — resetting slot to Preempted (this causes full recompute)"
+            "{reason} — resetting slot to Preempted (will re-match host/disk)"
         );
 
         let _ = self.operation_tracker.discard_pending();
@@ -729,13 +722,15 @@ impl VllmConnectorSlot {
         self.total_blocks_queried = 0;
         self.prefetched_g4_blocks_used_for_stats = 0;
 
+        let should_skip_g4 = matches!(g4_failure, Some(G4FailureMode::Skip));
         const MAX_G4_RETRIES: u32 = 3;
         self.g4.retry_count += 1;
-        if self.g4.retry_count >= MAX_G4_RETRIES {
+        if should_skip_g4 || self.g4.retry_count >= MAX_G4_RETRIES {
             tracing::error!(
                 target: "kvbm-diag",
                 request_id = %self.request_id,
-                "G4 retries exhausted — will skip G4 for all future lookups on this slot"
+                retry_count = self.g4.retry_count,
+                "G4 recovery will skip all future lookups on this slot"
             );
             self.g4.skip_on_retry = true;
         }
@@ -893,7 +888,7 @@ impl VllmConnectorSlot {
         sequence_hashes: Vec<u64>,
         token_blocks: Vec<TokenBlock>,
     ) -> Result<uuid::Uuid, SlotError> {
-        let (params, worker_req) = vllm_int::onboard_from_g4(
+        let (params, worker_reqs) = vllm_int::onboard_from_g4(
             self.request_id.clone(),
             sequence_hashes,
             vec![],
@@ -911,7 +906,9 @@ impl VllmConnectorSlot {
             SlotError::InvalidOperation(format!("Transfer engine unavailable: {}", e))
         })?;
 
-        self.append_pending_operation(worker_req);
+        for worker_req in worker_reqs {
+            self.append_pending_operation(worker_req);
+        }
 
         Ok(params.operation_id)
     }
@@ -923,17 +920,27 @@ impl VllmConnectorSlot {
         if prefetch.status != G4HostPrefetchStatus::Pending {
             return Ok(false);
         }
-        let sequence_hashes = prefetch.sequence_hashes.clone();
+        let Some(prefix_len) = self.leader.take_g4_prefetch_prefix(&self.request_id) else {
+            return Ok(false);
+        };
+        let requested_g4_blocks = prefetch.sequence_hashes.len();
+        let prefix_len = prefix_len.min(requested_g4_blocks);
+        let sequence_hashes = prefetch.sequence_hashes[..prefix_len].to_vec();
         let Some(host_pool) = self.block_manager.host() else {
             return Ok(false);
         };
 
-        let matched = host_pool
-            .match_sequence_hashes_blocking(sequence_hashes.as_slice())
-            .map_err(SlotError::BlockPoolError)?;
-        if matched.len() != sequence_hashes.len() {
-            return Ok(false);
-        }
+        let matched = if sequence_hashes.is_empty() {
+            vec![]
+        } else {
+            let matched = host_pool
+                .match_sequence_hashes_blocking(sequence_hashes.as_slice())
+                .map_err(SlotError::BlockPoolError)?;
+            if matched.len() != sequence_hashes.len() {
+                return Ok(false);
+            }
+            matched
+        };
 
         let matched_len = matched.len();
         if let Some(existing) = self.host.staging.as_mut() {
@@ -941,11 +948,15 @@ impl VllmConnectorSlot {
         } else {
             self.host.stage_non_empty(matched);
         }
+        prefetch.sequence_hashes.truncate(matched_len);
         self.prefetched_g4_blocks_used_for_stats = matched_len;
         prefetch.status = G4HostPrefetchStatus::Ready;
-        self.state = SlotState::OnboardStaged(prefetch.num_external_tokens);
+        let adjusted_external_tokens = prefetch
+            .num_external_tokens
+            .saturating_sub((requested_g4_blocks.saturating_sub(matched_len)) * self.block_size);
+        self.state = SlotState::OnboardStaged(adjusted_external_tokens);
         self.staged_match_report_pending
-            .arm(prefetch.num_external_tokens);
+            .arm(adjusted_external_tokens);
         Ok(true)
     }
 
@@ -1364,6 +1375,45 @@ impl Slot for VllmConnectorSlot {
         }
 
         if self.has_pending_g4_prefetch() {
+            if let Some(g4_failure) = self.leader.take_g4_failure(&self.request_id) {
+                tracing::error!(
+                    target: "kvbm-diag",
+                    request_id = %self.request_id,
+                    state = ?self.state(),
+                    retry_count = self.g4.retry_count,
+                    "G4 PREFETCH FAILED — cancelling host prefetch, resetting to Preempted"
+                );
+                self.host_prefetch = None;
+                let _ = self.operation_tracker.discard_pending();
+                self.state = SlotState::Preempted;
+                self.iteration_first_scheduled = None;
+                self.current_position = 0;
+                self.evaluated_blocks = 0;
+                self.device_blocks.clear();
+                self.tokens_cached_from_device = 0;
+                self.host.reset();
+                self.disk.reset();
+                self.g4.tier.reset();
+                self.performed_cache_lookup = false;
+                self.total_blocks_queried = 0;
+                self.prefetched_g4_blocks_used_for_stats = 0;
+
+                let should_skip_g4 = matches!(g4_failure, G4FailureMode::Skip);
+                const MAX_G4_RETRIES: u32 = 3;
+                self.g4.retry_count += 1;
+                if should_skip_g4 || self.g4.retry_count >= MAX_G4_RETRIES {
+                    tracing::error!(
+                        target: "kvbm-diag",
+                        request_id = %self.request_id,
+                        retry_count = self.g4.retry_count,
+                        "G4 recovery will skip all future lookups"
+                    );
+                    self.g4.skip_on_retry = true;
+                }
+                self.recovered_from_failed_transfer = true;
+                return Ok(());
+            }
+
             if self.try_stage_prefetched_host_matches()? {
                 tracing::debug!(
                     target: "kvbm-g4",
@@ -1921,7 +1971,7 @@ impl VllmConnectorSlot {
     ) -> Result<(), SlotError> {
         debug_assert_eq!(sequence_hashes.len(), device_block_ids.len());
 
-        let (params, worker_req) = vllm_int::onboard_from_g4(
+        let (params, worker_reqs) = vllm_int::onboard_from_g4(
             self.request_id.clone(),
             sequence_hashes,
             device_block_ids,
@@ -1939,7 +1989,9 @@ impl VllmConnectorSlot {
             SlotError::InvalidOperation(format!("Transfer engine unavailable: {}", e))
         })?;
 
-        self.append_pending_operation(worker_req);
+        for worker_req in worker_reqs {
+            self.append_pending_operation(worker_req);
+        }
         Ok(())
     }
 

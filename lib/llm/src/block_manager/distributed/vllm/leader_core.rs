@@ -116,6 +116,11 @@ impl KvConnectorLeaderCore {
             .expect("slot_manager not initialized")
     }
 
+    #[inline]
+    pub fn slot_manager_if_initialized(&self) -> Option<&ConnectorSlotManager<String>> {
+        self.slot_manager.get()
+    }
+
     /// Get the traceparent for a request, if one was registered at create_slot time.
     pub fn request_traceparent(&self, request_id: &str) -> Option<&str> {
         self.request_traces.get(request_id).map(|s| s.as_str())
@@ -329,7 +334,7 @@ impl KvConnectorLeaderCore {
 
         self.iteration_counter += 1;
         let iteration = self.iteration_counter;
-        let mut inflight_requests = self.inflight_requests.clone();
+        let mut accounted_requests = HashSet::new();
         let mut md = ConnectorMetadata::new(iteration);
         let onboarding_slots = std::mem::take(&mut self.onboarding_slots);
 
@@ -347,19 +352,26 @@ impl KvConnectorLeaderCore {
             let _req_span = self.enter_request_span(request_id, "kvbm.flush_onboarding");
             crate::lock_slot!(self, request_id => slot);
             crate::flush_slot_to_metadata!(slot, md, request_id);
-            assert!(inflight_requests.remove(request_id));
+            accounted_requests.insert(request_id.clone());
         }
 
         for new_req in &scheduler_output.new_requests {
             let request_id = &new_req.request_id;
             let already_created = md.new_slots.iter().any(|s| &s.request_id == request_id);
             if already_created {
-                assert!(inflight_requests.remove(request_id));
+                accounted_requests.insert(request_id.clone());
                 continue;
             }
 
             let _req_span = self.enter_request_span(request_id, "kvbm.schedule_new_request");
-            assert!(inflight_requests.remove(request_id));
+            if !accounted_requests.insert(request_id.clone()) {
+                tracing::warn!(
+                    target: "kvbm-diag",
+                    request_id = %request_id,
+                    iteration,
+                    "build_connector_metadata: request already accounted before new_request handling"
+                );
+            }
             crate::lock_slot!(self, request_id => slot);
             slot.record_start_iteration(iteration)?;
 
@@ -394,7 +406,16 @@ impl KvConnectorLeaderCore {
                 slot.reset_after_preemption();
             }
 
-            assert!(inflight_requests.remove(request_id));
+            if !accounted_requests.insert(request_id.clone())
+                && !onboarding_slots.contains(request_id)
+            {
+                tracing::warn!(
+                    target: "kvbm-diag",
+                    request_id = %request_id,
+                    iteration,
+                    "build_connector_metadata: cached_request duplicated outside onboarding flow"
+                );
+            }
             crate::lock_slot!(self, request_id => slot);
 
             let scheduled_tokens = *scheduler_output
@@ -415,7 +436,14 @@ impl KvConnectorLeaderCore {
             }
         }
 
-        for unscheduled_req in &inflight_requests {
+        let unscheduled_requests: Vec<_> = self
+            .inflight_requests
+            .iter()
+            .filter(|request_id| !accounted_requests.contains(*request_id))
+            .cloned()
+            .collect();
+
+        for unscheduled_req in &unscheduled_requests {
             crate::lock_slot!(self, unscheduled_req => slot_guard);
             let slot = slot_guard
                 .as_any_mut()
@@ -510,10 +538,30 @@ impl KvConnectorLeaderCore {
                  Set KVBM_DEV_MODE=TRUE to allow destructive pool operations."
             );
         }
-        self.inflight_requests.clear();
-        self.onboarding_slots.clear();
-        self.finishing_requests.clear();
-        self.slot_manager().clear_pool(&pool)?;
+
+        let active_inflight = self.inflight_requests.len();
+        let active_onboarding = self.onboarding_slots.len();
+        let active_finishing = self.finishing_requests.len();
+
+        let Some(slot_manager) = self.slot_manager_if_initialized() else {
+            tracing::warn!(
+                target: "kvbm-diag",
+                pool,
+                "clear_pool called before slot_manager initialization; skipping slot drop/reset"
+            );
+            return Ok(());
+        };
+
+        let active_slots = slot_manager.active_slot_count();
+        if active_inflight > 0 || active_onboarding > 0 || active_finishing > 0 || active_slots > 0 {
+            anyhow::bail!(
+                "clear_pool({pool}) rejected: active requests still present \
+                 (inflight={active_inflight}, onboarding={active_onboarding}, \
+                 finishing={active_finishing}, slots={active_slots})"
+            );
+        }
+
+        slot_manager.clear_pool(&pool)?;
         Ok(())
     }
 }

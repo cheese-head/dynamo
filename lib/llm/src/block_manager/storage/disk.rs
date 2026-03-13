@@ -554,9 +554,9 @@ impl RemoteDiskStorage {
     /// Open (or create) a file at `path` for a single NIXL transfer.
     ///
     /// * `create`     — `true` on offload (creates the file), `false` on onboard.
-    /// * `use_odirect` — when `true`, opens with `O_DIRECT` and pre-allocates space
-    ///   (required for GDS_MT). When `false`, skips both (POSIX write path: any
-    ///   filesystem, no pre-allocation; caller must `fdatasync` before GDS reads).
+    /// * `use_odirect` — when `true`, opens with `O_DIRECT`.
+    ///   This is treated as a hard requirement for the remote hash-file path.
+    ///   When `false`, skips both (buffered POSIX path).
     pub fn open(
         path: &str,
         size: usize,
@@ -581,7 +581,7 @@ impl RemoteDiskStorage {
         if create {
             flags |= OFlag::O_CREAT;
         }
-        if use_odirect && std::env::var(DISK_DISABLE_O_DIRECT_KEY).is_err() {
+        if use_odirect {
             flags |= OFlag::O_DIRECT;
         }
 
@@ -594,15 +594,6 @@ impl RemoteDiskStorage {
                 e
             ))
         })?;
-
-        // Pre-allocate only when using O_DIRECT (GDS requires real blocks).
-        // POSIX writes allocate blocks naturally; no pre-allocation needed.
-        if create && use_odirect {
-            allocate_file(raw_fd, size as u64).map_err(|e| {
-                unsafe { nix::libc::close(raw_fd) };
-                StorageError::AllocationFailed(format!("Failed to allocate file {}: {}", path, e))
-            })?;
-        }
 
         tracing::debug!(
             "RemoteDiskStorage opened: fd={}, file={}, size={} bytes, create={}, odirect={}",

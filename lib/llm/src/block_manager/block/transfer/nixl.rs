@@ -593,8 +593,9 @@ where
     let num_blocks = descriptors.len();
     let op = if matches!(direction, RemoteTransferDirection::Offload) { "write" } else { "read" };
     let base = ctx.base_path().unwrap_or("(none)");
+    let transfer_start = std::time::Instant::now();
     tracing::info!(
-        target: "kvbm-diag",
+        target: "kvbm-g4",
         direction = op,
         base_path = base,
         num_blocks,
@@ -619,8 +620,9 @@ where
     // Resolve the GDS_MT backend handle once (None if not loaded in agent).
     let gds_backend = agent.get_backend("GDS_MT");
 
-    // Optional: allow POSIX backend to also open files with O_DIRECT.
-    // This is independent from backend selection (GDS_MT vs POSIX).
+    // Optional: allow POSIX onboard reads to also open files with O_DIRECT.
+    // Offload writes use O_DIRECT by default so the one-file-per-hash path
+    // bypasses page cache and does not require a follow-up fdatasync.
     let posix_odirect = std::env::var(REMOTE_DISK_O_DIRECT_KEY)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
@@ -632,9 +634,14 @@ where
         gds_read && gds_backend.is_some()
     };
 
-    // Enable O_DIRECT when using GDS backend, and optionally for POSIX when
-    // DYN_KVBM_REMOTE_DISK_O_DIRECT is set.
-    let use_odirect = use_gds_backend || (!use_gds_backend && posix_odirect);
+    // Offload writes default to O_DIRECT even on the POSIX backend.
+    // Onboard reads keep the previous behavior: use O_DIRECT for GDS reads,
+    // or opt into POSIX O_DIRECT reads via DYN_KVBM_REMOTE_DISK_O_DIRECT.
+    let use_odirect = if create_files {
+        true
+    } else {
+        use_gds_backend || (!use_gds_backend && posix_odirect)
+    };
 
     let alignment_cfg = *REMOTE_DISK_ALIGNMENT_CONFIG;
     if use_odirect && alignment_cfg.validate && !block_size.is_multiple_of(alignment_cfg.quantum) {
@@ -675,7 +682,7 @@ where
 
             if disk_storages.is_empty() {
                 tracing::info!(
-                    target: "kvbm-diag",
+                    target: "kvbm-g4",
                     direction = op,
                     first_file = %file_path,
                     num_blocks,
@@ -796,10 +803,10 @@ where
         }
     }
 
-    // After a POSIX offload, flush dirty page-cache pages to storage so that
-    // a subsequent GDS O_DIRECT read (which bypasses the page cache) sees
-    // the committed data.  This is a no-op for GDS writes and for onboard.
-    if create_files && !gds_write {
+    // Buffered POSIX offloads must flush dirty page-cache pages so that a later
+    // O_DIRECT/GDS read sees committed data. O_DIRECT writes bypass the page cache,
+    // so they do not need an additional fdatasync here.
+    if create_files && !use_odirect {
         for ds in &disk_storages {
             ds.lock()
                 .fdatasync()
@@ -807,10 +814,14 @@ where
         }
     }
 
-    tracing::debug!(
-        "Disk transfer complete: {} blocks, direction={:?}",
+    tracing::info!(
+        target: "kvbm-g4",
+        direction = op,
+        base_path = base,
         num_blocks,
-        direction
+        block_size,
+        elapsed_ms = transfer_start.elapsed().as_millis(),
+        "Disk transfer complete"
     );
 
     Ok(())
