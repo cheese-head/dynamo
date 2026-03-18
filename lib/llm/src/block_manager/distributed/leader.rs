@@ -344,6 +344,15 @@ impl KvbmLeader {
                 .map(|v| v == "1" || v.to_lowercase() == "true");
         let object_req_checksum = std::env::var("DYN_KVBM_OBJECT_REQ_CHECKSUM").ok();
         let object_ca_bundle = std::env::var("DYN_KVBM_OBJECT_CA_BUNDLE").ok();
+        let object_accelerated =
+            std::env::var("DYN_KVBM_OBJECT_ACCELERATED")
+                .ok()
+                .map(|v| v == "1" || v.to_lowercase() == "true");
+        let accelerated_type = if object_accelerated == Some(true) {
+            std::env::var("DYN_KVBM_OBJECT_ACCELERATED_TYPE").ok()
+        } else {
+            None
+        };
 
         // Get disk storage config — keep raw template.
         // Singular DYN_KVBM_REMOTE_DISK_PATH (may contain {worker_id} template)
@@ -388,6 +397,8 @@ impl KvbmLeader {
             use_virtual_addressing: object_use_virtual_addressing,
             req_checksum: object_req_checksum.clone(),
             ca_bundle: object_ca_bundle.clone(),
+            accelerated: object_accelerated,
+            accelerated_type: accelerated_type.clone(),
         };
 
         match storage_type.as_str() {

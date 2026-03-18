@@ -233,11 +233,24 @@ fn build_agent(worker_id: usize, use_gds: bool) -> anyhow::Result<NixlAgent> {
                     ("DYN_KVBM_OBJECT_REQ_CHECKSUM", "req_checksum"),
                     ("DYN_KVBM_OBJECT_CA_BUNDLE", "ca_bundle"),
                     ("DYN_KVBM_OBJECT_NUM_THREADS", "num_threads"),
+                    ("DYN_KVBM_OBJECT_ACCELERATED", "accelerated"),
                 ];
                 for &(env_var, param_name) in obj_env_mappings {
                     if let Ok(val) = std::env::var(env_var) {
                         params.set(param_name, &val).map_err(|e| {
                             anyhow::anyhow!("Failed to set {} param: {}", param_name, e)
+                        })?;
+                    }
+                }
+
+                // Only set "type" if accelerated is enabled.
+                let accelerated = std::env::var("DYN_KVBM_OBJECT_ACCELERATED")
+                    .map(|v| v == "1" || v.to_lowercase() == "true")
+                    .unwrap_or(false);
+                if accelerated {
+                    if let Ok(val) = std::env::var("DYN_KVBM_OBJECT_ACCELERATED_TYPE") {
+                        params.set("type", &val).map_err(|e| {
+                            anyhow::anyhow!("Failed to set type param: {}", e)
                         })?;
                     }
                 }
@@ -1136,6 +1149,15 @@ fn remote_storage_config(worker_id: usize) -> Option<RemoteStorageConfig> {
             .map(|v| v == "1" || v.to_lowercase() == "true");
     let object_req_checksum = std::env::var("DYN_KVBM_OBJECT_REQ_CHECKSUM").ok();
     let object_ca_bundle = std::env::var("DYN_KVBM_OBJECT_CA_BUNDLE").ok();
+    let object_accelerated =
+        std::env::var("DYN_KVBM_OBJECT_ACCELERATED")
+            .ok()
+            .map(|v| v == "1" || v.to_lowercase() == "true");
+    let accelerated_type = if object_accelerated == Some(true) {
+        std::env::var("DYN_KVBM_OBJECT_ACCELERATED_TYPE").ok()
+    } else {
+        None
+    };
 
     // Get disk storage config (accept both singular and plural env vars).
     // Singular DYN_KVBM_REMOTE_DISK_PATH (may contain {worker_id} template)
@@ -1185,6 +1207,8 @@ fn remote_storage_config(worker_id: usize) -> Option<RemoteStorageConfig> {
         use_virtual_addressing: object_use_virtual_addressing,
         req_checksum: object_req_checksum.clone(),
         ca_bundle: object_ca_bundle.clone(),
+        accelerated: object_accelerated,
+        accelerated_type: accelerated_type.clone(),
     };
 
     match storage_type.as_str() {

@@ -400,6 +400,8 @@ pub enum RemoteStorageConfig {
         use_virtual_addressing: Option<bool>,
         req_checksum: Option<String>,
         ca_bundle: Option<String>,
+        accelerated: Option<bool>,
+        accelerated_type: Option<String>,
     },
     Disk {
         base_path: String,
@@ -420,6 +422,8 @@ impl RemoteStorageConfig {
             use_virtual_addressing: None,
             req_checksum: None,
             ca_bundle: None,
+            accelerated: None,
+            accelerated_type: None,
         }
     }
 
@@ -439,6 +443,8 @@ impl RemoteStorageConfig {
             use_virtual_addressing: None,
             req_checksum: None,
             ca_bundle: None,
+            accelerated: None,
+            accelerated_type: None,
         }
     }
 
@@ -796,6 +802,130 @@ mod tests {
             let debug_str = format!("{:?}", config);
             assert!(debug_str.contains("Object"));
             assert!(debug_str.contains("debug-bucket"));
+        }
+
+        #[test]
+        fn test_object_accelerated_and_type_default_none() {
+            let config = RemoteStorageConfig::object("my-bucket");
+            match config {
+                RemoteStorageConfig::Object {
+                    accelerated,
+                    accelerated_type,
+                    ..
+                } => {
+                    assert!(accelerated.is_none());
+                    assert!(accelerated_type.is_none());
+                }
+                _ => panic!("Expected Object variant"),
+            }
+        }
+
+        #[test]
+        fn test_object_with_options_accelerated_and_type_default_none() {
+            let config = RemoteStorageConfig::object_with_options(
+                Some("bucket".to_string()),
+                Some("http://localhost:9000".to_string()),
+                Some("us-east-1".to_string()),
+            );
+            match config {
+                RemoteStorageConfig::Object {
+                    accelerated,
+                    accelerated_type,
+                    ..
+                } => {
+                    assert!(accelerated.is_none());
+                    assert!(accelerated_type.is_none());
+                }
+                _ => panic!("Expected Object variant"),
+            }
+        }
+
+        #[test]
+        fn test_object_accelerated_true_with_type() {
+            let config = RemoteStorageConfig::Object {
+                bucket_template: Some("accel-bucket".to_string()),
+                endpoint: None,
+                region: None,
+                access_key: None,
+                secret_key: None,
+                session_token: None,
+                scheme: None,
+                use_virtual_addressing: None,
+                req_checksum: None,
+                ca_bundle: None,
+                accelerated: Some(true),
+                accelerated_type: Some("dell".to_string()),
+            };
+            match config {
+                RemoteStorageConfig::Object {
+                    accelerated,
+                    accelerated_type,
+                    ..
+                } => {
+                    assert_eq!(accelerated, Some(true));
+                    assert_eq!(accelerated_type, Some("dell".to_string()));
+                }
+                _ => panic!("Expected Object variant"),
+            }
+        }
+
+        #[test]
+        fn test_object_accelerated_false_type_ignored() {
+            let config = RemoteStorageConfig::Object {
+                bucket_template: Some("normal-bucket".to_string()),
+                endpoint: None,
+                region: None,
+                access_key: None,
+                secret_key: None,
+                session_token: None,
+                scheme: None,
+                use_virtual_addressing: None,
+                req_checksum: None,
+                ca_bundle: None,
+                accelerated: Some(false),
+                accelerated_type: None,
+            };
+            match config {
+                RemoteStorageConfig::Object {
+                    accelerated,
+                    accelerated_type,
+                    ..
+                } => {
+                    assert_eq!(accelerated, Some(false));
+                    assert!(accelerated_type.is_none());
+                }
+                _ => panic!("Expected Object variant"),
+            }
+        }
+
+        #[test]
+        fn test_object_accelerated_clone_preserves_fields() {
+            let config = RemoteStorageConfig::Object {
+                bucket_template: Some("clone-bucket".to_string()),
+                endpoint: None,
+                region: None,
+                access_key: None,
+                secret_key: None,
+                session_token: None,
+                scheme: None,
+                use_virtual_addressing: None,
+                req_checksum: None,
+                ca_bundle: None,
+                accelerated: Some(true),
+                accelerated_type: Some("dell".to_string()),
+            };
+            let cloned = config.clone();
+            match cloned {
+                RemoteStorageConfig::Object {
+                    accelerated,
+                    accelerated_type,
+                    ..
+                } => {
+                    assert_eq!(accelerated, Some(true));
+                    assert_eq!(accelerated_type, Some("dell".to_string()));
+                }
+                _ => panic!("Expected Object variant"),
+            }
         }
     }
 
