@@ -356,7 +356,6 @@ where
     V: Clone + Send + Sync + 'static,
     S: Storage<K, V>,
 {
-
     /// Record an access for a key (used for LRU/LFU tracking).
     ///
     /// Called when a cache hit occurs (e.g., onboard from G4, or G2 cache hit).
@@ -829,7 +828,15 @@ mod tests {
         let evictable: PositionalEviction<TestPosKey, u64> = PositionalEviction::with_capacity(100);
 
         let entries: Vec<(TestPosKey, u64)> = (0..10)
-            .map(|i| (TestPosKey { position: i % 3, id: i }, i * 100))
+            .map(|i| {
+                (
+                    TestPosKey {
+                        position: i % 3,
+                        id: i,
+                    },
+                    i * 100,
+                )
+            })
             .collect();
 
         evictable.insert_batch(entries);

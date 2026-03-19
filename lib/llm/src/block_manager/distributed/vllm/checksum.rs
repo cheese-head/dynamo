@@ -93,7 +93,10 @@ pub unsafe fn verify_g4_checksums(
 /// Error type for G4 checksum validation failures.
 #[derive(Debug, Clone)]
 pub enum G4ChecksumError {
-    CountMismatch { actual: usize, expected: usize },
+    CountMismatch {
+        actual: usize,
+        expected: usize,
+    },
     Mismatch {
         block_index: usize,
         sequence_hash: u64,

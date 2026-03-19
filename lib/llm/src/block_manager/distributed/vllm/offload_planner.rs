@@ -1,10 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::block_manager::block::transfer::remote::{RemoteBlockDescriptor, RemoteTransferPipeline};
+use crate::block_manager::block::transfer::remote::{
+    RemoteBlockDescriptor, RemoteTransferPipeline,
+};
 use crate::block_manager::config::RemoteStorageConfig;
-use crate::block_manager::distributed::remote::PositionalRemoteHandle;
 use crate::block_manager::distributed::RemoteHashOperations;
+use crate::block_manager::distributed::remote::PositionalRemoteHandle;
 use crate::tokens::SequenceHash;
 
 /// Create remote block descriptors from hashes and storage config.

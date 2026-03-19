@@ -6,17 +6,16 @@ pub mod slot;
 
 use super::*;
 use anyhow;
-use dynamo_runtime::config::environment_names::kvbm as env_kvbm;
 use dynamo_llm::block_manager::config::{
     cpu_cache_lookup_dirty, cpu_cache_lookup_disabled, set_cpu_cache_lookup_disabled,
 };
 use dynamo_llm::block_manager::distributed::vllm::{
-    ConnectorSlotManager, KvConnectorLeaderCore, SlotManager,
-    create_distributed_registry_client, is_dev_mode, kvbm_metrics_endpoint_enabled,
-    parse_kvbm_metrics_port,
+    ConnectorSlotManager, KvConnectorLeaderCore, SlotManager, create_distributed_registry_client,
+    is_dev_mode, kvbm_metrics_endpoint_enabled, parse_kvbm_metrics_port,
 };
 use dynamo_llm::block_manager::kv_consolidator::EventSource;
 use dynamo_llm::block_manager::metrics_kvbm::{KvbmMetrics, KvbmMetricsRegistry};
+use dynamo_runtime::config::environment_names::kvbm as env_kvbm;
 use std::sync::{Arc, OnceLock};
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
@@ -40,15 +39,26 @@ pub trait Leader: Send + Sync + std::fmt::Debug {
         num_external_tokens: usize,
     ) -> anyhow::Result<()>;
 
-    fn build_connector_metadata(&mut self, scheduler_output: SchedulerOutput) -> anyhow::Result<Vec<u8>>;
+    fn build_connector_metadata(
+        &mut self,
+        scheduler_output: SchedulerOutput,
+    ) -> anyhow::Result<Vec<u8>>;
 
-    fn request_finished(&mut self, request_id: String, block_ids: Vec<BlockId>) -> anyhow::Result<bool>;
+    fn request_finished(
+        &mut self,
+        request_id: String,
+        block_ids: Vec<BlockId>,
+    ) -> anyhow::Result<bool>;
 
     fn has_slot(&self, request_id: String) -> bool;
 
     fn create_slot(&mut self, request: KvbmRequest, tokens: Vec<u32>) -> anyhow::Result<()>;
 
-    fn set_request_traceparent(&mut self, request_id: String, traceparent: String) -> anyhow::Result<()>;
+    fn set_request_traceparent(
+        &mut self,
+        request_id: String,
+        traceparent: String,
+    ) -> anyhow::Result<()>;
 
     fn slot_manager(&self) -> &ConnectorSlotManager<String>;
 
@@ -78,7 +88,10 @@ impl KvConnectorLeader {
         consolidator_vllm_endpoint: Option<String>,
         consolidator_output_endpoint: Option<String>,
     ) -> Self {
-        tracing::info!("KvConnectorLeader initialized with worker_id: {}", worker_id);
+        tracing::info!(
+            "KvConnectorLeader initialized with worker_id: {}",
+            worker_id
+        );
 
         let leader = leader_py.get_inner().clone();
         let handle: Handle = get_current_tokio_handle();
@@ -107,7 +120,8 @@ impl KvConnectorLeader {
                     return;
                 }
 
-                if create_distributed_registry_client().map(|client| leader.set_remote_registry(client))
+                if create_distributed_registry_client()
+                    .map(|client| leader.set_remote_registry(client))
                     == Some(false)
                 {
                     tracing::warn!("Remote registry was already set on leader");
@@ -192,11 +206,18 @@ impl Leader for KvConnectorLeader {
             .update_state_after_alloc(request_id, block_ids, num_external_tokens)
     }
 
-    fn build_connector_metadata(&mut self, scheduler_output: SchedulerOutput) -> anyhow::Result<Vec<u8>> {
+    fn build_connector_metadata(
+        &mut self,
+        scheduler_output: SchedulerOutput,
+    ) -> anyhow::Result<Vec<u8>> {
         self.core.build_connector_metadata(scheduler_output.into())
     }
 
-    fn request_finished(&mut self, request_id: String, block_ids: Vec<BlockId>) -> anyhow::Result<bool> {
+    fn request_finished(
+        &mut self,
+        request_id: String,
+        block_ids: Vec<BlockId>,
+    ) -> anyhow::Result<bool> {
         self.core.request_finished(request_id, block_ids)
     }
 
@@ -209,7 +230,11 @@ impl Leader for KvConnectorLeader {
             .create_slot(request.request_id, request.salt_hash, tokens)
     }
 
-    fn set_request_traceparent(&mut self, request_id: String, traceparent: String) -> anyhow::Result<()> {
+    fn set_request_traceparent(
+        &mut self,
+        request_id: String,
+        traceparent: String,
+    ) -> anyhow::Result<()> {
         self.core.set_request_traceparent(request_id, traceparent);
         Ok(())
     }

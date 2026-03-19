@@ -197,19 +197,39 @@ impl KvbmMetrics {
             )
             .unwrap();
         let scheduler_onboarding = mr
-            .create_gauge("scheduler_onboarding", "Number of requests with onboard transfers pending", &[])
+            .create_gauge(
+                "scheduler_onboarding",
+                "Number of requests with onboard transfers pending",
+                &[],
+            )
             .unwrap();
         let scheduler_new_requests = mr
-            .create_gauge("scheduler_new_requests", "Number of new requests in current scheduler iteration", &[])
+            .create_gauge(
+                "scheduler_new_requests",
+                "Number of new requests in current scheduler iteration",
+                &[],
+            )
             .unwrap();
         let scheduler_cached_requests = mr
-            .create_gauge("scheduler_cached_requests", "Number of cached (continuing) requests in current scheduler iteration", &[])
+            .create_gauge(
+                "scheduler_cached_requests",
+                "Number of cached (continuing) requests in current scheduler iteration",
+                &[],
+            )
             .unwrap();
         let scheduler_finishing = mr
-            .create_gauge("scheduler_finishing", "Number of requests finishing in current scheduler iteration", &[])
+            .create_gauge(
+                "scheduler_finishing",
+                "Number of requests finishing in current scheduler iteration",
+                &[],
+            )
             .unwrap();
         let scheduler_inflight = mr
-            .create_gauge("scheduler_inflight", "Total inflight requests tracked by KVBM leader", &[])
+            .create_gauge(
+                "scheduler_inflight",
+                "Total inflight requests tracked by KVBM leader",
+                &[],
+            )
             .unwrap();
         // early return if no endpoint is needed
         if !create_endpoint {

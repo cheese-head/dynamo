@@ -361,7 +361,8 @@ impl Worker for KvConnectorWorker {
                         "replacing completed Phase 1 slot with Phase 2 slot"
                     );
                     self.connector.remove_slot(&slot_info.request_id);
-                    self.already_signaled_offloading.remove(&slot_info.request_id);
+                    self.already_signaled_offloading
+                        .remove(&slot_info.request_id);
                 } else {
                     // Phase 1 is NOT complete but Phase 2 arrived. This violates the
                     // protocol: vLLM should not schedule prefill until onboarding
@@ -417,10 +418,7 @@ impl Worker for KvConnectorWorker {
             }
 
             self.connector.enqueue_request(operation)?;
-            let state = self
-                .request_lifecycle
-                .entry(request_id)
-                .or_default();
+            let state = self.request_lifecycle.entry(request_id).or_default();
             state.onboarding_pending = true;
         }
 

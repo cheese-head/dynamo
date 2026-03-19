@@ -363,7 +363,10 @@ impl Worker for KvConnectorWorker {
             // currently chomping the error as the engine is closed and we are shutting down
             if self.connector.has_slot(request_id) {
                 if let Err(e) = self.connector.remove_slot(request_id) {
-                    tracing::error!(request_id, "failed to remove slot: {e}; scheduler disconnected");
+                    tracing::error!(
+                        request_id,
+                        "failed to remove slot: {e}; scheduler disconnected"
+                    );
                 }
             } else {
                 tracing::debug!(
@@ -394,7 +397,10 @@ impl Worker for KvConnectorWorker {
             self.maybe_finished_onboarding.remove(request_id);
             if self.connector.has_slot(request_id) {
                 if let Err(e) = self.connector.remove_slot(request_id) {
-                    tracing::error!(request_id, "failed to remove slot: {e}; scheduler disconnected");
+                    tracing::error!(
+                        request_id,
+                        "failed to remove slot: {e}; scheduler disconnected"
+                    );
                 }
             }
         }

@@ -9,8 +9,8 @@ use crate::block_manager::block::transfer::remote::RemoteKey;
 use utils::*;
 use zmq::*;
 
-use derive_builder::Builder;
 use dashmap::DashMap;
+use derive_builder::Builder;
 use parking_lot::RwLock;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -338,10 +338,9 @@ impl KvbmLeader {
             .or_else(|_| std::env::var("AWS_SESSION_TOKEN"))
             .ok();
         let object_scheme = std::env::var("DYN_KVBM_OBJECT_SCHEME").ok();
-        let object_use_virtual_addressing =
-            std::env::var("DYN_KVBM_OBJECT_USE_VIRTUAL_ADDRESSING")
-                .ok()
-                .map(|v| v == "1" || v.to_lowercase() == "true");
+        let object_use_virtual_addressing = std::env::var("DYN_KVBM_OBJECT_USE_VIRTUAL_ADDRESSING")
+            .ok()
+            .map(|v| v == "1" || v.to_lowercase() == "true");
         let object_req_checksum = std::env::var("DYN_KVBM_OBJECT_REQ_CHECKSUM").ok();
         let object_ca_bundle = std::env::var("DYN_KVBM_OBJECT_CA_BUNDLE").ok();
 

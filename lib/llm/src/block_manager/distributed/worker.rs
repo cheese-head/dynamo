@@ -155,10 +155,13 @@ fn build_agent(worker_id: usize, use_gds: bool) -> anyhow::Result<NixlAgent> {
                 posix_params
                     .set("use_uring", "true")
                     .map_err(|e| anyhow::anyhow!("Failed to set POSIX param use_uring: {}", e))?;
-                posix_params
-                    .set("use_posix_aio", "false")
-                    .map_err(|e| anyhow::anyhow!("Failed to set POSIX param use_posix_aio: {}", e))?;
-                tracing::info!(worker_id = worker_id, "Configured NIXL POSIX queue API: io_uring");
+                posix_params.set("use_posix_aio", "false").map_err(|e| {
+                    anyhow::anyhow!("Failed to set POSIX param use_posix_aio: {}", e)
+                })?;
+                tracing::info!(
+                    worker_id = worker_id,
+                    "Configured NIXL POSIX queue API: io_uring"
+                );
             }
             "aio" | "linux_aio" | "libaio" => {
                 posix_params
@@ -167,9 +170,9 @@ fn build_agent(worker_id: usize, use_gds: bool) -> anyhow::Result<NixlAgent> {
                 posix_params
                     .set("use_uring", "false")
                     .map_err(|e| anyhow::anyhow!("Failed to set POSIX param use_uring: {}", e))?;
-                posix_params
-                    .set("use_posix_aio", "false")
-                    .map_err(|e| anyhow::anyhow!("Failed to set POSIX param use_posix_aio: {}", e))?;
+                posix_params.set("use_posix_aio", "false").map_err(|e| {
+                    anyhow::anyhow!("Failed to set POSIX param use_posix_aio: {}", e)
+                })?;
                 tracing::info!(
                     worker_id = worker_id,
                     "Configured NIXL POSIX queue API: linux_aio"
@@ -182,9 +185,9 @@ fn build_agent(worker_id: usize, use_gds: bool) -> anyhow::Result<NixlAgent> {
                 posix_params
                     .set("use_uring", "false")
                     .map_err(|e| anyhow::anyhow!("Failed to set POSIX param use_uring: {}", e))?;
-                posix_params
-                    .set("use_posix_aio", "true")
-                    .map_err(|e| anyhow::anyhow!("Failed to set POSIX param use_posix_aio: {}", e))?;
+                posix_params.set("use_posix_aio", "true").map_err(|e| {
+                    anyhow::anyhow!("Failed to set POSIX param use_posix_aio: {}", e)
+                })?;
                 tracing::info!(
                     worker_id = worker_id,
                     "Configured NIXL POSIX queue API: posix_aio"
@@ -229,7 +232,10 @@ fn build_agent(worker_id: usize, use_gds: bool) -> anyhow::Result<NixlAgent> {
                     ("DYN_KVBM_OBJECT_SESSION_TOKEN", "session_token"),
                     ("DYN_KVBM_OBJECT_SCHEME", "scheme"),
                     ("DYN_KVBM_OBJECT_REGION", "region"),
-                    ("DYN_KVBM_OBJECT_USE_VIRTUAL_ADDRESSING", "use_virtual_addressing"),
+                    (
+                        "DYN_KVBM_OBJECT_USE_VIRTUAL_ADDRESSING",
+                        "use_virtual_addressing",
+                    ),
                     ("DYN_KVBM_OBJECT_REQ_CHECKSUM", "req_checksum"),
                     ("DYN_KVBM_OBJECT_CA_BUNDLE", "ca_bundle"),
                     ("DYN_KVBM_OBJECT_NUM_THREADS", "num_threads"),
@@ -244,10 +250,26 @@ fn build_agent(worker_id: usize, use_gds: bool) -> anyhow::Result<NixlAgent> {
 
                 // Fall back to AWS SDK env vars when DYN_KVBM_ variants are not set.
                 let aws_fallbacks: &[(&str, &str, &str)] = &[
-                    ("DYN_KVBM_OBJECT_ENDPOINT", "AWS_ENDPOINT_URL", "endpoint_override"),
-                    ("DYN_KVBM_OBJECT_ACCESS_KEY", "AWS_ACCESS_KEY_ID", "access_key"),
-                    ("DYN_KVBM_OBJECT_SECRET_KEY", "AWS_SECRET_ACCESS_KEY", "secret_key"),
-                    ("DYN_KVBM_OBJECT_SESSION_TOKEN", "AWS_SESSION_TOKEN", "session_token"),
+                    (
+                        "DYN_KVBM_OBJECT_ENDPOINT",
+                        "AWS_ENDPOINT_URL",
+                        "endpoint_override",
+                    ),
+                    (
+                        "DYN_KVBM_OBJECT_ACCESS_KEY",
+                        "AWS_ACCESS_KEY_ID",
+                        "access_key",
+                    ),
+                    (
+                        "DYN_KVBM_OBJECT_SECRET_KEY",
+                        "AWS_SECRET_ACCESS_KEY",
+                        "secret_key",
+                    ),
+                    (
+                        "DYN_KVBM_OBJECT_SESSION_TOKEN",
+                        "AWS_SESSION_TOKEN",
+                        "session_token",
+                    ),
                     ("DYN_KVBM_OBJECT_REGION", "AWS_REGION", "region"),
                 ];
                 for &(primary, fallback, param_name) in aws_fallbacks {
@@ -1130,10 +1152,9 @@ fn remote_storage_config(worker_id: usize) -> Option<RemoteStorageConfig> {
         .or_else(|_| std::env::var("AWS_SESSION_TOKEN"))
         .ok();
     let object_scheme = std::env::var("DYN_KVBM_OBJECT_SCHEME").ok();
-    let object_use_virtual_addressing =
-        std::env::var("DYN_KVBM_OBJECT_USE_VIRTUAL_ADDRESSING")
-            .ok()
-            .map(|v| v == "1" || v.to_lowercase() == "true");
+    let object_use_virtual_addressing = std::env::var("DYN_KVBM_OBJECT_USE_VIRTUAL_ADDRESSING")
+        .ok()
+        .map(|v| v == "1" || v.to_lowercase() == "true");
     let object_req_checksum = std::env::var("DYN_KVBM_OBJECT_REQ_CHECKSUM").ok();
     let object_ca_bundle = std::env::var("DYN_KVBM_OBJECT_CA_BUNDLE").ok();
 

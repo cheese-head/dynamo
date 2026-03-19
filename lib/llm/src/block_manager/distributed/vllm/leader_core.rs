@@ -7,16 +7,12 @@ use std::{
 };
 
 use crate::block_manager::{
-    block::BlockId,
-    connector::protocol::WorkerTransferRequest,
-    distributed::vllm::is_dev_mode,
+    block::BlockId, connector::protocol::WorkerTransferRequest, distributed::vllm::is_dev_mode,
     metrics_kvbm::KvbmMetrics,
 };
 use serde::{Deserialize, Serialize};
 
-use super::{
-    ConnectorSlotManager, SlotError, SlotManager, SlotState, VllmConnectorSlot,
-};
+use super::{ConnectorSlotManager, SlotError, SlotManager, SlotState, VllmConnectorSlot};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchedulerOutput {
@@ -129,7 +125,11 @@ impl KvConnectorLeaderCore {
 
     /// Enter a span linked to the request's trace. Returns the guard (drop to exit).
     /// Falls back to a standalone span if no traceparent is registered.
-    fn enter_request_span(&self, request_id: &str, span_name: &'static str) -> tracing::span::EnteredSpan {
+    fn enter_request_span(
+        &self,
+        request_id: &str,
+        span_name: &'static str,
+    ) -> tracing::span::EnteredSpan {
         if !dynamo_runtime::logging::otel_export_enabled() {
             return tracing::Span::none().entered();
         }
@@ -304,11 +304,21 @@ impl KvConnectorLeaderCore {
         &mut self,
         scheduler_output: SchedulerOutput,
     ) -> anyhow::Result<Vec<u8>> {
-        self.kvbm_metrics.scheduler_new_requests.set(scheduler_output.new_requests.len() as f64);
-        self.kvbm_metrics.scheduler_cached_requests.set(scheduler_output.cached_requests.len() as f64);
-        self.kvbm_metrics.scheduler_finishing.set(self.finishing_requests.len() as f64);
-        self.kvbm_metrics.scheduler_onboarding.set(self.onboarding_slots.len() as f64);
-        self.kvbm_metrics.scheduler_inflight.set(self.inflight_requests.len() as f64);
+        self.kvbm_metrics
+            .scheduler_new_requests
+            .set(scheduler_output.new_requests.len() as f64);
+        self.kvbm_metrics
+            .scheduler_cached_requests
+            .set(scheduler_output.cached_requests.len() as f64);
+        self.kvbm_metrics
+            .scheduler_finishing
+            .set(self.finishing_requests.len() as f64);
+        self.kvbm_metrics
+            .scheduler_onboarding
+            .set(self.onboarding_slots.len() as f64);
+        self.kvbm_metrics
+            .scheduler_inflight
+            .set(self.inflight_requests.len() as f64);
 
         if !self.finishing_requests.is_empty() {
             let to_clean: Vec<String> = self.finishing_requests.drain().collect();
@@ -379,7 +389,13 @@ impl KvConnectorLeaderCore {
                 "build_connector_metadata: new request from vLLM scheduler"
             );
 
-            slot.apply_scheduler_output(&[], &[], new_req.num_computed_tokens, scheduled_tokens, None)?;
+            slot.apply_scheduler_output(
+                &[],
+                &[],
+                new_req.num_computed_tokens,
+                scheduled_tokens,
+                None,
+            )?;
             crate::flush_slot_to_metadata!(slot, md, new_req.request_id);
         }
 

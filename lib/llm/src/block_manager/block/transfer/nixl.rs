@@ -591,7 +591,11 @@ where
     <LB as StorageTypeProvider>::StorageType: NixlDescriptor,
 {
     let num_blocks = descriptors.len();
-    let op = if matches!(direction, RemoteTransferDirection::Offload) { "write" } else { "read" };
+    let op = if matches!(direction, RemoteTransferDirection::Offload) {
+        "write"
+    } else {
+        "read"
+    };
     let base = ctx.base_path().unwrap_or("(none)");
     tracing::info!(
         target: "kvbm-diag",

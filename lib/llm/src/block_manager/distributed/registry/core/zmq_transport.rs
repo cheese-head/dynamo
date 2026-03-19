@@ -210,10 +210,7 @@ impl ZmqTransport {
     /// - Receives commands from mpsc channel, sends on DEALER
     /// - Receives responses from DEALER, routes to callers via oneshot
     /// - Stale responses (caller timed out) are discarded silently
-    async fn dealer_task(
-        mut dealer: dealer::Dealer,
-        mut rx: mpsc::Receiver<DealerCommand>,
-    ) {
+    async fn dealer_task(mut dealer: dealer::Dealer, mut rx: mpsc::Receiver<DealerCommand>) {
         let mut in_flight: HashMap<u32, oneshot::Sender<Result<Vec<u8>>>> = HashMap::new();
 
         loop {
@@ -311,10 +308,7 @@ impl ZmqTransport {
     /// Dedicated task that owns the PUSH socket.
     ///
     /// Simple fire-and-forget loop: receives commands, sends on PUSH socket.
-    async fn push_task(
-        mut pusher: push::Push,
-        mut rx: mpsc::Receiver<PushCommand>,
-    ) {
+    async fn push_task(mut pusher: push::Push, mut rx: mpsc::Receiver<PushCommand>) {
         while let Some(cmd) = rx.recv().await {
             let mut msg = VecDeque::new();
             msg.push_back(Message::from(cmd.payload));
@@ -354,11 +348,7 @@ impl RegistryTransport for ZmqTransport {
             .await
             .map_err(|_| anyhow!("DEALER socket task has shut down"))?;
 
-        tracing::info!(
-            request_id,
-            data_len = data.len(),
-            "ZMQ request submitted"
-        );
+        tracing::info!(request_id, data_len = data.len(), "ZMQ request submitted");
 
         // Wait for response from the socket task.
         // There is no transport-level timeout here. The caller (RemoteHandle)

@@ -406,10 +406,13 @@ pub fn decode_remote_transfer_message(bytes: &[u8]) -> anyhow::Result<RemoteTran
         );
     }
 
-    bincode::serde::decode_from_slice::<RemoteTransferRequest, _>(bytes, bincode::config::standard())
-        .map(|(request, _)| request)
-        .or_else(|_| serde_json::from_slice::<RemoteTransferRequest>(bytes))
-        .map_err(|e| anyhow::anyhow!("failed to decode remote transfer request: {}", e))
+    bincode::serde::decode_from_slice::<RemoteTransferRequest, _>(
+        bytes,
+        bincode::config::standard(),
+    )
+    .map(|(request, _)| request)
+    .or_else(|_| serde_json::from_slice::<RemoteTransferRequest>(bytes))
+    .map_err(|e| anyhow::anyhow!("failed to decode remote transfer request: {}", e))
 }
 
 #[cfg(test)]

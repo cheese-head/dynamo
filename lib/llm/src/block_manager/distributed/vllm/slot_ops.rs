@@ -49,7 +49,10 @@ impl OperationTracker {
 
     /// Drops pending operations without increasing dispatched count.
     pub fn discard_pending(&mut self) -> usize {
-        self.pending_operations.take().map(|ops| ops.len()).unwrap_or(0)
+        self.pending_operations
+            .take()
+            .map(|ops| ops.len())
+            .unwrap_or(0)
     }
 
     /// Clears pending and dispatched operation accounting.

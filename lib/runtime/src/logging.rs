@@ -464,10 +464,7 @@ pub fn make_linked_span(span_name: &'static str, traceparent: &str) -> Span {
             parent_id = pid.as_str(),
         )
     } else {
-        tracing::info_span!(
-            "linked_transfer",
-            otel.name = span_name,
-        )
+        tracing::info_span!("linked_transfer", otel.name = span_name,)
     };
 
     if let Some(context) = otel_context {

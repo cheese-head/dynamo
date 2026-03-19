@@ -140,7 +140,10 @@ impl<S: Storage, L: LocalityProvider, M: BlockMetadata> InactiveBlockPool<S, L, 
             }
             BlockState::Registered(state, _) => {
                 let sequence_hash = state.sequence_hash();
-                tracing::debug!(sequence_hash, "inactive: block arrived Registered → lookup_map");
+                tracing::debug!(
+                    sequence_hash,
+                    "inactive: block arrived Registered → lookup_map"
+                );
                 self.insert_with_sequence_hash(block, sequence_hash);
             }
         }

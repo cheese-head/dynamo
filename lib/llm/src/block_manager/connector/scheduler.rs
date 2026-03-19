@@ -222,7 +222,10 @@ impl WorkerSchedulerClient {
     ///
     /// Both the worker client and the scheduler keep track of outstanding requests.
     /// The atomic counter to mark completion is shared, but only incremented by the scheduler.
-    pub fn enqueue_request(&mut self, request: WorkerTransferRequest) -> Result<(), SchedulerError> {
+    pub fn enqueue_request(
+        &mut self,
+        request: WorkerTransferRequest,
+    ) -> Result<(), SchedulerError> {
         debug_assert!(
             self.slots.contains_key(&request.request_id),
             "slot does not exist"

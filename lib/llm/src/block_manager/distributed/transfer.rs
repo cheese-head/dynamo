@@ -102,7 +102,9 @@ pub struct RemoteTransferContextLease {
 
 impl RemoteTransferContextLease {
     fn context(&self) -> &Arc<RemoteTransferContext> {
-        self.ctx.as_ref().expect("remote transfer context lease missing")
+        self.ctx
+            .as_ref()
+            .expect("remote transfer context lease missing")
     }
 }
 
@@ -456,7 +458,9 @@ impl BlockTransferHandler {
                             connector_req: None,
                             sequence_hashes: None,
                         };
-                        self.execute_transfer(local_request).instrument(h2d_span).await?;
+                        self.execute_transfer(local_request)
+                            .instrument(h2d_span)
+                            .await?;
 
                         if is_onboard {
                             tracing::info!(
@@ -644,7 +648,9 @@ impl BlockTransferHandler {
                                     h2d_handler
                                         .execute_transfer(local_request)
                                         .await
-                                        .map_err(|e| anyhow::anyhow!("H2D chunk {}: {}", chunk_idx, e))
+                                        .map_err(|e| {
+                                            anyhow::anyhow!("H2D chunk {}: {}", chunk_idx, e)
+                                        })
                                 }
                                 .instrument(h2d_span),
                             );

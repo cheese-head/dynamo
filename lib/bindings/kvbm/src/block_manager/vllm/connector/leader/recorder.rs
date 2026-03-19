@@ -198,7 +198,8 @@ impl KvConnectorLeaderRecorder {
             });
         });
 
-        let connector_leader = KvConnectorLeader::from_parts(slot_manager_cell, page_size, kvbm_metrics);
+        let connector_leader =
+            KvConnectorLeader::from_parts(slot_manager_cell, page_size, kvbm_metrics);
 
         Self {
             _recorder: recorder,
@@ -350,8 +351,13 @@ impl Leader for KvConnectorLeaderRecorder {
         Ok(())
     }
 
-    fn set_request_traceparent(&mut self, request_id: String, traceparent: String) -> anyhow::Result<()> {
-        self.connector_leader.set_request_traceparent(request_id, traceparent)
+    fn set_request_traceparent(
+        &mut self,
+        request_id: String,
+        traceparent: String,
+    ) -> anyhow::Result<()> {
+        self.connector_leader
+            .set_request_traceparent(request_id, traceparent)
     }
 
     fn clear_pool(&mut self, pool: String) -> anyhow::Result<()> {

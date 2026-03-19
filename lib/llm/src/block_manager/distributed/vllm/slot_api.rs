@@ -4,11 +4,7 @@
 use std::any::Any;
 use std::sync::{Arc, Mutex};
 
-use crate::block_manager::{
-    block::BlockId,
-    connector::RequestKey,
-    pool::BlockPoolError,
-};
+use crate::block_manager::{block::BlockId, connector::RequestKey, pool::BlockPoolError};
 use crate::tokens::{SaltHash, TokenBlockSequence};
 
 #[derive(Debug, thiserror::Error)]

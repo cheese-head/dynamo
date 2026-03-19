@@ -6,11 +6,12 @@ use std::{sync::Arc, time::Instant};
 use dynamo_runtime::config::environment_names::kvbm::remote_storage as env_g4;
 use dynamo_runtime::utils::task::CriticalTaskExecutionHandle;
 use once_cell::sync::Lazy;
-use tokio::{runtime::Handle, sync::mpsc};
 use tokio::task::JoinSet;
+use tokio::{runtime::Handle, sync::mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+use crate::block_manager::KvBlockManager;
 use crate::block_manager::{
     BasicMetadata, BlockMetadata, BlockPool, NixlRegisterableStorage, Storage,
     block::{
@@ -24,12 +25,13 @@ use crate::block_manager::{
     pool::PinRegistry,
     transfer_orchestrator::{TransferPriority, priority_channel, run_priority_worker},
 };
-use crate::block_manager::KvBlockManager;
 
-use super::{DrainItem, LocalOffloadRequest, LocalOnboardRequest, LocalTransferRequest, RemoteTransferRequest};
+use super::{
+    DrainItem, LocalOffloadRequest, LocalOnboardRequest, LocalTransferRequest,
+    RemoteTransferRequest,
+};
 
-type VllmBlockManager =
-    KvBlockManager<Logical<DistributedLeaderWorkerResources>, BasicMetadata>;
+type VllmBlockManager = KvBlockManager<Logical<DistributedLeaderWorkerResources>, BasicMetadata>;
 
 const DEFAULT_DRAIN_QUEUE_CAP: usize = 512;
 const DEFAULT_MAX_REMOTE_INFLIGHT: usize = 64;
@@ -437,11 +439,12 @@ where
         blocks_to_register.push(mutable_block);
     }
 
-    let sequence_hashes = if transfer_pool == BlockTransferPool::Host && leader.remote_registry_enabled() {
-        Some(offload_req.sequence_hashes.clone())
-    } else {
-        None
-    };
+    let sequence_hashes =
+        if transfer_pool == BlockTransferPool::Host && leader.remote_registry_enabled() {
+            Some(offload_req.sequence_hashes.clone())
+        } else {
+            None
+        };
     let block_xfer_req = BlockTransferRequest {
         from_pool: BlockTransferPool::Device,
         to_pool: transfer_pool,
@@ -680,18 +683,19 @@ async fn process_remote_transfer_request(
     drop(_pipeline_span);
 
     let is_chained = !req.is_onboard;
-    let mut wire_req = crate::block_manager::distributed::RemoteTransferRequest::new_with_connector_req(
-        req.request_id.clone(),
-        req.operation_id,
-        &pipeline,
-        LeaderTransferRequest {
-            request_id: request_id.clone(),
-            uuid: *operation_id,
-            requirement: None,
-            request_type: RequestType::Immediate,
-            chained: is_chained,
-        },
-    );
+    let mut wire_req =
+        crate::block_manager::distributed::RemoteTransferRequest::new_with_connector_req(
+            req.request_id.clone(),
+            req.operation_id,
+            &pipeline,
+            LeaderTransferRequest {
+                request_id: request_id.clone(),
+                uuid: *operation_id,
+                requirement: None,
+                request_type: RequestType::Immediate,
+                chained: is_chained,
+            },
+        );
     wire_req.traceparent = req.traceparent.clone();
     let dispatch_span = tracing::info_span!(
         parent: &process_span,
@@ -760,7 +764,9 @@ async fn process_remote_transfer_request(
                 backend_label,
                 transfer_start.elapsed().as_secs_f64()
             );
-            Err(anyhow::anyhow!("Remote transfer completion notification failed"))
+            Err(anyhow::anyhow!(
+                "Remote transfer completion notification failed"
+            ))
         }
         Err(_) => {
             crate::record_remote_metrics!(
