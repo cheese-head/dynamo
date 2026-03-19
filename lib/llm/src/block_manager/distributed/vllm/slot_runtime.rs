@@ -11,20 +11,20 @@ use std::{
 
 use crate::{
     block_manager::{
+        BasicMetadata, DiskStorage, ImmutableBlock, KvBlockManager, PinnedStorage,
         block::{
-            data::logical::distributed_leader_worker::DistributedLeaderWorkerResources,
-            locality::Logical, transfer::remote::RemoteKey, BlockId,
+            BlockId, data::logical::distributed_leader_worker::DistributedLeaderWorkerResources,
+            locality::Logical, transfer::remote::RemoteKey,
         },
         connector::{
+            RequestKey,
             cache_stats::CacheStatsTracker,
             protocol::{RequestType, TransferType, WorkerTransferRequest},
             tier::{G4State, TierState},
-            RequestKey,
         },
         distributed::registry::{NoMetadata, PositionalKey},
-        distributed::{vllm as vllm_int, KvbmLeader, RemoteHashOperationsSync},
+        distributed::{KvbmLeader, RemoteHashOperationsSync, vllm as vllm_int},
         metrics_kvbm::KvbmMetrics,
-        BasicMetadata, DiskStorage, ImmutableBlock, KvBlockManager, PinnedStorage,
     },
     tokens::{SaltHash, TokenBlock, TokenBlockSequence, Tokens},
 };
@@ -33,10 +33,10 @@ use tokio::{runtime::Handle, sync::mpsc};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    compute_tp_consensus_hashes, flush_batch_size, g4_min_candidate_blocks, g4_transfer_timeout,
     AnyBlocks, AnyImmutableBlocks, ExternallyManagedDeviceSlot, LocalOffloadRequest,
     LocalOnboardRequest, LocalTransferEngine, LocalTransferRequest, OperationTracker,
     PendingG4Lookup, RemoteTransferRequest, Slot, SlotError, SlotManager, SlotState,
+    compute_tp_consensus_hashes, flush_batch_size, g4_min_candidate_blocks, g4_transfer_timeout,
 };
 
 type VllmBlockManager = KvBlockManager<Logical<DistributedLeaderWorkerResources>, BasicMetadata>;
@@ -386,7 +386,76 @@ pub struct VllmConnectorSlot {
     leader: Arc<KvbmLeader>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceBlockTableUpdateKind {
+    AppendSuffix,
+    NoChange,
+    Resync,
+}
+
+fn classify_device_block_table_update(
+    existing: &[BlockId],
+    incoming: &[BlockId],
+) -> DeviceBlockTableUpdateKind {
+    match incoming.len().cmp(&existing.len()) {
+        std::cmp::Ordering::Greater => {
+            if existing == &incoming[..existing.len()] {
+                DeviceBlockTableUpdateKind::AppendSuffix
+            } else {
+                DeviceBlockTableUpdateKind::Resync
+            }
+        }
+        std::cmp::Ordering::Equal => {
+            if existing == incoming {
+                DeviceBlockTableUpdateKind::NoChange
+            } else {
+                DeviceBlockTableUpdateKind::Resync
+            }
+        }
+        std::cmp::Ordering::Less => DeviceBlockTableUpdateKind::Resync,
+    }
+}
+
 impl VllmConnectorSlot {
+    /// Reconcile local slot state to an authoritative full block table from vLLM.
+    ///
+    /// This is used when incoming block IDs are not prefix-compatible with our cached table.
+    /// In that situation incremental append is unsafe, so we resync local tracking and force
+    /// conservative scheduler accounting on the next tick.
+    fn resync_device_blocks_from_vllm(&mut self, block_ids: &[BlockId], reason: &str) {
+        let old_len = self.device_blocks.len();
+        let new_len = block_ids.len();
+
+        tracing::warn!(
+            request_id = %self.request_id,
+            reason,
+            old_len,
+            new_len,
+            old_head = ?self.device_blocks.iter().take(8).copied().collect::<Vec<_>>(),
+            new_head = ?block_ids.iter().take(8).copied().collect::<Vec<_>>(),
+            "resyncing slot device block table from vLLM snapshot"
+        );
+
+        if self.operation_tracker.has_any() {
+            tracing::warn!(
+                request_id = %self.request_id,
+                pending_ops = self.operation_tracker.pending_count(),
+                dispatched_ops = self.operation_tracker.dispatched_count(),
+                "clearing pending/in-flight operations due to block-table resync"
+            );
+            self.operation_tracker.clear_all();
+        }
+
+        self.device_blocks.clear();
+        self.device_blocks.extend_from_slice(block_ids);
+
+        // Existing offload/onboard progression no longer maps to the new table layout.
+        self.current_position = 0;
+        self.evaluated_blocks = 0;
+        self.offload_terminated_at_block = None;
+        self.recovered_from_failed_transfer = true;
+    }
+
     fn new(
         request_id: String,
         tokens: Tokens,
@@ -1603,33 +1672,32 @@ impl ExternallyManagedDeviceSlot for VllmConnectorSlot {
     #[tracing::instrument(level = "debug", skip_all, fields(request_id = self.request_id))]
     fn append_mutable_device_blocks(&mut self, block_ids: &[BlockId]) -> Result<(), SlotError> {
         let existing = self.device_blocks.len();
-
-        if block_ids.len() > existing {
-            // Only append the truly new blocks (the suffix beyond what we already have).
-            debug_assert_eq!(
-                &self.device_blocks[..],
-                &block_ids[..existing],
-                "existing device blocks don't match prefix of incoming block table"
-            );
-            let new_blocks = &block_ids[existing..];
-            self.device_blocks.extend(new_blocks);
-            tracing::debug!(
-                "appended {} new device blocks (skipped {} existing); total device blocks: {}",
-                new_blocks.len(),
-                existing,
-                self.num_device_blocks_allocated()
-            );
-        } else if block_ids.len() == existing {
-            tracing::debug!(
-                "no new device blocks to append; total device blocks: {}",
-                self.num_device_blocks_allocated()
-            );
-        } else {
-            tracing::warn!(
-                "received fewer blocks ({}) than already tracked ({}); ignoring",
-                block_ids.len(),
-                existing
-            );
+        match classify_device_block_table_update(self.device_blocks.as_slice(), block_ids) {
+            DeviceBlockTableUpdateKind::AppendSuffix => {
+                // Append the truly new blocks (the suffix beyond what we already have).
+                let new_blocks = &block_ids[existing..];
+                self.device_blocks.extend(new_blocks);
+                tracing::debug!(
+                    "appended {} new device blocks (skipped {} existing); total device blocks: {}",
+                    new_blocks.len(),
+                    existing,
+                    self.num_device_blocks_allocated()
+                );
+            }
+            DeviceBlockTableUpdateKind::NoChange => {
+                tracing::debug!(
+                    "no new device blocks to append; total device blocks: {}",
+                    self.num_device_blocks_allocated()
+                );
+            }
+            DeviceBlockTableUpdateKind::Resync => {
+                let reason = match block_ids.len().cmp(&existing) {
+                    std::cmp::Ordering::Greater => "prefix_mismatch_growing_table",
+                    std::cmp::Ordering::Equal => "mismatch_same_length_table",
+                    std::cmp::Ordering::Less => "incoming_table_shrank",
+                };
+                self.resync_device_blocks_from_vllm(block_ids, reason);
+            }
         }
 
         Ok(())
@@ -2211,5 +2279,45 @@ mod tests {
 
         // This matches the logic in process_remote_transfer_request:
         // if can_offload_hashes.is_empty() { return Ok(()); }
+    }
+
+    #[test]
+    fn test_classify_device_block_table_update_append_suffix() {
+        let existing = vec![100, 101, 102];
+        let incoming = vec![100, 101, 102, 103, 104];
+        assert_eq!(
+            classify_device_block_table_update(&existing, &incoming),
+            DeviceBlockTableUpdateKind::AppendSuffix
+        );
+    }
+
+    #[test]
+    fn test_classify_device_block_table_update_no_change() {
+        let existing = vec![10, 11, 12];
+        let incoming = vec![10, 11, 12];
+        assert_eq!(
+            classify_device_block_table_update(&existing, &incoming),
+            DeviceBlockTableUpdateKind::NoChange
+        );
+    }
+
+    #[test]
+    fn test_classify_device_block_table_update_resync_reorder() {
+        let existing = vec![364, 365, 366, 927];
+        let incoming = vec![8, 5, 7, 9];
+        assert_eq!(
+            classify_device_block_table_update(&existing, &incoming),
+            DeviceBlockTableUpdateKind::Resync
+        );
+    }
+
+    #[test]
+    fn test_classify_device_block_table_update_resync_shrink() {
+        let existing = vec![1, 2, 3, 4, 5];
+        let incoming = vec![1, 2, 3];
+        assert_eq!(
+            classify_device_block_table_update(&existing, &incoming),
+            DeviceBlockTableUpdateKind::Resync
+        );
     }
 }

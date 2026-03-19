@@ -1,0 +1,138 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Registry (build + run inside container) + Dynamo KVBM with shared disk storage.
+# This variant is intended for a host-mounted shared filesystem such as Pure/NFS/GPFS.
+#
+# Usage:
+#   docker compose \
+#     --env-file examples/kvbm/distributed/.env-distributed-disk \
+#     -f examples/kvbm/distributed/docker-compose.disk.yml \
+#     up -d
+#
+# Optional toggles:
+#   ENABLE_PREFIX_CACHING     - "true" or "false" (default: false)
+#   GPU_MEMORY_UTILIZATION    - vLLM GPU memory fraction (default: 0.9)
+#   VLLM_EXTRA_ARGS           - extra args passed to dynamo.vllm
+#   DYN_LOG                   - debug, info, warn, error (default: debug)
+#   DYN_KVBM_CPU_CACHE_GB     - pinned CPU cache size in GB (default: 500)
+#   DYN_KVBM_DISK_CACHE_GB    - local disk tier cache size in GB (optional)
+#   TP_SIZE                   - tensor parallel size / GPU count (default: 8)
+#   KVBM_REMOTE_DISK_CONTAINER_PATH - mount point inside container (default: /mnt/pure)
+#
+# Notes:
+# - Shared remote disk path uses {worker_id} so each TP rank gets its own directory.
+# - GDS is disabled by default for shared filesystems. Enable only if your filesystem supports it.
+
+networks:
+  kvbm:
+    driver: bridge
+
+services:
+  nats-server:
+    image: nats:2.11.4
+    command: ["-c", "/etc/nats/nats-server.conf"]
+    volumes:
+      - ./nats-server.conf:/etc/nats/nats-server.conf:ro
+    networks:
+      - kvbm
+
+  etcd-server:
+    image: bitnamilegacy/etcd:3.6.1
+    environment:
+      ALLOW_NONE_AUTHENTICATION: yes
+    networks:
+      - kvbm
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health", "--endpoints=http://127.0.0.1:2379"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  registry:
+    image: ${DYNAMO_IMAGE:-gtc-demo-vllm-local-dev:latest}
+    volumes:
+      - ../../..:/workspace
+    working_dir: /workspace
+    command:
+      - bash
+      - -c
+      - |
+        cd /workspace/examples/kvbm/distributed/sample-registry && \
+        cargo build --release && \
+        exec /workspace/target/release/registry
+    environment:
+      DYN_REGISTRY_HUB_QUERY_ADDR: tcp://0.0.0.0:5555
+      DYN_REGISTRY_HUB_REGISTER_ADDR: tcp://0.0.0.0:5556
+      DYN_REGISTRY_HUB_CAPACITY: "1000000"
+      RUST_LOG: "${REGISTRY_LOG:-dynamo_llm::block_manager::distributed::registry=debug,registry=debug}"
+    ports:
+      - "5555:5555"
+      - "5556:5556"
+    networks:
+      - kvbm
+
+  dynamo-kvbm:
+    image: ${DYNAMO_IMAGE:-gtc-demo-vllm-local-dev:latest}
+    user: "0"
+    volumes:
+      - ../../..:/workspace
+      - ./hf_cache:/opt/models
+      - /dev/hugepages:/dev/hugepages
+      - /dev/infiniband:/dev/infiniband
+      - ./cufile.json:/etc/cufile.json:ro
+      - ${KVBM_REMOTE_DISK_HOST_PATH:-/gpfs/gpfs0}:${KVBM_REMOTE_DISK_CONTAINER_PATH:-/mnt/pure}
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    working_dir: /workspace/examples/backends/vllm
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${TP_SIZE:-8}
+              capabilities: [gpu]
+    environment:
+      DYN_LOG: ${DYN_LOG:-debug}
+      MODEL: ${MODEL:-openai/gpt-oss-120b}
+      ENABLE_PREFIX_CACHING: ${ENABLE_PREFIX_CACHING:-false}
+      GPU_MEMORY_UTILIZATION: ${GPU_MEMORY_UTILIZATION:-0.9}
+      TP_SIZE: ${TP_SIZE:-8}
+      VLLM_EXTRA_ARGS: ${VLLM_EXTRA_ARGS:-}
+      HF_HOME: /opt/models
+      HF_TOKEN: ${HF_TOKEN:-}
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+      DYN_STORE_KV: etcd
+      DYN_REQUEST_PLANE: tcp
+      ETCD_ENDPOINTS: http://etcd-server:2379
+      NATS_SERVER: nats://nats-server:4222
+      DYN_REGISTRY_ENABLE: "1"
+      DYN_REGISTRY_CLIENT_QUERY_ADDR: tcp://registry:5555
+      DYN_REGISTRY_CLIENT_REGISTER_ADDR: tcp://registry:5556
+      KVBM_DEV_MODE: ${KVBM_DEV_MODE:-}
+      KVBM_MANAGEMENT_PORT: ${KVBM_MANAGEMENT_PORT:-6881}
+      DYN_KVBM_CPU_CACHE_GB: ${DYN_KVBM_CPU_CACHE_GB:-500}
+      DYN_KVBM_DISK_CACHE_GB: ${DYN_KVBM_DISK_CACHE_GB:-}
+      DYN_KVBM_REMOTE_STORAGE_TYPE: disk
+      DYN_KVBM_REMOTE_DISK_PATH: ${KVBM_REMOTE_DISK_CONTAINER_PATH:-/mnt/pure}/kvbm-{worker_id}
+      DYN_KVBM_REMOTE_DISK_USE_GDS: ${DYN_KVBM_REMOTE_DISK_USE_GDS:-0}
+      DYN_KVBM_DISK_ZEROFILL_FALLBACK: ${DYN_KVBM_DISK_ZEROFILL_FALLBACK:-true}
+      DYN_KVBM_DISK_DISABLE_O_DIRECT: ${DYN_KVBM_DISK_DISABLE_O_DIRECT:-true}
+    depends_on:
+      nats-server:
+        condition: service_started
+      etcd-server:
+        condition: service_healthy
+      registry:
+        condition: service_started
+    networks:
+      - kvbm
+    ports:
+      - "8000:8000"
+      - "6881:6881"
+    command:
+      - bash
+      - /workspace/examples/kvbm/distributed/run-dynamo-kvbm.sh
