@@ -10,13 +10,13 @@ use crate::block_manager::vllm::connector::leader::slot::{
 use crate::block_manager::{distributed::KvbmLeader as PyKvbmLeader, vllm::KvbmRequest};
 use crate::get_current_tokio_handle;
 use anyhow;
-use dynamo_llm::block_manager::connector::protocol::RequestType;
+use dynamo_llm::block_manager::connector::protocol::{RequestType, SlotKey};
 use dynamo_llm::block_manager::distributed::vllm::{
     kvbm_metrics_endpoint_enabled, parse_kvbm_metrics_port,
 };
 use dynamo_llm::block_manager::kv_consolidator::EventSource;
 use dynamo_llm::block_manager::metrics_kvbm::{KvbmMetrics, KvbmMetricsRegistry};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use tokio::runtime::Handle;
 
@@ -50,18 +50,20 @@ pub trait Leader: Send + Sync + std::fmt::Debug {
 
     fn create_slot(&mut self, request: KvbmRequest, tokens: Vec<u32>) -> anyhow::Result<()>;
 
-    fn slot_manager(&self) -> &ConnectorSlotManager<String>;
+    fn slot_manager(&self) -> &ConnectorSlotManager<SlotKey>;
 }
 
 #[derive(Debug)]
 pub struct KvConnectorLeader {
-    slot_manager: Arc<OnceLock<ConnectorSlotManager<String>>>,
+    slot_manager: Arc<OnceLock<ConnectorSlotManager<SlotKey>>>,
     block_size: usize,
     inflight_requests: HashSet<String>,
     onboarding_slots: HashSet<String>,
     iteration_counter: u64,
     inflight_request_to_num_external_tokens: HashMap<String, usize>,
     kvbm_metrics: KvbmMetrics,
+    request_generations: HashMap<String, u64>,
+    active_slot_keys: HashMap<String, SlotKey>,
 }
 
 impl KvConnectorLeader {
@@ -159,13 +161,38 @@ impl KvConnectorLeader {
             iteration_counter: 0,
             inflight_request_to_num_external_tokens: HashMap::new(),
             kvbm_metrics,
+            request_generations: HashMap::new(),
+            active_slot_keys: HashMap::new(),
         }
+    }
+
+    fn active_slot_key(&self, request_id: &str) -> Option<SlotKey> {
+        self.active_slot_keys.get(request_id).cloned()
+    }
+
+    fn allocate_slot_key(&mut self, request_id: &str) -> SlotKey {
+        if let Some(key) = self.active_slot_keys.get(request_id) {
+            return key.clone();
+        }
+
+        let generation = self
+            .request_generations
+            .get(request_id)
+            .map(|generation| generation.saturating_add(1))
+            .unwrap_or(0);
+        self.request_generations
+            .insert(request_id.to_string(), generation);
+
+        let key = SlotKey::new(request_id.to_string(), generation);
+        self.active_slot_keys
+            .insert(request_id.to_string(), key.clone());
+        key
     }
 }
 
 impl Leader for KvConnectorLeader {
     #[inline]
-    fn slot_manager(&self) -> &ConnectorSlotManager<String> {
+    fn slot_manager(&self) -> &ConnectorSlotManager<SlotKey> {
         self.slot_manager
             .get()
             .expect("slot_manager not initialized")
@@ -194,7 +221,10 @@ impl Leader for KvConnectorLeader {
             return Ok((0, false));
         }
 
-        let shared_slot = self.slot_manager().get_slot(&request_id)?;
+        let key = self
+            .active_slot_key(&request_id)
+            .ok_or_else(|| anyhow::anyhow!("missing active SlotKey for request {}", request_id))?;
+        let shared_slot = self.slot_manager().get_slot(&key)?;
         let mut slot = shared_slot
             .lock()
             .map_err(|e| anyhow::anyhow!("Failed to lock slot: {}", e))?;
@@ -252,7 +282,10 @@ impl Leader for KvConnectorLeader {
             context_current_position
         );
 
-        let shared_slot = self.slot_manager().get_slot(&request_id)?;
+        let key = self
+            .active_slot_key(&request_id)
+            .ok_or_else(|| anyhow::anyhow!("missing active SlotKey for request {}", request_id))?;
+        let shared_slot = self.slot_manager().get_slot(&key)?;
         let mut slot = shared_slot
             .lock()
             .map_err(|e| anyhow::anyhow!("Failed to lock slot: {}", e))?;
@@ -319,7 +352,13 @@ impl Leader for KvConnectorLeader {
         // (e.g., tracking count when onboard_blocks is called, or deriving from architecture
         // config) might be more robust against potential timing-related issues.
         for request_id in onboarding_slots.iter() {
-            let shared_slot = self.slot_manager().get_slot(request_id)?;
+            let key = self.active_slot_key(request_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "missing active SlotKey for onboarding request {}",
+                    request_id
+                )
+            })?;
+            let shared_slot = self.slot_manager().get_slot(&key)?;
             let mut slot = shared_slot
                 .lock()
                 .map_err(|e| anyhow::anyhow!("Failed to lock slot: {}", e))?;
@@ -334,10 +373,10 @@ impl Leader for KvConnectorLeader {
                     .count() as u64;
 
                 // Create slot with expected immediate ops BEFORE adding operations
-                md.create_slot(request_id.clone(), num_immediate);
-                md.add_operations(pending_ops);
+                md.create_slot_with_key(key.clone(), num_immediate);
+                md.add_operations_for_key(&key, pending_ops);
             } else {
-                md.create_slot(request_id.clone(), 0);
+                md.create_slot_with_key(key, 0);
             }
         }
 
@@ -345,7 +384,7 @@ impl Leader for KvConnectorLeader {
         for new_req in &scheduler_output.new_requests {
             let request_id = &new_req.request_id;
 
-            let already_created = md.new_slots.iter().any(|s| &s.request_id == request_id);
+            let already_created = md.new_slots.iter().any(|s| s.key.request_id == *request_id);
 
             // Skip if this slot was already created in the onboarding_slots loop above.
             // This prevents overwriting the slot with expected_immediate_ops=0 when it should have the correct count.
@@ -362,7 +401,13 @@ impl Leader for KvConnectorLeader {
                 "request_id {request_id} not found in inflight_requests: "
             );
 
-            let shared_slot = self.slot_manager().get_slot(request_id)?;
+            let key = self.active_slot_key(&new_req.request_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "missing active SlotKey for new request {}",
+                    new_req.request_id
+                )
+            })?;
+            let shared_slot = self.slot_manager().get_slot(&key)?;
             let mut slot = shared_slot
                 .lock()
                 .map_err(|e| anyhow::anyhow!("Failed to lock slot: {}", e))?;
@@ -401,7 +446,7 @@ impl Leader for KvConnectorLeader {
                     .count() as u64;
 
                 // Create slot with expected immediate ops BEFORE adding operations
-                md.create_slot(new_req.request_id.clone(), num_immediate);
+                md.create_slot_with_key(key.clone(), num_immediate);
 
                 tracing::debug!(
                     "adding {} pending operations for slot {} ({} immediate)",
@@ -409,9 +454,9 @@ impl Leader for KvConnectorLeader {
                     new_req.request_id,
                     num_immediate
                 );
-                md.add_operations(pending_ops);
+                md.add_operations_for_key(&key, pending_ops);
             } else {
-                md.create_slot(new_req.request_id.clone(), 0);
+                md.create_slot_with_key(key, 0);
             }
         }
 
@@ -424,7 +469,10 @@ impl Leader for KvConnectorLeader {
                 "request_id {request_id} not found in inflight_requests: "
             );
 
-            let shared_slot = self.slot_manager().get_slot(request_id)?;
+            let key = self.active_slot_key(request_id).ok_or_else(|| {
+                anyhow::anyhow!("missing active SlotKey for cached request {}", request_id)
+            })?;
+            let shared_slot = self.slot_manager().get_slot(&key)?;
             let mut slot = shared_slot
                 .lock()
                 .map_err(|e| anyhow::anyhow!("Failed to lock slot: {}", e))?;
@@ -448,7 +496,10 @@ impl Leader for KvConnectorLeader {
                     pending_ops.len(),
                     request_id
                 );
-                md.add_operations(pending_ops);
+                let key = self.active_slot_key(request_id).ok_or_else(|| {
+                    anyhow::anyhow!("missing active SlotKey for cached request {}", request_id)
+                })?;
+                md.add_operations_for_key(&key, pending_ops);
             }
         }
 
@@ -464,7 +515,10 @@ impl Leader for KvConnectorLeader {
     ) -> anyhow::Result<bool> {
         tracing::debug!("Request finished: {request_id}; block_ids: {block_ids:?}");
         // grab the slot
-        let shared_slot = self.slot_manager().get_slot(&request_id)?;
+        let key = self
+            .active_slot_key(&request_id)
+            .ok_or_else(|| anyhow::anyhow!("missing active SlotKey for request {}", request_id))?;
+        let shared_slot = self.slot_manager().get_slot(&key)?;
 
         // mark the slot as finished
         let mut slot = shared_slot
@@ -478,9 +532,10 @@ impl Leader for KvConnectorLeader {
         // then we can remove the slot and trigger the worker to clean up as well.
 
         // remove it from the manager as we will never use it again
-        self.slot_manager().remove_slot(&request_id)?;
+        self.slot_manager().remove_slot(&key)?;
         self.inflight_request_to_num_external_tokens
             .remove(&request_id);
+        self.active_slot_keys.remove(&request_id);
 
         // if the slot has finished, we can return false to trtllm, indicating all gpu blocks are free to be reused
         // otherwise, we return true, which means there are still outstanding operations on gpu blocks which
@@ -495,15 +550,16 @@ impl Leader for KvConnectorLeader {
     }
 
     fn has_slot(&self, request_id: String) -> bool {
-        self.slot_manager().has_slot(&request_id)
+        self.active_slot_key(&request_id)
+            .is_some_and(|key| self.slot_manager().has_slot(&key))
     }
 
     /// Create a new slot for the given request ID.
     /// This is used to create a new slot for the request.
     fn create_slot(&mut self, request: KvbmRequest, tokens: Vec<u32>) -> anyhow::Result<()> {
+        let key = self.allocate_slot_key(&request.request_id);
         self.slot_manager()
-            .create_slot(&request.request_id, tokens, request.salt_hash)?;
-
+            .create_slot(&key, tokens, request.salt_hash)?;
         self.inflight_requests.insert(request.request_id);
 
         Ok(())

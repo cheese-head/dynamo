@@ -1,0 +1,6 @@
+request_id: fixture-basic
+generation: 0
+tp_bindings: 2
+immediate_ops: 3
+block_count: 4
+block_size: 16

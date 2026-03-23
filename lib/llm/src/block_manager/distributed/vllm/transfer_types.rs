@@ -4,6 +4,7 @@
 use crate::block_manager::{
     BlockMetadata, DiskStorage, ImmutableBlock, PinnedStorage, Storage,
     block::{BlockId, locality::LocalityProvider},
+    connector::protocol::SlotKey,
     distributed::BlockTransferPool,
     pool::PinGuard,
 };
@@ -73,6 +74,7 @@ pub enum LocalTransferRequest {
 }
 
 pub struct LocalOffloadRequest {
+    pub key: SlotKey,
     pub request_id: String,
     pub block_ids: Vec<BlockId>,
     pub token_blocks: Vec<TokenBlock>,
@@ -85,7 +87,7 @@ pub struct LocalOffloadRequest {
 
 impl LocalOffloadRequest {
     pub fn new(
-        request_id: String,
+        key: SlotKey,
         block_ids: Vec<BlockId>,
         token_blocks: Vec<TokenBlock>,
         priorities: Vec<u32>,
@@ -97,7 +99,8 @@ impl LocalOffloadRequest {
         debug_assert!(block_ids.len() == priorities.len());
         let sequence_hashes = token_blocks.iter().map(|tb| tb.sequence_hash()).collect();
         Self {
-            request_id,
+            request_id: key.request_id.clone(),
+            key,
             block_ids,
             token_blocks,
             priorities,
@@ -110,6 +113,7 @@ impl LocalOffloadRequest {
 }
 
 pub struct LocalOnboardRequest {
+    pub key: SlotKey,
     pub request_id: String,
     pub src_blocks: Box<dyn AnyBlocks>,
     pub dst_block_ids: Vec<BlockId>,
@@ -118,14 +122,15 @@ pub struct LocalOnboardRequest {
 
 impl LocalOnboardRequest {
     pub fn new(
-        request_id: String,
+        key: SlotKey,
         src_blocks: Box<dyn AnyBlocks>,
         dst_block_ids: Vec<BlockId>,
         operation_id: uuid::Uuid,
     ) -> Self {
         debug_assert!(src_blocks.len() == dst_block_ids.len());
         Self {
-            request_id,
+            request_id: key.request_id.clone(),
+            key,
             src_blocks,
             dst_block_ids,
             operation_id,
@@ -134,6 +139,7 @@ impl LocalOnboardRequest {
 }
 
 pub struct RemoteTransferRequest {
+    pub key: SlotKey,
     pub request_id: String,
     pub sequence_hashes: Vec<u64>,
     pub device_block_ids: Vec<BlockId>,
@@ -153,6 +159,7 @@ impl RemoteTransferRequest {
         traceparent: Option<String>,
     ) -> Self {
         Self {
+            key: params.key.clone(),
             request_id: params.request_id.clone(),
             sequence_hashes: params.sequence_hashes.clone(),
             device_block_ids: params.device_block_ids.clone(),
@@ -167,7 +174,7 @@ impl RemoteTransferRequest {
     }
 
     pub fn new_h2o(
-        request_id: String,
+        key: SlotKey,
         sequence_hashes: Vec<u64>,
         host_block_ids: Vec<BlockId>,
         operation_id: uuid::Uuid,
@@ -177,7 +184,8 @@ impl RemoteTransferRequest {
     ) -> Self {
         debug_assert!(sequence_hashes.len() == host_block_ids.len());
         Self {
-            request_id,
+            request_id: key.request_id.clone(),
+            key,
             sequence_hashes,
             device_block_ids: vec![],
             host_block_ids: Some(host_block_ids),
@@ -198,6 +206,7 @@ impl RemoteTransferRequest {
 /// Item pushed to the drain queue after D2H completes.
 /// Holds Arc references to host blocks, preventing eviction until H2R finishes.
 pub struct DrainItem {
+    pub key: SlotKey,
     pub request_id: String,
     pub sequence_hashes: Vec<u64>,
     pub host_block_ids: Vec<BlockId>,

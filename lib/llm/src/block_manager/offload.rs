@@ -42,7 +42,7 @@ use super::storage::{Cuda, Storage};
 use super::{DeviceStorage, DiskStorage, KvManagerModelConfig, PinnedStorage};
 use nixl_sys::Agent as NixlAgent;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicU64, Ordering},
 };
 use tokio::runtime::Handle;
@@ -55,7 +55,8 @@ use tokio_util::sync::CancellationToken;
 use anyhow::Result;
 use std::any::Any;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::time::Duration;
 
 pub mod filter;
 mod pending;
@@ -84,6 +85,28 @@ pub struct OffloadManagerConfig {
     pub bypass_cpu_mem: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SequenceGateState {
+    Pending,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug)]
+struct OffloadCohortProgress {
+    expected: usize,
+    attempted: usize,
+    admitted: usize,
+    sequence_hashes: Vec<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CohortTrackingMode {
+    None,
+    FinalizeDeviceAdmissions,
+    GateHostOffload,
+}
+
 /// The offload manager handles all block transfers between different cache levels.
 pub struct OffloadManager<Locality: LocalityProvider, Metadata: BlockMetadata> {
     // Handles to the device, host, and disk pools.
@@ -107,6 +130,8 @@ pub struct OffloadManager<Locality: LocalityProvider, Metadata: BlockMetadata> {
 
     /// An incrementing counter for offloaded blocks. Within the same priority, blocks with lower tick values are processed first.
     tick: Arc<AtomicU64>,
+    cohort_states: Arc<Mutex<HashMap<u64, OffloadCohortProgress>>>,
+    sequence_gate_states: Arc<Mutex<HashMap<u64, SequenceGateState>>>,
 
     /// If true, offload directly from device (G1) to disk (G3), bypassing host (G2)
     bypass_cpu_mem: bool,
@@ -140,6 +165,8 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
             host_onboard_tx,
             disk_onboard_tx,
             tick: Arc::new(AtomicU64::new(0)),
+            cohort_states: Arc::new(Mutex::new(HashMap::new())),
+            sequence_gate_states: Arc::new(Mutex::new(HashMap::new())),
             bypass_cpu_mem: config.bypass_cpu_mem,
         });
 
@@ -192,6 +219,9 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
                 .kvbm_metrics
                 .as_ref()
                 .map(|m| m.offload_blocks_d2h.clone()),
+            this.cohort_states.clone(),
+            this.sequence_gate_states.clone(),
+            false,
             config.cancellation_token.clone(),
         );
         CriticalTaskExecutionHandle::new_with_runtime(
@@ -217,7 +247,7 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
             })?,
         );
 
-        // Host -> Disk offload
+        // Host -> Disk offload (gate enabled: blocks from failed D2H cohorts are dropped)
         let host_to_disk_task = OffloadManager::offload_worker(
             this.host.clone(),
             this.disk.clone(),
@@ -238,6 +268,9 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
                 .kvbm_metrics
                 .as_ref()
                 .map(|m| m.offload_blocks_h2d.clone()),
+            this.cohort_states.clone(),
+            this.sequence_gate_states.clone(),
+            true,
             config.cancellation_token.clone(),
         );
         CriticalTaskExecutionHandle::new_with_runtime(
@@ -326,6 +359,9 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
                     .kvbm_metrics
                     .as_ref()
                     .map(|m| m.offload_blocks_d2d.clone()),
+                this.cohort_states.clone(),
+                this.sequence_gate_states.clone(),
+                false,
                 config.cancellation_token.clone(),
             );
             CriticalTaskExecutionHandle::new_with_runtime(
@@ -340,6 +376,7 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
         Ok(this)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn offload_worker<Source: Storage, Target: Storage>(
         source_pool: Option<Arc<dyn BlockPool<Source, Locality, Metadata>>>,
         target_pool: Option<Arc<dyn BlockPool<Target, Locality, Metadata>>>,
@@ -347,6 +384,9 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
         transfer_manager: Arc<dyn TransferManager<Source, Target, Locality, Metadata>>,
         offload_filter: Option<Arc<dyn OffloadFilter>>,
         offload_metric: Option<prometheus::IntCounter>,
+        cohort_states: Arc<Mutex<HashMap<u64, OffloadCohortProgress>>>,
+        sequence_gate_states: Arc<Mutex<HashMap<u64, SequenceGateState>>>,
+        check_sequence_gate: bool,
         cancellation_token: CancellationToken,
     ) -> Result<()> {
         if source_pool.is_none() || target_pool.is_none() {
@@ -378,6 +418,33 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
 
             // If there is a request, process it.
             if let Some(request) = queue.pop_first() {
+                // Gate: only the H2D worker checks sequence_gate_states.
+                // H2D requests arrive with sequence hashes that were set to Pending/Ready/Failed
+                // by the D2H worker. Non-cohort blocks (no gate entry) pass through freely.
+                if check_sequence_gate {
+                    let gate_state = {
+                        let gates = sequence_gate_states.lock().unwrap();
+                        gates.get(&request.sequence_hash).copied()
+                    };
+                    match gate_state {
+                        Some(SequenceGateState::Pending) => {
+                            queue.insert(request);
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                            continue;
+                        }
+                        Some(SequenceGateState::Failed) => {
+                            tracing::debug!(
+                                sequence_hash = request.sequence_hash,
+                                "Dropping offload request: D2H cohort failed for this block"
+                            );
+                            continue;
+                        }
+                        Some(SequenceGateState::Ready) | None => {
+                            // Proceed normally
+                        }
+                    }
+                }
+
                 // Try to upgrade the block to a strong reference.
                 let block = match request.block.upgrade() {
                     Some(block) => Some(ImmutableBlock::new(block)),
@@ -396,12 +463,24 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
                         .await
                         && !blocks.is_empty()
                     {
+                        Self::record_cohort_attempt(
+                            request.cohort_id,
+                            true,
+                            &cohort_states,
+                            &sequence_gate_states,
+                        );
                         continue;
                     }
 
                     if let Some(offload_filter) = offload_filter.as_ref()
                         && !offload_filter.should_offload(request.sequence_hash)
                     {
+                        Self::record_cohort_attempt(
+                            request.cohort_id,
+                            false,
+                            &cohort_states,
+                            &sequence_gate_states,
+                        );
                         continue;
                     }
 
@@ -429,6 +508,13 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
                             metric.inc();
                         }
 
+                        Self::record_cohort_attempt(
+                            request.cohort_id,
+                            true,
+                            &cohort_states,
+                            &sequence_gate_states,
+                        );
+
                         transfer_manager
                             .enqueue_transfer(PendingTransfer::new(
                                 vec![block],
@@ -437,7 +523,21 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
                                 target_pool.clone(),
                             ))
                             .await?;
+                    } else {
+                        Self::record_cohort_attempt(
+                            request.cohort_id,
+                            false,
+                            &cohort_states,
+                            &sequence_gate_states,
+                        );
                     }
+                } else {
+                    Self::record_cohort_attempt(
+                        request.cohort_id,
+                        false,
+                        &cohort_states,
+                        &sequence_gate_states,
+                    );
                 }
             } else {
                 // Await the next request.
@@ -447,6 +547,52 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
                         queue.insert(request);
                     }
                 }
+            }
+        }
+    }
+
+    fn record_cohort_attempt(
+        cohort_id: Option<u64>,
+        admitted: bool,
+        cohort_states: &Arc<Mutex<HashMap<u64, OffloadCohortProgress>>>,
+        sequence_gate_states: &Arc<Mutex<HashMap<u64, SequenceGateState>>>,
+    ) {
+        let Some(cohort_id) = cohort_id else {
+            return;
+        };
+
+        let mut states = cohort_states.lock().unwrap();
+        let Some(progress) = states.get_mut(&cohort_id) else {
+            return;
+        };
+
+        progress.attempted += 1;
+        if admitted {
+            progress.admitted += 1;
+        }
+
+        if progress.attempted == progress.expected {
+            let all_admitted = progress.admitted == progress.expected;
+            let gate = if all_admitted {
+                SequenceGateState::Ready
+            } else {
+                tracing::warn!(
+                    cohort_id,
+                    admitted = progress.admitted,
+                    expected = progress.expected,
+                    "D2H cohort partially failed; gating H2D for all sequence hashes in cohort"
+                );
+                SequenceGateState::Failed
+            };
+
+            let sequence_hashes = progress.sequence_hashes.clone();
+            // Remove the completed cohort entry
+            states.remove(&cohort_id);
+            drop(states);
+
+            let mut gates = sequence_gate_states.lock().unwrap();
+            for hash in &sequence_hashes {
+                gates.insert(*hash, gate);
             }
         }
     }
@@ -503,6 +649,15 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
         block: &ImmutableBlock<S, Locality, Metadata>,
         priority: u64,
     ) -> core::result::Result<(), BlockPoolError> {
+        self.offload_inner(block, priority, None).await
+    }
+
+    async fn offload_inner<S: Storage>(
+        &self,
+        block: &ImmutableBlock<S, Locality, Metadata>,
+        priority: u64,
+        cohort_id: Option<u64>,
+    ) -> core::result::Result<(), BlockPoolError> {
         match block.state() {
             BlockState::Registered(_, _) => {}
             _ => {
@@ -537,6 +692,7 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
                     block: Arc::downgrade(device_block.mutable_block()),
                     sequence_hash: device_block.sequence_hash(),
                     key,
+                    cohort_id,
                 };
 
                 tracing::debug!(
@@ -554,6 +710,7 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
                     block: Arc::downgrade(device_block.mutable_block()),
                     sequence_hash: device_block.sequence_hash(),
                     key,
+                    cohort_id,
                 };
 
                 self.device_offload_tx.send(request).unwrap();
@@ -570,9 +727,66 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
                 block: Arc::downgrade(host_block.mutable_block()),
                 sequence_hash: host_block.sequence_hash(),
                 key,
+                cohort_id,
             };
 
             self.host_offload_tx.send(request).unwrap();
+        }
+
+        Ok(())
+    }
+
+    pub async fn offload_blocks<S: Storage>(
+        &self,
+        blocks: &[ImmutableBlock<S, Locality, Metadata>],
+    ) -> core::result::Result<(), BlockPoolError> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+
+        // Only create cohort tracking for device blocks (D2H path).
+        // Host blocks (H2D path) should not be gated — they are the downstream
+        // consumer of the gate, not the producer.
+        let is_device_block = (blocks.first().unwrap() as &dyn Any)
+            .downcast_ref::<ImmutableBlock<DeviceStorage, Locality, Metadata>>()
+            .is_some();
+
+        let cohort_id = if is_device_block {
+            let id = self.tick.fetch_add(1, Ordering::Relaxed);
+            let sequence_hashes: Vec<u64> = blocks.iter().map(|b| b.sequence_hash()).collect();
+
+            {
+                let mut states = self.cohort_states.lock().unwrap();
+                states.insert(
+                    id,
+                    OffloadCohortProgress {
+                        expected: blocks.len(),
+                        attempted: 0,
+                        admitted: 0,
+                        sequence_hashes: sequence_hashes.clone(),
+                    },
+                );
+            }
+
+            {
+                let mut gates = self.sequence_gate_states.lock().unwrap();
+                for &hash in &sequence_hashes {
+                    gates.insert(hash, SequenceGateState::Pending);
+                }
+            }
+
+            Some(id)
+        } else {
+            None
+        };
+
+        for block in blocks {
+            let priority = block
+                .metadata()
+                .offload_priority()
+                .unwrap_or(0);
+            self.offload_inner(block, priority, cohort_id)
+                .await?;
         }
 
         Ok(())

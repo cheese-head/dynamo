@@ -182,7 +182,7 @@ impl LocalTransferEngine {
                         req = offload_rx.recv() => {
                             match req {
                                 Some(req) => {
-                                    let request_id = req.request_id.clone();
+                                    let key = req.key.clone();
                                     let operation_id = req.operation_id;
                                     let block_manager = block_manager_offload.clone();
                                     let leader = Arc::clone(&leader_offload);
@@ -205,7 +205,7 @@ impl LocalTransferEngine {
                                                 to_pool: BlockTransferPool::Host,
                                                 blocks: vec![],
                                                 connector_req: Some(LeaderTransferRequest {
-                                                    request_id: request_id.clone(),
+                                                    key: key.clone(),
                                                     uuid: operation_id,
                                                     requirement: None,
                                                     request_type: RequestType::Immediate,
@@ -285,7 +285,7 @@ impl LocalTransferEngine {
                     pin_registry_drain.insert(h2o_operation_id, item.pin_guard);
 
                     let h2o_req = RemoteTransferRequest::new_h2o(
-                        item.request_id,
+                        item.key,
                         item.sequence_hashes,
                         item.host_block_ids,
                         h2o_operation_id,
@@ -450,7 +450,7 @@ where
         to_pool: transfer_pool,
         blocks: block_pairs,
         connector_req: Some(LeaderTransferRequest {
-            request_id: offload_req.request_id.clone(),
+            key: offload_req.key.clone(),
             uuid: offload_req.operation_id,
             requirement: None,
             request_type: RequestType::Scheduled,
@@ -470,6 +470,7 @@ where
             let host_block_ids = immutable_blocks.iter().map(|b| b.block_id()).collect();
             let pin_guard = crate::block_manager::pool::PinGuard::new(immutable_blocks);
             let item = DrainItem {
+                key: offload_req.key.clone(),
                 request_id: offload_req.request_id.clone(),
                 sequence_hashes: offload_req.sequence_hashes.clone(),
                 host_block_ids,
@@ -518,7 +519,7 @@ async fn process_onboard_request(
         to_pool: BlockTransferPool::Device,
         blocks: block_pairs,
         connector_req: Some(LeaderTransferRequest {
-            request_id: onboard_req.request_id.clone(),
+            key: onboard_req.key.clone(),
             uuid: onboard_req.operation_id,
             requirement: None,
             request_type: RequestType::Immediate,
@@ -689,7 +690,7 @@ async fn process_remote_transfer_request(
             req.operation_id,
             &pipeline,
             LeaderTransferRequest {
-                request_id: request_id.clone(),
+                key: req.key.clone(),
                 uuid: *operation_id,
                 requirement: None,
                 request_type: RequestType::Immediate,
@@ -765,7 +766,11 @@ async fn process_remote_transfer_request(
                 transfer_start.elapsed().as_secs_f64()
             );
             Err(anyhow::anyhow!(
-                "Remote transfer completion notification failed"
+                "Remote transfer ({}) completion notification failed: request_id={}, num_blocks={}, backend={}",
+                if req.is_onboard { "onboard/read" } else { "offload/write" },
+                req.request_id,
+                num_blocks,
+                backend_label,
             ))
         }
         Err(_) => {
@@ -779,8 +784,12 @@ async fn process_remote_transfer_request(
                 transfer_start.elapsed().as_secs_f64()
             );
             Err(anyhow::anyhow!(
-                "Remote transfer timed out after {} seconds",
-                G4_TRANSFER_TIMEOUT.as_secs()
+                "Remote transfer ({}) timed out after {} seconds: request_id={}, num_blocks={}, backend={}",
+                if req.is_onboard { "onboard/read" } else { "offload/write" },
+                G4_TRANSFER_TIMEOUT.as_secs(),
+                req.request_id,
+                num_blocks,
+                backend_label,
             ))
         }
     };

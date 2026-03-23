@@ -553,15 +553,17 @@ pub struct RemoteDiskStorage {
 impl RemoteDiskStorage {
     /// Open (or create) a file at `path` for a single NIXL transfer.
     ///
-    /// * `create`     — `true` on offload (creates the file), `false` on onboard.
-    /// * `use_odirect` — when `true`, opens with `O_DIRECT` and pre-allocates space
-    ///   (required for GDS_MT). When `false`, skips both (POSIX write path: any
-    ///   filesystem, no pre-allocation; caller must `fdatasync` before GDS reads).
+    /// * `create`       — `true` on offload (creates the file), `false` on onboard.
+    /// * `use_odirect`  — when `true`, opens with `O_DIRECT` for direct I/O.
+    /// * `preallocate`  — when `true`, pre-allocates disk blocks via `fallocate`.
+    ///   Only needed for GDS_MT which DMAs directly to disk blocks. POSIX writes
+    ///   allocate blocks naturally on write; no pre-allocation required.
     pub fn open(
         path: &str,
         size: usize,
         create: bool,
         use_odirect: bool,
+        preallocate: bool,
     ) -> Result<Self, StorageError> {
         use nix::fcntl::{OFlag, open};
         use nix::sys::stat::Mode;
@@ -595,9 +597,7 @@ impl RemoteDiskStorage {
             ))
         })?;
 
-        // Pre-allocate only when using O_DIRECT (GDS requires real blocks).
-        // POSIX writes allocate blocks naturally; no pre-allocation needed.
-        if create && use_odirect {
+        if create && preallocate {
             allocate_file(raw_fd, size as u64).map_err(|e| {
                 unsafe { nix::libc::close(raw_fd) };
                 StorageError::AllocationFailed(format!("Failed to allocate file {}: {}", path, e))
@@ -605,12 +605,13 @@ impl RemoteDiskStorage {
         }
 
         tracing::debug!(
-            "RemoteDiskStorage opened: fd={}, file={}, size={} bytes, create={}, odirect={}",
+            "RemoteDiskStorage opened: fd={}, file={}, size={} bytes, create={}, odirect={}, preallocate={}",
             raw_fd,
             path,
             size,
             create,
-            use_odirect
+            use_odirect,
+            preallocate
         );
 
         Ok(Self {

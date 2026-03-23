@@ -7,7 +7,9 @@ use std::{
 };
 
 use crate::block_manager::{
-    block::BlockId, connector::protocol::WorkerTransferRequest, distributed::vllm::is_dev_mode,
+    block::BlockId,
+    connector::protocol::{SlotKey, WorkerTransferRequest},
+    distributed::vllm::is_dev_mode,
     metrics_kvbm::KvbmMetrics,
 };
 use serde::{Deserialize, Serialize};
@@ -42,7 +44,7 @@ pub struct CachedRequestData {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewSlotInfo {
-    pub request_id: String,
+    pub key: SlotKey,
     pub expected_immediate_ops: u64,
 }
 
@@ -62,9 +64,9 @@ impl ConnectorMetadata {
         }
     }
 
-    pub fn create_slot(&mut self, request_id: String, expected_immediate_ops: u64) {
+    pub fn create_slot_with_key(&mut self, key: SlotKey, expected_immediate_ops: u64) {
         self.new_slots.push(NewSlotInfo {
-            request_id,
+            key,
             expected_immediate_ops,
         });
     }
@@ -72,11 +74,22 @@ impl ConnectorMetadata {
     pub fn add_operations(&mut self, xfer_reqs: Vec<WorkerTransferRequest>) {
         self.operations.extend(xfer_reqs);
     }
+
+    pub fn add_operations_for_key(
+        &mut self,
+        key: &SlotKey,
+        mut xfer_reqs: Vec<WorkerTransferRequest>,
+    ) {
+        for req in &mut xfer_reqs {
+            req.key = key.clone();
+        }
+        self.operations.extend(xfer_reqs);
+    }
 }
 
 #[derive(Debug)]
 pub struct KvConnectorLeaderCore {
-    slot_manager: Arc<OnceLock<ConnectorSlotManager<String>>>,
+    slot_manager: Arc<OnceLock<ConnectorSlotManager<SlotKey>>>,
     block_size: usize,
     inflight_requests: HashSet<String>,
     onboarding_slots: HashSet<String>,
@@ -85,11 +98,13 @@ pub struct KvConnectorLeaderCore {
     kvbm_metrics: KvbmMetrics,
     /// Maps request_id -> W3C traceparent so all spans for one request share a single trace ID.
     request_traces: HashMap<String, String>,
+    request_generations: HashMap<String, u64>,
+    active_slot_keys: HashMap<String, SlotKey>,
 }
 
 impl KvConnectorLeaderCore {
     pub fn new(
-        slot_manager: Arc<OnceLock<ConnectorSlotManager<String>>>,
+        slot_manager: Arc<OnceLock<ConnectorSlotManager<SlotKey>>>,
         block_size: usize,
         kvbm_metrics: KvbmMetrics,
     ) -> Self {
@@ -102,11 +117,13 @@ impl KvConnectorLeaderCore {
             iteration_counter: 0,
             kvbm_metrics,
             request_traces: HashMap::new(),
+            request_generations: HashMap::new(),
+            active_slot_keys: HashMap::new(),
         }
     }
 
     #[inline]
-    pub fn slot_manager(&self) -> &ConnectorSlotManager<String> {
+    pub fn slot_manager(&self) -> &ConnectorSlotManager<SlotKey> {
         self.slot_manager
             .get()
             .expect("slot_manager not initialized")
@@ -121,6 +138,29 @@ impl KvConnectorLeaderCore {
     /// connector can provide a traceparent from the HTTP/OTEL context.
     pub fn set_request_traceparent(&mut self, request_id: String, traceparent: String) {
         self.request_traces.insert(request_id, traceparent);
+    }
+
+    fn active_slot_key(&self, request_id: &str) -> Option<SlotKey> {
+        self.active_slot_keys.get(request_id).cloned()
+    }
+
+    fn allocate_slot_key(&mut self, request_id: &str) -> SlotKey {
+        if let Some(key) = self.active_slot_keys.get(request_id) {
+            return key.clone();
+        }
+
+        let generation = self
+            .request_generations
+            .get(request_id)
+            .map(|generation| generation.saturating_add(1))
+            .unwrap_or(0);
+        self.request_generations
+            .insert(request_id.to_string(), generation);
+
+        let key = SlotKey::new(request_id.to_string(), generation);
+        self.active_slot_keys
+            .insert(request_id.to_string(), key.clone());
+        key
     }
 
     /// Enter a span linked to the request's trace. Returns the guard (drop to exit).
@@ -147,7 +187,10 @@ impl KvConnectorLeaderCore {
         _request_num_tokens: usize,
         num_computed_tokens: usize,
     ) -> anyhow::Result<(Option<usize>, bool)> {
-        crate::lock_slot!(self, &request_id => slot);
+        let key = self
+            .active_slot_key(&request_id)
+            .ok_or_else(|| anyhow::anyhow!("missing active SlotKey for request {}", request_id))?;
+        crate::lock_slot!(self, &key => slot);
         slot.set_request_traceparent(self.request_traceparent(&request_id).map(str::to_string));
         let _span = slot
             .as_any_mut()
@@ -245,7 +288,10 @@ impl KvConnectorLeaderCore {
         num_external_tokens: usize,
     ) -> anyhow::Result<()> {
         let _span = self.enter_request_span(&request_id, "kvbm.update_state_after_alloc");
-        crate::lock_slot!(self, &request_id => slot);
+        let key = self
+            .active_slot_key(&request_id)
+            .ok_or_else(|| anyhow::anyhow!("missing active SlotKey for request {}", request_id))?;
+        crate::lock_slot!(self, &key => slot);
         slot.set_request_traceparent(self.request_traceparent(&request_id).map(str::to_string));
         slot.append_mutable_device_blocks(&block_ids)?;
 
@@ -323,16 +369,18 @@ impl KvConnectorLeaderCore {
         if !self.finishing_requests.is_empty() {
             let to_clean: Vec<String> = self.finishing_requests.drain().collect();
             for request_id in &to_clean {
-                if self.slot_manager().has_slot(request_id) {
+                if let Some(key) = self.active_slot_key(request_id)
+                    && self.slot_manager().has_slot(&key)
+                {
                     {
-                        crate::lock_slot!(self, request_id => slot);
+                        crate::lock_slot!(self, &key => slot);
                         if let Some(vllm_slot) =
                             slot.as_any_mut().downcast_mut::<VllmConnectorSlot>()
                         {
                             let _ = vllm_slot.release_prefetched_host_blocks();
                         }
                     }
-                    let _ = self.slot_manager().remove_slot(request_id);
+                    let _ = self.slot_manager().remove_slot(&key);
                 }
             }
         }
@@ -355,14 +403,20 @@ impl KvConnectorLeaderCore {
 
         for request_id in &onboarding_slots {
             let _req_span = self.enter_request_span(request_id, "kvbm.flush_onboarding");
-            crate::lock_slot!(self, request_id => slot);
-            crate::flush_slot_to_metadata!(slot, md, request_id);
+            let key = self.active_slot_key(request_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "missing active SlotKey for onboarding request {}",
+                    request_id
+                )
+            })?;
+            crate::lock_slot!(self, &key => slot);
+            crate::flush_slot_to_metadata!(slot, md, key);
             assert!(inflight_requests.remove(request_id));
         }
 
         for new_req in &scheduler_output.new_requests {
             let request_id = &new_req.request_id;
-            let already_created = md.new_slots.iter().any(|s| &s.request_id == request_id);
+            let already_created = md.new_slots.iter().any(|s| s.key.request_id == *request_id);
             if already_created {
                 assert!(inflight_requests.remove(request_id));
                 continue;
@@ -370,7 +424,10 @@ impl KvConnectorLeaderCore {
 
             let _req_span = self.enter_request_span(request_id, "kvbm.schedule_new_request");
             assert!(inflight_requests.remove(request_id));
-            crate::lock_slot!(self, request_id => slot);
+            let key = self.active_slot_key(request_id).ok_or_else(|| {
+                anyhow::anyhow!("missing active SlotKey for new request {}", request_id)
+            })?;
+            crate::lock_slot!(self, &key => slot);
             slot.record_start_iteration(iteration)?;
 
             let scheduled_tokens = *scheduler_output
@@ -396,14 +453,17 @@ impl KvConnectorLeaderCore {
                 scheduled_tokens,
                 None,
             )?;
-            crate::flush_slot_to_metadata!(slot, md, new_req.request_id);
+            crate::flush_slot_to_metadata!(slot, md, key);
         }
 
         for cached_req in &scheduler_output.cached_requests {
             let request_id = &cached_req.request_id;
 
             if cached_req.resumed_from_preemption {
-                let shared_slot = self.slot_manager().get_slot(request_id)?;
+                let key = self.active_slot_key(request_id).ok_or_else(|| {
+                    anyhow::anyhow!("missing active SlotKey for cached request {}", request_id)
+                })?;
+                let shared_slot = self.slot_manager().get_slot(&key)?;
                 let mut slot = shared_slot
                     .lock()
                     .map_err(|e| anyhow::anyhow!("Failed to lock slot: {}", e))?;
@@ -411,7 +471,10 @@ impl KvConnectorLeaderCore {
             }
 
             assert!(inflight_requests.remove(request_id));
-            crate::lock_slot!(self, request_id => slot);
+            let key = self.active_slot_key(request_id).ok_or_else(|| {
+                anyhow::anyhow!("missing active SlotKey for cached request {}", request_id)
+            })?;
+            crate::lock_slot!(self, &key => slot);
 
             let scheduled_tokens = *scheduler_output
                 .num_scheduled_tokens
@@ -427,12 +490,18 @@ impl KvConnectorLeaderCore {
             )?;
 
             if let Some(pending_ops) = slot.take_pending_operations() {
-                md.add_operations(pending_ops);
+                md.add_operations_for_key(&key, pending_ops);
             }
         }
 
         for unscheduled_req in &inflight_requests {
-            crate::lock_slot!(self, unscheduled_req => slot_guard);
+            let key = self.active_slot_key(unscheduled_req).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "missing active SlotKey for unscheduled request {}",
+                    unscheduled_req
+                )
+            })?;
+            crate::lock_slot!(self, &key => slot_guard);
             let slot = slot_guard
                 .as_any_mut()
                 .downcast_mut::<VllmConnectorSlot>()
@@ -452,12 +521,18 @@ impl KvConnectorLeaderCore {
         self.onboarding_slots.remove(&request_id);
         self.request_traces.remove(&request_id);
 
-        if !self.slot_manager().has_slot(&request_id) {
+        let Some(key) = self.active_slot_key(&request_id) else {
             self.inflight_requests.remove(&request_id);
+            self.active_slot_keys.remove(&request_id);
+            return Ok(true);
+        };
+        if !self.slot_manager().has_slot(&key) {
+            self.inflight_requests.remove(&request_id);
+            self.active_slot_keys.remove(&request_id);
             return Ok(true);
         }
 
-        crate::lock_slot!(self, &request_id => slot);
+        crate::lock_slot!(self, &key => slot);
         if matches!(slot.state(), SlotState::Onboarding(_))
             && let Some(vllm_slot) = slot.as_any_mut().downcast_mut::<VllmConnectorSlot>()
         {
@@ -466,13 +541,14 @@ impl KvConnectorLeaderCore {
 
         slot.mark_as_finished(self.iteration_counter)?;
         self.inflight_requests.remove(&request_id);
+        self.active_slot_keys.remove(&request_id);
 
         match slot.state() {
             SlotState::Finished => {
                 if let Some(vllm_slot) = slot.as_any_mut().downcast_mut::<VllmConnectorSlot>() {
                     vllm_slot.release_prefetched_host_blocks()?;
                 }
-                self.slot_manager().remove_slot(&request_id)?;
+                self.slot_manager().remove_slot(&key)?;
             }
             SlotState::Finishing => {
                 self.finishing_requests.insert(request_id);
@@ -481,7 +557,7 @@ impl KvConnectorLeaderCore {
                 if let Some(vllm_slot) = slot.as_any_mut().downcast_mut::<VllmConnectorSlot>() {
                     vllm_slot.release_prefetched_host_blocks()?;
                 }
-                self.slot_manager().remove_slot(&request_id)?;
+                self.slot_manager().remove_slot(&key)?;
             }
         }
 
@@ -489,7 +565,8 @@ impl KvConnectorLeaderCore {
     }
 
     pub fn has_slot(&self, request_id: &str) -> bool {
-        self.slot_manager().has_slot(&request_id.to_string())
+        self.active_slot_key(request_id)
+            .is_some_and(|key| self.slot_manager().has_slot(&key))
     }
 
     pub fn create_slot(
@@ -498,8 +575,8 @@ impl KvConnectorLeaderCore {
         salt_hash: u64,
         tokens: Vec<u32>,
     ) -> anyhow::Result<()> {
-        self.slot_manager()
-            .create_slot(&request_id, tokens, salt_hash)?;
+        let key = self.allocate_slot_key(&request_id);
+        self.slot_manager().create_slot(&key, tokens, salt_hash)?;
         self.inflight_requests.insert(request_id.clone());
 
         if !self.request_traces.contains_key(&request_id) {
@@ -514,8 +591,9 @@ impl KvConnectorLeaderCore {
                     .insert(request_id.clone(), ctx.create_traceparent());
             }
         }
-        crate::lock_slot!(self, &request_id => slot);
+        crate::lock_slot!(self, &key => slot);
         slot.set_request_traceparent(self.request_traceparent(&request_id).map(str::to_string));
+        slot.set_generation(key.generation);
         Ok(())
     }
 
@@ -529,6 +607,8 @@ impl KvConnectorLeaderCore {
         self.inflight_requests.clear();
         self.onboarding_slots.clear();
         self.finishing_requests.clear();
+        self.request_generations.clear();
+        self.active_slot_keys.clear();
         self.slot_manager().clear_pool(&pool)?;
         Ok(())
     }

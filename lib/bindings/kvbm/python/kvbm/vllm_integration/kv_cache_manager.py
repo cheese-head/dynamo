@@ -61,6 +61,14 @@ class KvbmCacheManager(KVConnectorBase_V1):
         self.prefix_cache_stats = PrefixCacheStats() if log_stats else None
         self.pending_onboard_blocks = {}
 
+    def _kvbm_request(self, request: Request) -> KvbmRequest:
+        return KvbmRequest(
+            request_id=request.request_id,
+            generation=getattr(request, "kvbm_generation", 0),
+            lora_name=request.lora_request.lora_name() if request.lora_request else None,
+            salt_hash=request.cache_salt,
+        )
+
     @property
     def usage(self) -> float:
         """Get the KV cache usage.
@@ -114,15 +122,7 @@ class KvbmCacheManager(KVConnectorBase_V1):
         all_token_ids = request.all_token_ids
 
         # extract the critial aspects of the request that effect how the tokens are hashed
-        request = KvbmRequest(
-            request_id=request.request_id,
-            lora_name=request.lora_request.lora_name()
-            if request.lora_request
-            else None,
-            salt_hash=request.cache_salt,
-        )
-
-        return self.cache_manager.create_slot(request, all_token_ids)
+        return self.cache_manager.create_slot(self._kvbm_request(request), all_token_ids)
 
     def allocate_slots(
         self,
@@ -172,15 +172,15 @@ class KvbmCacheManager(KVConnectorBase_V1):
         if num_new_tokens == 0:
             raise ValueError("num_new_tokens must be greater than 0")
 
-        if not self.cache_manager.has_slot(request.request_id):
+        kvbm_request = self._kvbm_request(request)
+
+        if not self.cache_manager.has_slot(kvbm_request):
             self._create_slot(request)
 
         num_computed_tokens = request.num_computed_tokens + num_new_computed_tokens
 
         # we need to extract from the request the new tokens to append to the block state
-        prev_computed_tokens = self.cache_manager.num_computed_tokens(
-            request.request_id
-        )
+        prev_computed_tokens = self.cache_manager.num_computed_tokens(kvbm_request)
         tokens_to_append = request.all_token_ids[
             prev_computed_tokens:num_computed_tokens
         ]
@@ -196,6 +196,7 @@ class KvbmCacheManager(KVConnectorBase_V1):
 
         slot_update = SlotUpdate(
             request_id=request.request_id,
+            generation=getattr(request, "kvbm_generation", 0),
             request_num_tokens=request.num_tokens,
             request_num_computed_tokens=request.num_computed_tokens,
             tokens_to_append=tokens_to_append,
@@ -227,7 +228,7 @@ class KvbmCacheManager(KVConnectorBase_V1):
         Args:
             request: The request to free the blocks.
         """
-        self.cache_manager.free(request.request_id)
+        self.cache_manager.free(self._kvbm_request(request))
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
@@ -304,7 +305,7 @@ class KvbmCacheManager(KVConnectorBase_V1):
         NOTE: Unlike `free`, this method should be called only when the request
         is finished, not when it is preempted.
         """
-        self.cache_manager.free_block_hashes(request.request_id)
+        self.cache_manager.free_block_hashes(self._kvbm_request(request))
 
     def take_events(self) -> list[KVCacheEvent]:
         """Take the KV cache events from the block pool.
@@ -314,9 +315,9 @@ class KvbmCacheManager(KVConnectorBase_V1):
         """
         return []
 
-    def get_block_ids(self, request_id: str) -> list[list[int]]:
+    def get_block_ids(self, request: Request) -> list[list[int]]:
         """Get the block ids of a request."""
-        return [self.cache_manager.get_block_ids(request_id)]
+        return [self.cache_manager.get_block_ids(self._kvbm_request(request))]
 
     # KV Connector
 
@@ -342,7 +343,7 @@ class KvbmCacheManager(KVConnectorBase_V1):
                   asynchronously (between scheduler steps).
         """
         return self.cache_manager.get_num_new_matched_tokens(
-            request.request_id,
+            self._kvbm_request(request),
             request.num_tokens,
             num_computed_tokens,
         )
@@ -350,7 +351,7 @@ class KvbmCacheManager(KVConnectorBase_V1):
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
-        self.cache_manager.trigger_onboard(request.request_id)
+        self.cache_manager.trigger_onboard(self._kvbm_request(request))
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput

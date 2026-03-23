@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use dynamo_llm::block_manager::connector::protocol::TransferType;
+use dynamo_llm::block_manager::connector::protocol::{SlotKey, TransferType};
 use dynamo_llm::block_manager::connector::scheduler::{
     Scheduler, TransferSchedulerClient, WorkerSchedulerClient,
 };
@@ -54,8 +54,8 @@ pub trait Worker: Send + Sync {
     fn get_block_ids_with_load_errors(&mut self) -> HashSet<u32>;
 }
 
-#[derive(Debug, Default, Clone)]
-struct RequestLifecycle {
+#[derive(Debug, Clone, Default)]
+struct LocalEpochState {
     onboarding_pending: bool,
     offloading_pending: bool,
     terminal_seen: bool,
@@ -69,8 +69,11 @@ pub struct KvConnectorWorker {
 
     kv_cache_layers: Vec<(String, Arc<dyn TorchTensor>)>,
 
-    /// Per-request lifecycle state used to derive completion emissions.
-    request_lifecycle: HashMap<String, RequestLifecycle>,
+    /// Current active epoch per request id, used only as the external adapter.
+    active_epochs: HashMap<String, SlotKey>,
+
+    /// Worker-local projection of scheduler-owned epoch state.
+    local_epochs: HashMap<SlotKey, LocalEpochState>,
 
     /// For now, offloading operations will be enqueued at the end of the forward pass
     offloading_operations: Vec<WorkerTransferRequest>,
@@ -82,87 +85,30 @@ pub struct KvConnectorWorker {
     /// cuda events created by the python side
     layer_events: Vec<u64>,
 
-    /// Map request_id to (uuid → block_ids) for error tracking (Load operations only)
-    request_to_blocks: HashMap<String, HashMap<uuid::Uuid, Vec<usize>>>,
+    /// Map epoch key to (uuid → block_ids) for error tracking (Load operations only)
+    request_to_blocks: HashMap<SlotKey, HashMap<uuid::Uuid, Vec<usize>>>,
 
     /// Block IDs that failed to load.
     /// Uses u32 since vLLM block IDs are 32-bit. Protocol uses usize for flexibility,
     /// but actual block counts won't exceed u32::MAX in practice.
     failed_block_ids: HashSet<u32>,
 
-    /// Pending failure notifications not yet processed (request_id → failed UUIDs)
-    pending_failures: HashMap<String, HashSet<uuid::Uuid>>,
-
-    /// Request IDs for which we already returned `is_finished_offloading`.
-    /// Prevents duplicate signals in TP>1: a previous step may have returned
-    /// the request via the normal slot-completion path, and a later step
-    /// (where the slot is already gone) must not return it again.
-    already_signaled_offloading: HashMap<String, u64>,
-    finished_poll_counter: u64,
-    signaled_offloading_cap: usize,
-    signaled_offloading_ttl_polls: u64,
-    signaled_offloading_gc_interval: u64,
+    /// Pending failure notifications not yet processed (epoch → failed UUIDs)
+    pending_failures: HashMap<SlotKey, HashSet<uuid::Uuid>>,
 }
 
 impl KvConnectorWorker {
-    const DEFAULT_SIGNALED_OFFLOAD_CAP: usize = 131_072;
-    const DEFAULT_SIGNALED_OFFLOAD_TTL_POLLS: u64 = 8_192;
-    const DEFAULT_SIGNALED_OFFLOAD_GC_INTERVAL: u64 = 256;
-
-    fn env_usize(name: &str, default: usize) -> usize {
-        std::env::var(name)
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(default)
-    }
-
-    fn env_u64(name: &str, default: u64) -> u64 {
-        std::env::var(name)
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(default)
-    }
-
-    fn mark_signaled_offloading(&mut self, request_id: String) {
-        self.already_signaled_offloading
-            .insert(request_id, self.finished_poll_counter);
-    }
-
-    fn maybe_gc_signaled_offloading(&mut self) {
-        if self.signaled_offloading_gc_interval == 0
-            || (self.finished_poll_counter % self.signaled_offloading_gc_interval != 0)
-        {
-            return;
-        }
-
-        let now = self.finished_poll_counter;
-        let ttl = self.signaled_offloading_ttl_polls;
-
-        self.already_signaled_offloading
-            .retain(|_, last_seen| now.saturating_sub(*last_seen) <= ttl);
-
-        let len = self.already_signaled_offloading.len();
-        if len <= self.signaled_offloading_cap {
-            return;
-        }
-
-        let remove_n = len - self.signaled_offloading_cap;
-        let mut oldest: Vec<(String, u64)> = self
-            .already_signaled_offloading
-            .iter()
-            .map(|(k, v)| (k.clone(), *v))
-            .collect();
-        oldest.sort_by_key(|(_, seen)| *seen);
-        for (k, _) in oldest.into_iter().take(remove_n) {
-            self.already_signaled_offloading.remove(&k);
-        }
+    fn ensure_local_epoch(&mut self, key: &SlotKey) -> &mut LocalEpochState {
+        self.active_epochs
+            .insert(key.request_id.clone(), key.clone());
+        self.local_epochs.entry(key.clone()).or_default()
     }
 
     fn new(drt: Option<Arc<DistributedRuntime>>, vllm_worker_id: String) -> anyhow::Result<Self> {
         let runtime = get_current_tokio_handle();
 
         let (scheduler, worker_client, transfer_client) =
-            Scheduler::new(get_current_cancel_token());
+            Scheduler::new(vllm_worker_id.clone(), get_current_cancel_token());
 
         CriticalTaskExecutionHandle::new_with_runtime(
             move |_| {
@@ -185,7 +131,8 @@ impl KvConnectorWorker {
             kvbm_worker: OnceLock::new(),
             connector: worker_client,
             transfer_client,
-            request_lifecycle: HashMap::new(),
+            active_epochs: HashMap::new(),
+            local_epochs: HashMap::new(),
             offloading_operations: Vec::new(),
             bound: false,
             iteration: 0,
@@ -195,20 +142,6 @@ impl KvConnectorWorker {
             request_to_blocks: HashMap::new(),
             failed_block_ids: HashSet::new(),
             pending_failures: HashMap::new(),
-            already_signaled_offloading: HashMap::new(),
-            finished_poll_counter: 0,
-            signaled_offloading_cap: Self::env_usize(
-                "DYN_KVBM_SIGNALED_OFFLOAD_CAP",
-                Self::DEFAULT_SIGNALED_OFFLOAD_CAP,
-            ),
-            signaled_offloading_ttl_polls: Self::env_u64(
-                "DYN_KVBM_SIGNALED_OFFLOAD_TTL_POLLS",
-                Self::DEFAULT_SIGNALED_OFFLOAD_TTL_POLLS,
-            ),
-            signaled_offloading_gc_interval: Self::env_u64(
-                "DYN_KVBM_SIGNALED_OFFLOAD_GC_INTERVAL",
-                Self::DEFAULT_SIGNALED_OFFLOAD_GC_INTERVAL,
-            ),
         })
     }
 }
@@ -351,42 +284,41 @@ impl Worker for KvConnectorWorker {
         // - send the list of actions to the engine to track completion
 
         for slot_info in &metadata.new_slots {
-            if self.connector.has_slot(&slot_info.request_id) {
-                if self.connector.is_complete(&slot_info.request_id) {
-                    // Normal two-phase transition: Phase 1 (onboarding) is complete.
-                    // Cleanly remove the old slot before creating the Phase 2 slot.
-                    tracing::debug!(
-                        request_id = %slot_info.request_id,
-                        expected_immediate_ops = slot_info.expected_immediate_ops,
-                        "replacing completed Phase 1 slot with Phase 2 slot"
-                    );
-                    self.connector.remove_slot(&slot_info.request_id);
-                    self.already_signaled_offloading
-                        .remove(&slot_info.request_id);
-                } else {
-                    // Phase 1 is NOT complete but Phase 2 arrived. This violates the
-                    // protocol: vLLM should not schedule prefill until onboarding
-                    // finishes. Return an error instead of risking data corruption
-                    // from stale transfer results contaminating the new slot.
-                    return Err(anyhow::anyhow!(
-                        "Cannot create Phase 2 slot for request '{}': \
-                         Phase 1 slot exists with incomplete operations. \
-                         This indicates a scheduling protocol violation \
-                         (prefill scheduled before onboarding finished).",
-                        slot_info.request_id
-                    ));
+            if let Some(existing_key) = self.active_epochs.get(&slot_info.key.request_id).cloned() {
+                if existing_key != slot_info.key && self.connector.has_key(&existing_key) {
+                    if self.connector.is_key_complete(&existing_key) {
+                        tracing::debug!(
+                            request_id = %slot_info.key.request_id,
+                            previous_generation = existing_key.generation,
+                            new_generation = slot_info.key.generation,
+                            expected_immediate_ops = slot_info.expected_immediate_ops,
+                            "replacing completed epoch slot"
+                        );
+                        self.connector.remove_key(&existing_key)?;
+                        self.local_epochs.remove(&existing_key);
+                    } else {
+                        return Err(anyhow::anyhow!(
+                            "Cannot create new epoch slot for request '{}': \
+                             previous epoch {} still has incomplete operations.",
+                            slot_info.key.request_id,
+                            existing_key.generation
+                        ));
+                    }
+                } else if existing_key == slot_info.key && self.connector.has_key(&existing_key) {
+                    continue;
                 }
             }
 
             tracing::debug!(
-                request_id = %slot_info.request_id,
+                request_id = %slot_info.key.request_id,
                 expected_immediate_ops = slot_info.expected_immediate_ops,
                 "creating connector slot"
             );
-            self.connector.create_slot_with_immediate_ops(
-                slot_info.request_id.clone(),
+            self.connector.create_slot_with_key_and_immediate_ops(
+                slot_info.key.clone(),
                 slot_info.expected_immediate_ops,
             )?;
+            self.ensure_local_epoch(&slot_info.key);
         }
 
         let mut onboarding_operations = Vec::new();
@@ -394,7 +326,7 @@ impl Worker for KvConnectorWorker {
 
         for operation in metadata.operations {
             tracing::debug!(
-                request_id = operation.request_id, operation_id = %operation.uuid,
+                request_id = operation.key.request_id, operation_id = %operation.uuid,
                 "adding operation to slot: {operation:#?}"
             );
 
@@ -406,19 +338,19 @@ impl Worker for KvConnectorWorker {
 
         // immediately enqueue the onboarding operations
         for operation in onboarding_operations {
-            let request_id = operation.request_id.clone();
             let uuid = operation.uuid;
 
             // Store block_ids per operation UUID for error tracking
             if !operation.block_ids.is_empty() {
                 self.request_to_blocks
-                    .entry(request_id.clone())
+                    .entry(operation.key.clone())
                     .or_default()
                     .insert(uuid, operation.block_ids.clone());
             }
 
+            let key = operation.key.clone();
             self.connector.enqueue_request(operation)?;
-            let state = self.request_lifecycle.entry(request_id).or_default();
+            let state = self.ensure_local_epoch(&key);
             state.onboarding_pending = true;
         }
 
@@ -471,7 +403,7 @@ impl Worker for KvConnectorWorker {
             }
             for operation in &offloading_operations {
                 tracing::debug!(
-                    request_id = %operation.request_id,
+                    request_id = %operation.key.request_id,
                     operation_id = %operation.uuid,
                     "Enqueuing offload operation to scheduler"
                 );
@@ -485,291 +417,161 @@ impl Worker for KvConnectorWorker {
         &mut self,
         finished_requests: HashSet<String>,
     ) -> (HashSet<String>, HashSet<String>) {
-        self.finished_poll_counter = self.finished_poll_counter.saturating_add(1);
-        self.maybe_gc_signaled_offloading();
-
         tracing::debug!(
             iteration = self.iteration,
             "Getting finished requests: {finished_requests:?}"
         );
 
-        // we do not have to visit every slot on every pass, just slots we are waiting on
-        //
-        // there are two conditions where we would be waiting:
-        // 1. if we have requested a load, we need to wait for it to complete
-        //    - the load request would come in via the metadata this is processsed in the bind
-        // 2. if we have requested a finished event, then we need to await for all outstanding
-        //    operations to complete -- either by finishing or being cancelled
-        //    - the finish request is triggered by this function, it is not seen in the metadata
-        //
-        // under each scenario, we mark the `maybe_loading_finished` and `maybe_finished_offloading` hashsets with
-        // the request id
-        //
-        // on each forward pass we visit the maybe slots to see if they are finished
-
         let mut is_finished_offloading = HashSet::new();
         let mut is_finished_onboarding = HashSet::new();
 
-        // before we process the maybes, add any newly annotated finished requests
-        // to the maybe finished set
         for request_id in finished_requests {
             tracing::debug!(request_id, "marking request as finished");
-
-            if !self.connector.has_slot(&request_id) {
-                if self.already_signaled_offloading.contains_key(&request_id) {
-                    // We already returned this request as finished_offloading in a
-                    // previous step. Don't signal again — duplicates cause vLLM's
-                    // _update_from_kv_xfer_finished to process the same request twice,
-                    // crashing on the second assert req_id in self.requests.
-                    tracing::debug!(
-                        request_id,
-                        "finished request with no slot already signaled; skipping duplicate"
-                    );
-                } else {
-                    tracing::warn!(
-                        request_id,
-                        "finished request received for unknown request_id; \
-                         signaling as finished_offloading so vLLM can clean up"
-                    );
-                    // The leader returned `true` from request_finished, so vLLM is keeping
-                    // the request in self.requests until we signal completion. Since we have
-                    // no slot (no in-flight transfers to wait for), signal immediately.
-                    is_finished_offloading.insert(request_id.clone());
-                    self.mark_signaled_offloading(request_id);
-                }
-                continue;
-            }
-
-            // If the request is already complete at the connector level,
-            // emit finished_sending immediately so vLLM's scheduler calls
-            // _free_blocks and releases GPU blocks. The leader's
-            // request_finished() returns true to keep the request in
-            // self.requests until this signal arrives.
-            if self.connector.is_complete(&request_id) {
-                tracing::debug!(
-                    request_id,
-                    "finished request already complete at connector; emitting finished_sending"
-                );
-                let state = self
-                    .request_lifecycle
-                    .entry(request_id.clone())
-                    .or_default();
-                state.onboarding_pending = false;
-                state.offloading_pending = false;
-                state.terminal_seen = true;
-                // Terminal request is fully complete at connector; retire slot now
-                // to avoid stale-slot collisions when a reused request_id appears.
-                if self.connector.has_slot(&request_id) {
-                    self.connector.remove_slot(&request_id);
-                }
-                is_finished_offloading.insert(request_id.clone());
-                self.mark_signaled_offloading(request_id);
-                continue;
-            }
-
-            let state = self
-                .request_lifecycle
-                .entry(request_id.clone())
-                .or_default();
-            if state.onboarding_pending {
-                tracing::info!(
-                    request_id,
-                    "got a finished warning for a request that is onboarding"
-                );
-            }
-
-            if state.offloading_pending {
+            let Some(key) = self.active_epochs.get(&request_id).cloned() else {
                 tracing::warn!(
                     request_id,
-                    "possibly got a duplicate finished request; request_id already in offloading-pending state"
+                    "finished request received for unknown request_id; dropping silently"
                 );
-            } else {
-                tracing::debug!(
-                    request_id,
-                    "received finished request; adding to offloading-pending state"
-                );
+                continue;
+            };
+
+            let is_complete = !self.connector.has_key(&key) || self.connector.is_key_complete(&key);
+            if is_complete {
+                if self.connector.has_key(&key) {
+                    let _ = self.connector.remove_key(&key);
+                }
+                self.local_epochs.remove(&key);
+                self.active_epochs.remove(&request_id);
+                self.request_to_blocks.remove(&key);
+                self.pending_failures.remove(&key);
+                is_finished_offloading.insert(request_id);
+                continue;
+            }
+
+            if let Some(state) = self.local_epochs.get_mut(&key) {
+                state.onboarding_pending = false;
                 state.offloading_pending = true;
+                state.terminal_seen = true;
             }
-            // Terminal request lifecycle must suppress onboarding emissions.
-            state.onboarding_pending = false;
-            state.terminal_seen = true;
         }
 
-        // visit each request slot with offloading pending
-        let offloading_pending_ids: Vec<String> = self
-            .request_lifecycle
+        let offloading_pending_keys: Vec<SlotKey> = self
+            .local_epochs
             .iter()
-            .filter_map(|(request_id, state)| {
+            .filter_map(|(key, state)| {
                 if state.offloading_pending {
-                    Some(request_id.clone())
+                    Some(key.clone())
                 } else {
                     None
                 }
             })
             .collect();
-        for request_id in offloading_pending_ids {
-            if self.connector.has_slot(&request_id) {
-                if self.connector.is_complete(&request_id) {
-                    tracing::debug!(request_id, "request slot is finished");
-                    is_finished_offloading.insert(request_id.clone());
-                } else {
-                    tracing::debug!(request_id, "request slot is not finished");
-                }
-            } else {
-                // Slot was already removed (e.g., retired after onboarding completed).
-                // No in-flight transfers to wait for — signal completion immediately
-                // so vLLM can free the request.
-                tracing::debug!(
-                    request_id,
-                    "offloading-pending request has no connector slot; signaling finished"
-                );
-                is_finished_offloading.insert(request_id.clone());
+        for key in offloading_pending_keys {
+            if !self.connector.has_key(&key) || self.connector.is_key_complete(&key) {
+                is_finished_offloading.insert(key.request_id.clone());
             }
         }
 
-        // remove the finished requests from the pending offload state.
-        // NOTE: Slot teardown is leader-owned via request_finished() lifecycle.
-        // The worker must not remove slots here, otherwise leader may later see
-        // request_finished() for an already-deleted slot and race vLLM request tracking.
         for request_id in &is_finished_offloading {
-            if let Some(state) = self.request_lifecycle.get_mut(request_id) {
-                state.offloading_pending = false;
-                // Once terminal + offload-complete, retire connector slot.
-                if state.terminal_seen && self.connector.has_slot(request_id) {
-                    self.connector.remove_slot(request_id);
+            if let Some(key) = self.active_epochs.remove(request_id) {
+                if self.connector.has_key(&key) {
+                    let _ = self.connector.remove_key(&key);
                 }
+                self.local_epochs.remove(&key);
+                self.request_to_blocks.remove(&key);
+                self.pending_failures.remove(&key);
             }
-            // Track that we signaled this request, so we don't duplicate if
-            // get_finished is called again after the slot is removed.
-            self.mark_signaled_offloading(request_id.clone());
-            // Note: Store operations don't track failures or block_ids - no cleanup needed
         }
 
-        // Drain failure notifications from channel and merge into pending_failures (non-blocking)
         for (request_id, failed_uuids) in self.connector.drain_failures() {
-            self.pending_failures
-                .entry(request_id)
-                .or_default()
-                .extend(failed_uuids);
+            if let Some(key) = self.active_epochs.get(&request_id).cloned() {
+                self.pending_failures
+                    .entry(key)
+                    .or_default()
+                    .extend(failed_uuids);
+            }
         }
 
-        // visit each request slot with onboarding pending to see if it is finished
-        let onboarding_pending_ids: Vec<String> = self
-            .request_lifecycle
+        let onboarding_pending_keys: Vec<SlotKey> = self
+            .local_epochs
             .iter()
-            .filter_map(|(request_id, state)| {
+            .filter_map(|(key, state)| {
                 if state.onboarding_pending && !state.terminal_seen {
-                    Some(request_id.clone())
+                    Some(key.clone())
                 } else {
                     None
                 }
             })
             .collect();
-        for request_id in onboarding_pending_ids {
-            if self.connector.has_slot(&request_id) {
-                if self.connector.is_complete(&request_id) {
-                    tracing::debug!(request_id, "request slot is finished");
-
-                    // Check for failures for this request
-                    if let Some(failed_uuids) = self.pending_failures.get(&request_id) {
-                        // Get block_ids for failed operations
-                        if let Some(uuid_to_blocks) = self.request_to_blocks.get(&request_id) {
-                            for failed_uuid in failed_uuids {
-                                if let Some(block_ids) = uuid_to_blocks.get(failed_uuid) {
-                                    for &block_id in block_ids {
-                                        self.failed_block_ids.insert(block_id as u32);
-                                    }
-                                    tracing::warn!(
-                                        request_id = %request_id,
-                                        operation_id = %failed_uuid,
-                                        num_failed_blocks = block_ids.len(),
-                                        "Recorded failed block IDs for load operation"
-                                    );
-                                }
+        for key in onboarding_pending_keys {
+            if !self.connector.has_key(&key) || self.connector.is_key_complete(&key) {
+                if let Some(failed_uuids) = self.pending_failures.get(&key)
+                    && let Some(uuid_to_blocks) = self.request_to_blocks.get(&key)
+                {
+                    for failed_uuid in failed_uuids {
+                        if let Some(block_ids) = uuid_to_blocks.get(failed_uuid) {
+                            for &block_id in block_ids {
+                                self.failed_block_ids.insert(block_id as u32);
                             }
                         }
                     }
-
-                    is_finished_onboarding.insert(request_id.clone());
-                } else {
-                    tracing::debug!(request_id, "request slot is not finished");
                 }
-            } else {
-                // Slot was removed (e.g., request cancelled mid-onboard).
-                // Treat as finished so lifecycle state gets cleaned up.
-                tracing::warn!(
-                    request_id,
-                    "onboarding-pending request has no connector slot; signaling finished"
-                );
-                is_finished_onboarding.insert(request_id.clone());
+                is_finished_onboarding.insert(key.request_id.clone());
             }
         }
 
-        // remove the finished requests from the lifecycle
         for request_id in &is_finished_onboarding {
-            if let Some(state) = self.request_lifecycle.get_mut(request_id) {
-                state.onboarding_pending = false;
+            if let Some(key) = self.active_epochs.get(request_id).cloned() {
+                if self.connector.has_key(&key) {
+                    let _ = self.connector.remove_key(&key);
+                }
+                self.request_to_blocks.remove(&key);
+                self.pending_failures.remove(&key);
+                if let Some(state) = self.local_epochs.get_mut(&key) {
+                    state.onboarding_pending = false;
+                }
             }
-            // Cleanup UUID → block_ids mapping and pending failures
-            self.request_to_blocks.remove(request_id);
-            self.pending_failures.remove(request_id);
-
-            // Remove the connector slot now that onboarding is complete.
-            // This sends RequestFinished to the scheduler, cleanly retiring the
-            // Phase 1 slot BEFORE the next bind_connector_metadata creates a
-            // Phase 2 slot. Without this, the Phase 2 transition's remove_slot
-            // races with transfer-side ScheduleRequests: the transfer half can
-            // arrive between remove_slot and create_slot, getting wiped by the
-            // RequestFinished cleanup, leaving the Phase 2 operation permanently
-            // un-paired and is_complete() stuck at false.
-            if self.connector.has_slot(request_id) {
-                self.connector.remove_slot(request_id);
-            }
-            self.already_signaled_offloading.remove(request_id);
-            tracing::debug!(
-                request_id,
-                "onboarding finished; connector slot removed to avoid Phase 2 race"
-            );
         }
 
-        // Drop inactive entries to keep lifecycle state bounded.
-        self.request_lifecycle
+        self.local_epochs
             .retain(|_, state| state.onboarding_pending || state.offloading_pending);
+        self.active_epochs
+            .retain(|_, key| self.local_epochs.contains_key(key) || self.connector.has_key(key));
 
         (is_finished_offloading, is_finished_onboarding)
     }
 
     fn get_block_ids_with_load_errors(&mut self) -> HashSet<u32> {
-        // Drain any failures that arrived since last check
         for (request_id, failed_uuids) in self.connector.drain_failures() {
-            self.pending_failures
-                .entry(request_id)
-                .or_default()
-                .extend(failed_uuids);
+            if let Some(key) = self.active_epochs.get(&request_id).cloned() {
+                self.pending_failures
+                    .entry(key)
+                    .or_default()
+                    .extend(failed_uuids);
+            }
         }
 
-        // Process failures for completed onboarding requests
-        let onboarding_ids: Vec<String> = self
-            .request_lifecycle
+        let onboarding_keys: Vec<SlotKey> = self
+            .local_epochs
             .iter()
-            .filter_map(|(request_id, state)| {
+            .filter_map(|(key, state)| {
                 if state.onboarding_pending {
-                    Some(request_id.clone())
+                    Some(key.clone())
                 } else {
                     None
                 }
             })
             .collect();
-        for request_id in onboarding_ids {
-            if self.connector.has_slot(&request_id) && self.connector.is_complete(&request_id) {
-                if let Some(failed_uuids) = self.pending_failures.get(&request_id) {
-                    if let Some(uuid_to_blocks) = self.request_to_blocks.get(&request_id) {
-                        for failed_uuid in failed_uuids {
-                            if let Some(block_ids) = uuid_to_blocks.get(failed_uuid) {
-                                for &block_id in block_ids {
-                                    self.failed_block_ids.insert(block_id as u32);
-                                }
-                            }
+        for key in onboarding_keys {
+            if self.connector.has_key(&key)
+                && self.connector.is_key_complete(&key)
+                && let Some(failed_uuids) = self.pending_failures.get(&key)
+                && let Some(uuid_to_blocks) = self.request_to_blocks.get(&key)
+            {
+                for failed_uuid in failed_uuids {
+                    if let Some(block_ids) = uuid_to_blocks.get(failed_uuid) {
+                        for &block_id in block_ids {
+                            self.failed_block_ids.insert(block_id as u32);
                         }
                     }
                 }

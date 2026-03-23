@@ -16,10 +16,11 @@ use crate::{
             BlockId, data::logical::distributed_leader_worker::DistributedLeaderWorkerResources,
             locality::Logical, transfer::remote::RemoteKey,
         },
+        config::should_bypass_cpu_cache,
         connector::{
             RequestKey,
             cache_stats::CacheStatsTracker,
-            protocol::{RequestType, TransferType, WorkerTransferRequest},
+            protocol::{RequestType, SlotKey, TransferType, WorkerTransferRequest},
             tier::{G4State, TierState},
         },
         distributed::registry::{NoMetadata, PositionalKey},
@@ -59,7 +60,7 @@ pub struct ConnectorSlotManager<R: RequestKey> {
     leader: Arc<KvbmLeader>,
 }
 
-impl std::fmt::Debug for ConnectorSlotManager<String> {
+impl std::fmt::Debug for ConnectorSlotManager<SlotKey> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConnectorSlotManager").finish()
     }
@@ -223,7 +224,7 @@ impl<R: RequestKey> SlotManager<R> for ConnectorSlotManager<R> {
             tokens.len()
         );
         let slot = VllmConnectorSlot::new(
-            request_id.to_string(),
+            request_id.request_id_str().to_string(),
             tokens.into(),
             salt_hash,
             self.block_manager.clone(),
@@ -302,6 +303,7 @@ impl StagedMatchReport {
 
 pub struct VllmConnectorSlot {
     request_id: String,
+    generation: u64,
     traceparent: Option<String>,
     request_poll_span: Option<tracing::Span>,
     host_prefetch: Option<G4HostPrefetchState>,
@@ -381,6 +383,9 @@ pub struct VllmConnectorSlot {
     /// Block index where offload was terminated due to priority filtering.
     /// When Some, no further blocks will be offloaded to ensure global contiguity.
     offload_terminated_at_block: Option<usize>,
+    /// When true, KVBM no longer treats this slot's G1 blocks as protected for retention.
+    /// We adopt vLLM's block table snapshots authoritatively and stop issuing new offloads.
+    g1_residency_unprotected: bool,
 
     // Reference to the leader for g4 operations
     leader: Arc<KvbmLeader>,
@@ -423,14 +428,11 @@ impl VllmConnectorSlot {
     /// In that situation incremental append is unsafe, so we resync local tracking and force
     /// conservative scheduler accounting on the next tick.
     fn resync_device_blocks_from_vllm(&mut self, block_ids: &[BlockId], reason: &str) {
-        let old_len = self.device_blocks.len();
-        let new_len = block_ids.len();
-
         tracing::warn!(
             request_id = %self.request_id,
             reason,
-            old_len,
-            new_len,
+            old_len = self.device_blocks.len(),
+            new_len = block_ids.len(),
             old_head = ?self.device_blocks.iter().take(8).copied().collect::<Vec<_>>(),
             new_head = ?block_ids.iter().take(8).copied().collect::<Vec<_>>(),
             "resyncing slot device block table from vLLM snapshot"
@@ -453,6 +455,7 @@ impl VllmConnectorSlot {
         self.current_position = 0;
         self.evaluated_blocks = 0;
         self.offload_terminated_at_block = None;
+        self.g1_residency_unprotected = false;
         self.recovered_from_failed_transfer = true;
     }
 
@@ -473,6 +476,7 @@ impl VllmConnectorSlot {
 
         Self {
             request_id,
+            generation: 0,
             traceparent: None,
             request_poll_span: None,
             host_prefetch: None,
@@ -499,8 +503,17 @@ impl VllmConnectorSlot {
             cache_stats,
             offload_min_priority,
             offload_terminated_at_block: None,
+            g1_residency_unprotected: false,
             leader,
         }
+    }
+
+    pub fn set_generation(&mut self, generation: u64) {
+        self.generation = generation;
+    }
+
+    pub fn slot_key(&self) -> SlotKey {
+        SlotKey::new(self.request_id.clone(), self.generation)
     }
 
     pub fn has_pending_g4_lookup(&self) -> bool {
@@ -532,6 +545,16 @@ impl VllmConnectorSlot {
         num_candidate_blocks: usize,
         priorities: Option<&[u32]>,
     ) -> Result<(), SlotError> {
+        if self.g1_residency_unprotected {
+            self.evaluated_blocks += num_candidate_blocks;
+            tracing::debug!(
+                request_id = %self.request_id,
+                num_candidate_blocks,
+                "slot G1 residency is unprotected; skipping offload generation"
+            );
+            return Ok(());
+        }
+
         if num_candidate_blocks == 0 {
             return Ok(());
         }
@@ -667,6 +690,56 @@ impl VllmConnectorSlot {
         self.performed_cache_lookup = false;
         self.total_blocks_queried = 0;
         self.prefetched_g4_blocks_used_for_stats = 0;
+    }
+
+    fn offload_capacity_shortage(
+        &self,
+        requested_blocks: usize,
+    ) -> Result<Option<(&'static str, usize)>, SlotError> {
+        if should_bypass_cpu_cache() {
+            let disk_pool = self.block_manager.disk().ok_or_else(|| {
+                SlotError::InvalidOperation(
+                    "disk pool is not configured for direct offload".to_string(),
+                )
+            })?;
+            let available = disk_pool.available_blocks() as usize;
+            if available < requested_blocks {
+                return Ok(Some(("disk", available)));
+            }
+        } else {
+            let host_pool = self.block_manager.host().ok_or_else(|| {
+                SlotError::InvalidOperation(
+                    "host pool is not configured for local offload".to_string(),
+                )
+            })?;
+            let available = host_pool.available_blocks() as usize;
+            if available < requested_blocks {
+                return Ok(Some(("host", available)));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn mark_retention_unavailable(
+        &mut self,
+        tier_name: &'static str,
+        requested_blocks: usize,
+        available_blocks: usize,
+    ) {
+        self.g1_residency_unprotected = true;
+        self.offload_terminated_at_block = Some(self.evaluated_blocks);
+        self.recovered_from_failed_transfer = false;
+
+        tracing::warn!(
+            request_id = %self.request_id,
+            tier = tier_name,
+            requested_blocks,
+            available_blocks,
+            evaluated_blocks = self.evaluated_blocks,
+            current_position = self.current_position,
+            "lower-tier retention unavailable; KVBM will stop offloading this slot and treat G1 residency as unprotected"
+        );
     }
 
     fn start_async_g4_lookup(
@@ -962,13 +1035,9 @@ impl VllmConnectorSlot {
         sequence_hashes: Vec<u64>,
         token_blocks: Vec<TokenBlock>,
     ) -> Result<uuid::Uuid, SlotError> {
-        let (params, worker_req) = vllm_int::onboard_from_g4(
-            self.request_id.clone(),
-            sequence_hashes,
-            vec![],
-            self.block_size,
-            token_blocks,
-        );
+        let key = self.slot_key();
+        let (params, worker_req) =
+            vllm_int::onboard_from_g4(key, sequence_hashes, vec![], self.block_size, token_blocks);
 
         let xfer_req = LocalTransferRequest::Remote(RemoteTransferRequest::from_g4_params(
             &params,
@@ -1100,6 +1169,7 @@ impl Slot for VllmConnectorSlot {
     }
 
     fn reset_after_preemption(&mut self) {
+        let preserve_unprotected = self.g1_residency_unprotected;
         crate::all_tiers!(clear_staging self);
         if self.operation_tracker.has_any() {
             tracing::warn!(
@@ -1112,7 +1182,11 @@ impl Slot for VllmConnectorSlot {
         }
 
         self.reset_core_state();
-        self.offload_terminated_at_block = None;
+        if preserve_unprotected {
+            self.offload_terminated_at_block = Some(0);
+        } else {
+            self.offload_terminated_at_block = None;
+        }
     }
 
     fn reset(&mut self) {
@@ -1691,12 +1765,49 @@ impl ExternallyManagedDeviceSlot for VllmConnectorSlot {
                 );
             }
             DeviceBlockTableUpdateKind::Resync => {
-                let reason = match block_ids.len().cmp(&existing) {
-                    std::cmp::Ordering::Greater => "prefix_mismatch_growing_table",
-                    std::cmp::Ordering::Equal => "mismatch_same_length_table",
-                    std::cmp::Ordering::Less => "incoming_table_shrank",
-                };
-                self.resync_device_blocks_from_vllm(block_ids, reason);
+                if self.g1_residency_unprotected {
+                    tracing::debug!(
+                        request_id = %self.request_id,
+                        old_len = self.device_blocks.len(),
+                        new_len = block_ids.len(),
+                        "adopting authoritative vLLM device block table while G1 is unprotected"
+                    );
+                    self.device_blocks.clear();
+                    self.device_blocks.extend_from_slice(block_ids);
+                    return Ok(());
+                }
+
+                if block_ids.len() == existing {
+                    // Same-length block reassignment: vLLM preempted and reallocated
+                    // physical blocks but the logical request is unchanged. Adopt the
+                    // new IDs and cancel stale operations, but preserve offload
+                    // position so the slot doesn't livelock re-evaluating capacity.
+                    tracing::info!(
+                        request_id = %self.request_id,
+                        num_blocks = existing,
+                        "adopting reassigned device blocks (same-length table); preserving offload position"
+                    );
+
+                    if self.operation_tracker.has_any() {
+                        tracing::warn!(
+                            request_id = %self.request_id,
+                            pending_ops = self.operation_tracker.pending_count(),
+                            dispatched_ops = self.operation_tracker.dispatched_count(),
+                            "clearing stale operations after block reassignment"
+                        );
+                        self.operation_tracker.clear_all();
+                    }
+
+                    self.device_blocks.clear();
+                    self.device_blocks.extend_from_slice(block_ids);
+                } else {
+                    let reason = if block_ids.len() > existing {
+                        "prefix_mismatch_growing_table"
+                    } else {
+                        "incoming_table_shrank"
+                    };
+                    self.resync_device_blocks_from_vllm(block_ids, reason);
+                }
             }
         }
 
@@ -1708,6 +1819,10 @@ impl ExternallyManagedDeviceSlot for VllmConnectorSlot {
             self.request_poll_span = None;
         }
         self.traceparent = traceparent;
+    }
+
+    fn set_generation(&mut self, generation: u64) {
+        self.generation = generation;
     }
 }
 
@@ -1789,6 +1904,15 @@ impl VllmConnectorSlot {
         token_blocks: &[TokenBlock],
         priorities: &[u32],
     ) -> Result<(), SlotError> {
+        if self.g1_residency_unprotected {
+            tracing::debug!(
+                request_id = %self.request_id,
+                num_blocks = block_ids.len(),
+                "skipping offload because G1 residency is already unprotected"
+            );
+            return Ok(());
+        }
+
         // Check if slot is in Finishing state before creating operations
         // If we're finishing, don't create new operations
         if matches!(self.state, SlotState::Finishing | SlotState::Finished) {
@@ -1798,10 +1922,18 @@ impl VllmConnectorSlot {
         assert!(block_ids.len() == token_blocks.len());
         assert!(block_ids.len() == priorities.len());
 
+        if let Some((tier_name, available_blocks)) =
+            self.offload_capacity_shortage(block_ids.len())?
+        {
+            self.mark_retention_unavailable(tier_name, block_ids.len(), available_blocks);
+            return Ok(());
+        }
+
         let operation_id = uuid::Uuid::new_v4();
+        let key = self.slot_key();
 
         let xfer_req = LocalTransferRequest::Offload(LocalOffloadRequest::new(
-            self.request_id.clone(),
+            key.clone(),
             block_ids.to_vec(),
             token_blocks.to_vec(),
             priorities.to_vec(),
@@ -1811,7 +1943,7 @@ impl VllmConnectorSlot {
         ));
 
         let worker_req = WorkerTransferRequest {
-            request_id: self.request_id.clone(),
+            key,
             uuid: operation_id,
             transfer_type: TransferType::Store,
             request_type: RequestType::Scheduled,
@@ -1933,16 +2065,17 @@ impl VllmConnectorSlot {
         let num_blocks = src_blocks.len();
         let src_storage_pool = src_blocks.storage_pool();
         let operation_id = uuid::Uuid::new_v4();
+        let key = self.slot_key();
 
         let xfer_req = LocalTransferRequest::Onboard(LocalOnboardRequest::new(
-            self.request_id.clone(),
+            key.clone(),
             src_blocks,
             dst_block_ids.clone(),
             operation_id,
         ));
 
         let worker_req = WorkerTransferRequest {
-            request_id: self.request_id.clone(),
+            key,
             uuid: operation_id,
             transfer_type: TransferType::Load,
             request_type: RequestType::Immediate,
@@ -1989,8 +2122,9 @@ impl VllmConnectorSlot {
     ) -> Result<(), SlotError> {
         debug_assert_eq!(sequence_hashes.len(), device_block_ids.len());
 
+        let key = self.slot_key();
         let (params, worker_req) = vllm_int::onboard_from_g4(
-            self.request_id.clone(),
+            key,
             sequence_hashes,
             device_block_ids,
             self.block_size,
@@ -2046,7 +2180,7 @@ mod tests {
 
         let pin_id = uuid::Uuid::new_v4();
         let req = RemoteTransferRequest::new_h2o(
-            request_id.clone(),
+            SlotKey::new(request_id.clone(), 7),
             sequence_hashes.clone(),
             host_block_ids.clone(),
             operation_id,
@@ -2061,7 +2195,8 @@ mod tests {
         assert_eq!(req.host_block_ids, Some(host_block_ids));
         assert!(req.device_block_ids.is_empty()); // H2R doesn't use device blocks
         assert_eq!(req.block_size, block_size);
-        assert_eq!(req.request_id, request_id);
+        assert_eq!(req.key.request_id, request_id);
+        assert_eq!(req.key.generation, 7);
         assert_eq!(req.pin_id, Some(pin_id));
     }
 
@@ -2070,6 +2205,7 @@ mod tests {
     #[test]
     fn test_g4_onboard_request_creation_for_host_prefetch() {
         let request_id = "test-request-g4-prefetch".to_string();
+        let key = SlotKey::new(request_id.clone(), 0);
         let sequence_hashes = vec![0x1111, 0x2222, 0x3333];
         let device_block_ids = vec![]; // Host-prefetch-only path
         let operation_id = uuid::Uuid::new_v4();
@@ -2079,6 +2215,7 @@ mod tests {
             Some("00-0123456789abcdef0123456789abcdef-0123456789abcdef-01".to_string());
 
         let params = G4OnboardParams {
+            key: key.clone(),
             request_id: request_id.clone(),
             sequence_hashes: sequence_hashes.clone(),
             device_block_ids: device_block_ids.clone(),
@@ -2091,7 +2228,8 @@ mod tests {
 
         assert!(req.is_onboard);
         assert!(!req.is_h2o());
-        assert_eq!(req.request_id, request_id);
+        assert_eq!(req.key.request_id, request_id);
+        assert_eq!(req.key, key);
         assert_eq!(req.sequence_hashes, sequence_hashes);
         assert_eq!(req.device_block_ids, device_block_ids);
         assert_eq!(req.host_block_ids, None);
@@ -2128,6 +2266,7 @@ mod tests {
     #[test]
     fn test_local_offload_request_has_block_size() {
         let request_id = "test-request".to_string();
+        let key = SlotKey::new(request_id.clone(), 0);
         let block_ids = vec![0, 1, 2];
 
         // Create mock token blocks (we can't easily create real ones without the full infrastructure)
@@ -2137,6 +2276,7 @@ mod tests {
 
         // Test that LocalOffloadRequest stores block_size
         let req = LocalOffloadRequest {
+            key: key.clone(),
             request_id: request_id.clone(),
             block_ids: block_ids.clone(),
             token_blocks: vec![], // Empty for this unit test
@@ -2149,6 +2289,7 @@ mod tests {
 
         assert_eq!(req.block_size, block_size);
         assert_eq!(req.block_ids.len(), 3);
+        assert_eq!(req.key, key);
     }
 
     /// Test that LocalOffloadRequest::new wires the full offload cycle inputs
@@ -2156,6 +2297,7 @@ mod tests {
     #[test]
     fn test_local_offload_request_new_derives_sequence_hashes_and_traceparent() {
         let request_id = "test-offload-request".to_string();
+        let key = SlotKey::new(request_id.clone(), 0);
         let block_ids = vec![7, 8];
         let operation_id = uuid::Uuid::new_v4();
         let block_size = 16;
@@ -2166,7 +2308,7 @@ mod tests {
         let priorities = vec![10, 20];
 
         let req = LocalOffloadRequest::new(
-            request_id.clone(),
+            key.clone(),
             block_ids.clone(),
             token_blocks.clone(),
             priorities.clone(),
@@ -2175,7 +2317,8 @@ mod tests {
             traceparent.clone(),
         );
 
-        assert_eq!(req.request_id, request_id);
+        assert_eq!(req.key.request_id, request_id);
+        assert_eq!(req.key, key);
         assert_eq!(req.block_ids, block_ids);
         assert_eq!(req.operation_id, operation_id);
         assert_eq!(req.block_size, block_size);

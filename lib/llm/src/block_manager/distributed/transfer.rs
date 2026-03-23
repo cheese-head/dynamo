@@ -254,11 +254,27 @@ impl BlockTransferHandler {
 
         // Get the blocks corresponding to the indices.
         let sources: Vec<LocalBlockData<Source>> = source_idxs
-            .map(|idx| source_pool_list[idx].clone())
-            .collect();
+            .map(|idx| {
+                source_pool_list.get(idx).cloned().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Source block index {} out of range for pool size {}",
+                        idx,
+                        source_pool_list.len()
+                    )
+                })
+            })
+            .collect::<Result<_>>()?;
         let mut targets: Vec<LocalBlockData<Target>> = target_idxs
-            .map(|idx| target_pool_list[idx].clone())
-            .collect();
+            .map(|idx| {
+                target_pool_list.get(idx).cloned().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Target block index {} out of range for pool size {}",
+                        idx,
+                        target_pool_list.len()
+                    )
+                })
+            })
+            .collect::<Result<_>>()?;
 
         // Perform the transfer, and return the notifying channel.
         match sources.write_to(&mut targets, self.context.clone()) {
@@ -362,8 +378,16 @@ impl BlockTransferHandler {
         // Get the host blocks for this transfer
         let bounce_blocks: Vec<LocalBlockData<PinnedStorage>> = bounce_ids
             .iter()
-            .map(|&idx| host_blocks[idx].clone())
-            .collect();
+            .map(|&idx| {
+                host_blocks.get(idx).cloned().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Bounce block index {} out of range for host pool size {}",
+                        idx,
+                        host_blocks.len()
+                    )
+                })
+            })
+            .collect::<Result<_>>()?;
 
         let chunk_size = g4_pipeline_chunk_size();
 
@@ -564,6 +588,16 @@ impl BlockTransferHandler {
             let start = chunk_idx * chunk_size;
             let end = (start + chunk_size).min(num_blocks);
 
+            if end > descriptors.len() || end > bounce_blocks.len() {
+                return Err(anyhow::anyhow!(
+                    "Chunk range {}..{} exceeds descriptors len ({}) or bounce_blocks len ({})",
+                    start,
+                    end,
+                    descriptors.len(),
+                    bounce_blocks.len()
+                ));
+            }
+
             let chunk_descs = descriptors[start..end].to_vec();
             let chunk_bounce = bounce_blocks[start..end].to_vec();
             let ctx = Arc::clone(remote_ctx);
@@ -619,6 +653,17 @@ impl BlockTransferHandler {
                     }
 
                     if let Some(all_device_ids) = device_ids {
+                        if end > bounce_ids.len() || end > all_device_ids.len() {
+                            r2h_error = Some(anyhow::anyhow!(
+                                "H2D chunk range {}..{} exceeds bounce_ids len ({}) or device_ids len ({})",
+                                start,
+                                end,
+                                bounce_ids.len(),
+                                all_device_ids.len()
+                            ));
+                            break;
+                        }
+
                         let block_pairs: Vec<(usize, usize)> = bounce_ids[start..end]
                             .iter()
                             .copied()
@@ -859,7 +904,7 @@ impl Handler for BlockTransferHandler {
                 let operation_id = req.uuid;
 
                 tracing::debug!(
-                    request_id = %req.request_id,
+                    request_id = %req.key.request_id,
                     operation_id = %operation_id,
                     "scheduling transfer"
                 );

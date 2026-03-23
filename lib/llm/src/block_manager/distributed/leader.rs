@@ -308,7 +308,6 @@ impl KvbmLeader {
     ) -> Option<crate::block_manager::config::RemoteStorageConfig> {
         use crate::block_manager::config::RemoteStorageConfig;
 
-        let worker_id = self.config.rank;
         let storage_type = std::env::var("DYN_KVBM_REMOTE_STORAGE_TYPE")
             .unwrap_or_else(|_| "auto".to_string())
             .to_lowercase();

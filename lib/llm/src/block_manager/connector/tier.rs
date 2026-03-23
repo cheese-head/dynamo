@@ -232,7 +232,7 @@ macro_rules! lock_slot {
 /// Take pending ops from a slot, count immediate ops, and create metadata slot entry.
 #[macro_export]
 macro_rules! flush_slot_to_metadata {
-    ($slot:expr, $md:expr, $request_id:expr) => {{
+    ($slot:expr, $md:expr, $key:expr) => {{
         if let Some(pending_ops) = $slot.take_pending_operations() {
             let num_immediate = pending_ops
                 .iter()
@@ -241,10 +241,10 @@ macro_rules! flush_slot_to_metadata {
                         == $crate::block_manager::connector::protocol::RequestType::Immediate
                 })
                 .count() as u64;
-            $md.create_slot($request_id.clone(), num_immediate);
-            $md.add_operations(pending_ops);
+            $md.create_slot_with_key($key.clone(), num_immediate);
+            $md.add_operations_for_key(&$key, pending_ops);
         } else {
-            $md.create_slot($request_id.clone(), 0);
+            $md.create_slot_with_key($key, 0);
         }
     }};
 }

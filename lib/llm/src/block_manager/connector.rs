@@ -14,6 +14,7 @@ pub mod protocol;
 pub mod scheduler;
 pub mod tier;
 
+use self::protocol::SlotKey;
 use super::*;
 
 use crate::{
@@ -39,21 +40,34 @@ pub enum SlotError {
 }
 
 pub trait RequestKey:
-    std::hash::Hash
-    + std::cmp::Eq
-    + std::fmt::Debug
-    + std::fmt::Display
-    + tracing::Value
-    + Clone
-    + Send
-    + Sync
-    + 'static
+    std::hash::Hash + std::cmp::Eq + std::fmt::Debug + std::fmt::Display + Clone + Send + Sync + 'static
 {
+    /// The bare request identifier string, without any generation suffix.
+    /// Used when creating slots that need to reconstruct a canonical SlotKey.
+    fn request_id_str(&self) -> &str;
 }
 
-impl RequestKey for String {}
-impl RequestKey for u64 {}
-impl RequestKey for usize {}
+impl RequestKey for String {
+    fn request_id_str(&self) -> &str {
+        self.as_str()
+    }
+}
+impl RequestKey for u64 {
+    fn request_id_str(&self) -> &str {
+        // u64 keys don't have a string form; callers should not rely on this
+        ""
+    }
+}
+impl RequestKey for usize {
+    fn request_id_str(&self) -> &str {
+        ""
+    }
+}
+impl RequestKey for SlotKey {
+    fn request_id_str(&self) -> &str {
+        &self.request_id
+    }
+}
 
 pub trait SlotManager<R: RequestKey>: Send + Sync {
     type SlotType: Slot + ?Sized;

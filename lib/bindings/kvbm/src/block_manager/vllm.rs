@@ -17,6 +17,7 @@ use dynamo_llm::{
             data::logical::distributed_leader_worker::DistributedLeaderWorkerResources,
             locality::{LocalityProvider, Logical},
         },
+        connector::protocol::SlotKey,
         pool::{BlockPool, BlockPoolError},
     },
     tokens::{SaltHash, SequenceHash, TokenBlockSequence, Tokens},
@@ -65,7 +66,7 @@ pub fn add_to_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[pyclass]
 pub struct KvbmCacheManager {
     block_manager: PyBlockManager,
-    slot_manager: Mutex<SlotManager<String>>,
+    slot_manager: Mutex<SlotManager<SlotKey>>,
 }
 
 #[pyclass]
@@ -90,9 +91,9 @@ impl KvbmCacheManager {
         })
     }
 
-    pub fn has_slot(&self, request_id: String) -> PyResult<bool> {
+    pub fn has_slot(&self, request: KvbmRequest) -> PyResult<bool> {
         let slot_manager = self.slot_manager.lock().map_err(to_pyerr)?;
-        Ok(slot_manager.has_slot(&request_id))
+        Ok(slot_manager.has_slot(&request.slot_key()))
     }
 
     /// Create a new slot for the given request ID.
@@ -104,16 +105,16 @@ impl KvbmCacheManager {
     ) -> PyResult<Vec<SequenceHash>> {
         let mut slot_manager = self.slot_manager.lock().map_err(to_pyerr)?;
         slot_manager
-            .create_slot(&request.request_id, request.salt_hash, tokens)
+            .create_slot(&request.slot_key(), request.salt_hash, tokens)
             .map_err(to_pyerr)
     }
 
     /// Returns the number of tokens that have been computed for the given request.
     #[tracing::instrument(level = "debug", skip(self))]
-    pub fn num_computed_tokens(&self, request_id: String) -> PyResult<usize> {
+    pub fn num_computed_tokens(&self, request: KvbmRequest) -> PyResult<usize> {
         let slot_manager = self.slot_manager.lock().map_err(to_pyerr)?;
         slot_manager
-            .num_tokens(&request_id, SlotPosition::Computed)
+            .num_tokens(&request.slot_key(), SlotPosition::Computed)
             .map_err(to_pyerr)
     }
 
@@ -144,14 +145,14 @@ impl KvbmCacheManager {
     /// in the slot manager as well as determine if the matches are on full block boundaries.
     pub fn get_num_new_matched_tokens(
         &self,
-        request_id: String,
+        request: KvbmRequest,
         request_num_tokens: usize,
         num_computed_tokens: usize,
     ) -> PyResult<(usize, bool)> {
         let mut slot_manager = self.slot_manager.lock().map_err(to_pyerr)?;
         slot_manager
             .get_num_new_matched_tokens(
-                &request_id,
+                &request.slot_key(),
                 request_num_tokens,
                 num_computed_tokens,
                 self.block_manager(),
@@ -170,9 +171,9 @@ impl KvbmCacheManager {
             .map_err(to_pyerr)
     }
 
-    pub fn free(&self, request_id: String) -> PyResult<()> {
+    pub fn free(&self, request: KvbmRequest) -> PyResult<()> {
         let mut slot_manager = self.slot_manager.lock().map_err(to_pyerr)?;
-        slot_manager.free_blocks(&request_id);
+        slot_manager.free_blocks(&request.slot_key());
         Ok(())
     }
 
@@ -185,9 +186,9 @@ impl KvbmCacheManager {
     }
 
     /// Free the entire slot for the given request ID.
-    pub fn free_block_hashes(&self, request_id: String) -> PyResult<()> {
+    pub fn free_block_hashes(&self, request: KvbmRequest) -> PyResult<()> {
         let mut slot_manager = self.slot_manager.lock().map_err(to_pyerr)?;
-        slot_manager.drop_slot(&request_id);
+        slot_manager.drop_slot(&request.slot_key());
         Ok(())
     }
 
@@ -196,18 +197,19 @@ impl KvbmCacheManager {
         Ok(vec![])
     }
 
-    pub fn get_block_ids(&self, request_id: String) -> PyResult<Vec<BlockId>> {
+    pub fn get_block_ids(&self, request: KvbmRequest) -> PyResult<Vec<BlockId>> {
+        let key = request.slot_key();
         Ok(self
             .slot_manager
             .lock()
             .map_err(to_pyerr)?
-            .get_block_ids(&request_id)
+            .get_block_ids(&key)
             .inspect_err(|e| match e {
                 SlotError::NotFound => {
-                    tracing::warn!(request_id, "slot was never allocated for this request");
+                    tracing::warn!(request_id = %key.request_id, generation = key.generation, "slot was never allocated for this request");
                 }
                 _ => {
-                    tracing::error!(request_id, "failed to get block ids: {:?}", e);
+                    tracing::error!(request_id = %key.request_id, generation = key.generation, "failed to get block ids: {:?}", e);
                 }
             })
             .unwrap_or_default())
@@ -220,11 +222,11 @@ impl KvbmCacheManager {
         Ok(usage)
     }
 
-    pub fn trigger_onboard(&self, request_id: String) -> PyResult<()> {
+    pub fn trigger_onboard(&self, request: KvbmRequest) -> PyResult<()> {
         self.slot_manager
             .lock()
             .map_err(to_pyerr)?
-            .trigger_onboard(&request_id, self.block_manager())
+            .trigger_onboard(&request.slot_key(), self.block_manager())
             .map_err(to_pyerr)
     }
 
@@ -397,7 +399,7 @@ pub struct GenericSlotUpdate<R> {
     pub delay_cache_blocks: Option<bool>,
 }
 
-impl std::fmt::Debug for GenericSlotUpdate<String> {
+impl std::fmt::Debug for GenericSlotUpdate<SlotKey> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let tokens_display = if self.tokens_to_append.len() > 8 {
             format!(
@@ -427,12 +429,12 @@ impl std::fmt::Debug for GenericSlotUpdate<String> {
 
 #[pyclass]
 #[derive(Debug, Clone, Dissolve)]
-pub struct SlotUpdate(pub GenericSlotUpdate<String>);
+pub struct SlotUpdate(pub GenericSlotUpdate<SlotKey>);
 
 #[pymethods]
 impl SlotUpdate {
     #[new]
-    #[pyo3(signature = (request_id, request_num_tokens, request_num_computed_tokens, tokens_to_append, num_new_tokens, num_new_computed_tokens=None, new_computed_blocks=None, num_lookahead_blocks=None, delay_cache_blocks=None))]
+    #[pyo3(signature = (request_id, request_num_tokens, request_num_computed_tokens, tokens_to_append, num_new_tokens, generation=0, num_new_computed_tokens=None, new_computed_blocks=None, num_lookahead_blocks=None, delay_cache_blocks=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         request_id: String,
@@ -440,13 +442,14 @@ impl SlotUpdate {
         request_num_computed_tokens: usize,
         tokens_to_append: Vec<u32>,
         num_new_tokens: usize,
+        generation: u64,
         num_new_computed_tokens: Option<usize>,
         new_computed_blocks: Option<KvbmBlockList>,
         num_lookahead_blocks: Option<usize>,
         delay_cache_blocks: Option<bool>,
     ) -> Self {
         let update = GenericSlotUpdate {
-            request_id,
+            request_id: SlotKey::new(request_id, generation),
             request_num_tokens,
             request_num_computed_tokens,
             tokens_to_append,
@@ -462,19 +465,12 @@ impl SlotUpdate {
 }
 
 pub trait RequestKey:
-    std::hash::Hash
-    + std::cmp::Eq
-    + std::fmt::Debug
-    + std::fmt::Display
-    + tracing::Value
-    + Clone
-    + Send
-    + Sync
-    + 'static
+    std::hash::Hash + std::cmp::Eq + std::fmt::Debug + std::fmt::Display + Clone + Send + Sync + 'static
 {
 }
 
 impl RequestKey for String {}
+impl RequestKey for SlotKey {}
 
 #[derive(Debug, thiserror::Error)]
 pub enum SlotError {
@@ -534,7 +530,7 @@ impl<R: RequestKey> SlotManager<R> {
                 Slot::new(tokens.into(), self.block_size, salt_hash),
             );
             tracing::debug!(
-                request_id,
+                request_id = %request_id,
                 "created slot; total slots: {}",
                 self.slots.len()
             );
@@ -591,7 +587,7 @@ impl<R: RequestKey> SlotManager<R> {
             match matched_blocks.take_blocks() {
                 Some(BlockListType::ImmutableDevice(blocks)) => {
                     tracing::debug!(
-                        request_id,
+                        request_id = %request_id,
                         "applying {} cache-hit tokens",
                         blocks.len() * self.block_size
                     );
@@ -602,7 +598,11 @@ impl<R: RequestKey> SlotManager<R> {
                 }
             }
         } else {
-            tracing::debug!(request_id, "applying {} tokens", tokens_to_append.len());
+            tracing::debug!(
+                request_id = %request_id,
+                "applying {} tokens",
+                tokens_to_append.len()
+            );
             slot.apply_computed_tokens(tokens_to_append, bm.device().unwrap())?;
         }
 
@@ -649,7 +649,7 @@ impl<R: RequestKey> SlotManager<R> {
         } else {
             // Request ID may not be found if the client aborts the request.
             tracing::debug!(
-                request_id,
+                request_id = %request_id,
                 "request id {} not found in the slot manager",
                 request_id
             );
@@ -665,7 +665,7 @@ impl<R: RequestKey> SlotManager<R> {
                 let isl_host = slot.num_blocks_cached_from_host() * self.block_size;
                 let isl_disk = slot.num_blocks_cached_from_disk() * self.block_size;
                 tracing::info!(
-                    request_id,
+                    request_id = %request_id,
                     "request complete isl: {} - cache hits: device: {}, host: {}, disk: {} - prefilled: {}",
                     isl,
                     isl_device,
@@ -676,7 +676,7 @@ impl<R: RequestKey> SlotManager<R> {
             }
             None => {
                 tracing::debug!(
-                    request_id,
+                    request_id = %request_id,
                     "request id {} not found in the slot manager during drop",
                     request_id
                 );
@@ -761,7 +761,7 @@ impl<R: RequestKey> SlotManager<R> {
         // we are on a block boundary, so we need to throw away the last block
         if num_computed_tokens + num_new_matched_tokens == request_num_tokens {
             tracing::debug!(
-                request_id,
+                request_id = %request_id,
                 "on a block boundary, throwing away the last block"
             );
 

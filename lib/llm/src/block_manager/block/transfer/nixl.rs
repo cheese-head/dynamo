@@ -151,6 +151,7 @@ async fn get_or_open_remote_disk_storage(
     block_size: usize,
     create: bool,
     use_odirect: bool,
+    preallocate: bool,
 ) -> Result<Arc<SyncMutex<RemoteDiskStorage>>, TransferError> {
     let key = RemoteDiskFdCacheKey {
         path: path.to_string(),
@@ -165,7 +166,7 @@ async fn get_or_open_remote_disk_storage(
     }
 
     let mut storage =
-        RemoteDiskStorage::open(path, block_size, create, use_odirect).map_err(|e| {
+        RemoteDiskStorage::open(path, block_size, create, use_odirect, preallocate).map_err(|e| {
             TransferError::ExecutionError(format!(
                 "Failed to {} RemoteDiskStorage at {}: {:?}",
                 if create { "create" } else { "open" },
@@ -693,6 +694,7 @@ where
                 block_size,
                 create_files,
                 use_odirect,
+                use_gds_backend,
             )
             .await?;
 

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use dynamo_llm::block_manager::connector::protocol::SlotKey;
 use serde::{Deserialize, Serialize};
 
 use dynamo_llm::tokens::compute_hash_v2;
@@ -12,6 +13,7 @@ use dynamo_llm::tokens::compute_hash_v2;
 #[allow(dead_code)]
 pub struct KvbmRequest {
     pub request_id: String,
+    pub generation: u64,
     pub lora_name: Option<String>,
     pub salt_hash: u64,
 }
@@ -19,8 +21,13 @@ pub struct KvbmRequest {
 #[pymethods]
 impl KvbmRequest {
     #[new]
-    #[pyo3(signature = (request_id, lora_name=None, salt_hash=None))]
-    pub fn new(request_id: String, lora_name: Option<String>, salt_hash: Option<String>) -> Self {
+    #[pyo3(signature = (request_id, generation=0, lora_name=None, salt_hash=None))]
+    pub fn new(
+        request_id: String,
+        generation: u64,
+        lora_name: Option<String>,
+        salt_hash: Option<String>,
+    ) -> Self {
         // compute salt
         #[derive(Debug, serde::Serialize)]
         struct Salt {
@@ -44,8 +51,15 @@ impl KvbmRequest {
 
         Self {
             request_id,
+            generation,
             lora_name,
             salt_hash,
         }
+    }
+}
+
+impl KvbmRequest {
+    pub fn slot_key(&self) -> SlotKey {
+        SlotKey::new(self.request_id.clone(), self.generation)
     }
 }

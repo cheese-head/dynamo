@@ -70,16 +70,23 @@ mod tests {
 
     use anyhow::Result;
     use rstest::*;
+    use serial_test::serial;
 
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+    use std::sync::Once;
     use tokio_util::sync::CancellationToken;
 
     use dynamo_runtime::logging::init as init_logging;
 
-    const NUM_BLOCKS: usize = 8;
+    const DEFAULT_NUM_BLOCKS: usize = 8;
+    const TEST_NUM_LAYERS: usize = 2;
+    const TEST_OUTER_DIM: usize = 2;
+    const TEST_INNER_DIM: usize = 4;
+    static TEST_PORT_COUNTER: AtomicUsize = AtomicUsize::new(0);
+    static TEST_ENV_INIT: Once = Once::new();
 
     #[derive(Clone, Debug)]
     struct MockTensor {
@@ -130,17 +137,55 @@ mod tests {
         }
     }
 
-    async fn build_leader_and_workers(num_workers: usize) -> Result<(KvbmLeader, Vec<KvbmWorker>)> {
+    fn next_test_ports() -> (String, String) {
+        let offset = TEST_PORT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let base_port = 56001 + (offset * 2);
+        (
+            format!("tcp://127.0.0.1:{base_port}"),
+            format!("tcp://127.0.0.1:{}", base_port + 1),
+        )
+    }
+
+    fn init_test_env() {
+        TEST_ENV_INIT.call_once(|| {
+            // The default NIXL POSIX queue selection may pick linux_aio in this container,
+            // which is not stable enough for the distributed E2E suite. Force a deterministic
+            // backend for tests so disk offload/onboard validates the KVBM path instead of the
+            // host's AIO limits.
+            unsafe {
+                std::env::set_var("DYN_KVBM_NIXL_POSIX_API", "posix_aio");
+                std::env::set_var("DYN_KVBM_LOCAL_DISK_USE_GDS", "false");
+            }
+        });
+    }
+
+    async fn build_leader_and_workers(
+        num_workers: usize,
+        num_device_blocks: usize,
+        num_host_blocks: usize,
+        num_disk_blocks: usize,
+        page_size: usize,
+    ) -> Result<(KvbmLeader, Vec<KvbmWorker>)> {
+        init_test_env();
+        let (leader_pub_url, leader_ack_url) = next_test_ports();
         let mut workers = Vec::new();
 
-        for i in 0..num_workers {
-            let tensors: Vec<Arc<dyn TorchTensor>> =
-                vec![Arc::new(MockTensor::new(vec![2, NUM_BLOCKS, 4096]))];
+        for _ in 0..num_workers {
+            let tensors: Vec<Arc<dyn TorchTensor>> = vec![Arc::new(MockTensor::new(vec![
+                num_device_blocks,
+                TEST_NUM_LAYERS,
+                TEST_OUTER_DIM,
+                page_size * TEST_INNER_DIM,
+            ]))];
 
             let config = KvbmWorkerConfig::builder()
-                .num_device_blocks(NUM_BLOCKS)
+                .cancel_token(CancellationToken::new())
+                .num_device_blocks(num_device_blocks)
+                .page_size(page_size)
                 .tensors(tensors)
-                .device_id(i)
+                .device_id(0)
+                .leader_pub_url(leader_pub_url.clone())
+                .leader_ack_url(leader_ack_url.clone())
                 .build()?;
 
             let worker = KvbmWorker::new(config, false).await?;
@@ -149,88 +194,37 @@ mod tests {
 
         let host_blocks = KvbmLeaderNumBlocksConfig {
             cache_size_in_gb: 1.0,
-            num_blocks_overriden: NUM_BLOCKS,
+            num_blocks_overriden: num_host_blocks,
         };
 
         let disk_blocks = KvbmLeaderNumBlocksConfig {
             cache_size_in_gb: 1.0,
-            num_blocks_overriden: NUM_BLOCKS,
+            num_blocks_overriden: num_disk_blocks,
         };
 
         let leader_config = KvbmLeaderConfig::builder()
             .world_size(num_workers)
             .host_blocks_config(host_blocks)
             .disk_blocks_config(disk_blocks)
+            .leader_pub_url(leader_pub_url)
+            .leader_ack_url(leader_ack_url)
             .build()?;
 
         // When/if this returns, we know that all the workers were also successful.
         let leader = KvbmLeader::new(leader_config).await?;
+        anyhow::ensure!(
+            leader.wait_worker_sync_ready().await,
+            "timed out waiting for leader/worker ZMQ handshake readiness"
+        );
 
         Ok((leader, workers))
     }
 
-    #[tokio::test]
-    #[rstest]
-    #[case(1)]
-    #[case(2)]
-    #[case(4)]
-    #[case(8)]
-    async fn test_leader_worker_sync_and_transfer(#[case] num_workers: usize) -> Result<()> {
-        init_logging();
-
-        let (leader, _workers) = build_leader_and_workers(num_workers).await?;
-
-        // Do a whole bunch of distributed transfers.
-
-        for block_idx in 0..NUM_BLOCKS {
-            leader
-                .transfer_blocks_request(utils::BlockTransferRequest::new(
-                    utils::BlockTransferPool::Device,
-                    utils::BlockTransferPool::Host,
-                    vec![(block_idx, block_idx)],
-                ))
-                .await?
-                .await?;
-        }
-
-        for block_idx in 0..NUM_BLOCKS {
-            leader
-                .transfer_blocks_request(utils::BlockTransferRequest::new(
-                    utils::BlockTransferPool::Host,
-                    utils::BlockTransferPool::Disk,
-                    vec![(block_idx, block_idx)],
-                ))
-                .await?
-                .await?;
-        }
-
-        for block_idx in 0..NUM_BLOCKS {
-            leader
-                .transfer_blocks_request(utils::BlockTransferRequest::new(
-                    utils::BlockTransferPool::Disk,
-                    utils::BlockTransferPool::Device,
-                    vec![(block_idx, block_idx)],
-                ))
-                .await?
-                .await?;
-        }
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[rstest]
-    #[case(1)]
-    #[case(2)]
-    #[case(4)]
-    #[case(8)]
-    async fn test_leader_worker_transfer_e2e(#[case] num_workers: usize) -> Result<()> {
-        init_logging();
-
-        const BLOCK_SIZE: usize = 4;
-
-        let (leader, _workers) = build_leader_and_workers(num_workers).await?;
-
+    async fn build_test_block_manager(
+        leader: Arc<KvbmLeader>,
+        num_blocks: usize,
+        block_size: usize,
+    ) -> Result<KvBlockManager<Logical<DistributedLeaderWorkerResources>, BasicMetadata>> {
         let cancel_token = CancellationToken::new();
 
         let config = KvBlockManagerConfig::builder()
@@ -242,55 +236,122 @@ mod tests {
             )
             .model(
                 KvManagerModelConfig::builder()
-                    .num_layers(1)
-                    .outer_dim(1)
-                    .page_size(BLOCK_SIZE)
-                    .inner_dim(1)
+                    .num_layers(TEST_NUM_LAYERS)
+                    .outer_dim(TEST_OUTER_DIM)
+                    .page_size(block_size)
+                    .inner_dim(TEST_INNER_DIM)
                     .build()?,
             )
             .device_layout(
                 KvManagerLayoutConfig::builder()
-                    .num_blocks(NUM_BLOCKS)
+                    .num_blocks(num_blocks)
                     .logical(Some(BlockParallelismStrategy::LeaderWorkerSharded))
                     .build()?,
             )
             .host_layout(
                 KvManagerLayoutConfig::builder()
-                    .num_blocks(NUM_BLOCKS)
+                    .num_blocks(num_blocks)
                     .logical(Some(BlockParallelismStrategy::LeaderWorkerSharded))
                     .build()?,
             )
             .disk_layout(
                 KvManagerLayoutConfig::builder()
-                    .num_blocks(NUM_BLOCKS)
+                    .num_blocks(num_blocks)
                     .logical(Some(BlockParallelismStrategy::LeaderWorkerSharded))
                     .build()?,
             )
             .build()?;
 
-        let resources = DistributedLeaderWorkerResources::new(
-            Some(Arc::new(leader)),
-            cancel_token.child_token(),
-        )?;
+        let resources =
+            DistributedLeaderWorkerResources::new(Some(leader), cancel_token.child_token())?;
 
-        let block_manager = KvBlockManager::<
-            Logical<DistributedLeaderWorkerResources>,
-            BasicMetadata,
-        >::new(config, resources)
-        .await
-        .unwrap();
+        Ok(
+            KvBlockManager::<Logical<DistributedLeaderWorkerResources>, BasicMetadata>::new(
+                config, resources,
+            )
+            .await
+            ?,
+        )
+    }
+
+    #[tokio::test]
+    #[rstest]
+    #[serial]
+    #[case(1)]
+    #[case(2)]
+    #[case(4)]
+    #[case(8)]
+    async fn test_leader_worker_sync_and_transfer(#[case] num_workers: usize) -> Result<()> {
+        init_logging();
+
+        let (leader, _workers) = build_leader_and_workers(
+            num_workers,
+            DEFAULT_NUM_BLOCKS,
+            DEFAULT_NUM_BLOCKS,
+            DEFAULT_NUM_BLOCKS,
+            32,
+        )
+        .await?;
+
+        // Do a whole bunch of distributed transfers.
+
+        for block_idx in 0..DEFAULT_NUM_BLOCKS {
+            leader
+                .transfer_blocks_request(utils::BlockTransferRequest::new(
+                    utils::BlockTransferPool::Device,
+                    utils::BlockTransferPool::Host,
+                    vec![(block_idx, block_idx)],
+                ))
+                .await?
+                .await?;
+        }
+
+        for block_idx in 0..DEFAULT_NUM_BLOCKS {
+            leader
+                .transfer_blocks_request(utils::BlockTransferRequest::new(
+                    utils::BlockTransferPool::Host,
+                    utils::BlockTransferPool::Disk,
+                    vec![(block_idx, block_idx)],
+                ))
+                .await?
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[rstest]
+    #[serial]
+    #[case(1, 8, 4, 100)]
+    #[case(2, 8, 4, 100)]
+    #[case(4, 8, 8, 150)]
+    async fn test_leader_worker_transfer_e2e(
+        #[case] num_workers: usize,
+        #[case] num_blocks: usize,
+        #[case] block_size: usize,
+        #[case] wait_ms: u64,
+    ) -> Result<()> {
+        init_logging();
+
+        let (leader, _workers) =
+            build_leader_and_workers(num_workers, num_blocks, num_blocks, num_blocks, block_size)
+                .await?;
+
+        let block_manager =
+            build_test_block_manager(Arc::new(leader), num_blocks, block_size).await?;
 
         let device_pool = block_manager.device().unwrap();
         let host_pool = block_manager.host().unwrap();
         let disk_pool = block_manager.disk().unwrap();
 
-        let mut device_blocks = device_pool.allocate_blocks(NUM_BLOCKS).await?;
+        let mut device_blocks = device_pool.allocate_blocks(num_blocks).await?;
 
         let mut sequence_hashes = Vec::new();
         for block in &mut device_blocks {
             block.init_sequence(42).unwrap();
 
-            for _ in 0..BLOCK_SIZE {
+            for _ in 0..block_size {
                 block.add_token(42).unwrap();
             }
 
@@ -303,28 +364,28 @@ mod tests {
         let immutable_device_blocks = device_pool.register_blocks(device_blocks).await?;
 
         // Wait for the blocks to be offloaded.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
 
         // Now, all blocks should be on the host.
         let host_blocks = host_pool
             .match_sequence_hashes(sequence_hashes.as_slice())
             .await?;
 
-        assert_eq!(host_blocks.len(), NUM_BLOCKS);
+        assert_eq!(host_blocks.len(), num_blocks);
 
         let disk_blocks = disk_pool
             .match_sequence_hashes(sequence_hashes.as_slice())
             .await?;
 
-        assert_eq!(disk_blocks.len(), NUM_BLOCKS);
+        assert_eq!(disk_blocks.len(), num_blocks);
 
         // Return the device blocks to the pool.
         drop(immutable_device_blocks);
 
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
 
         // Clear out the device pool.
-        let _ = device_pool.allocate_blocks(NUM_BLOCKS).await?;
+        let _ = device_pool.allocate_blocks(num_blocks).await?;
 
         // Now, all the blocks should be gone.
         assert_eq!(
@@ -336,12 +397,151 @@ mod tests {
         );
 
         // Wait for the device blocks to be returned to the pool.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
 
         // Now, onboard them back to the device.
         let new_device_blocks = block_manager.onboard_blocks(host_blocks, None).await??;
 
-        assert_eq!(new_device_blocks.len(), NUM_BLOCKS);
+        assert_eq!(new_device_blocks.len(), num_blocks);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[rstest]
+    #[serial]
+    #[case(1, 8, 4, 150)]
+    #[case(2, 8, 4, 150)]
+    #[case(4, 8, 8, 200)]
+    async fn test_leader_worker_disk_onboard_e2e(
+        #[case] num_workers: usize,
+        #[case] num_blocks: usize,
+        #[case] block_size: usize,
+        #[case] wait_ms: u64,
+    ) -> Result<()> {
+        init_logging();
+
+        let (leader, _workers) =
+            build_leader_and_workers(num_workers, num_blocks, num_blocks, num_blocks, block_size)
+                .await?;
+        let block_manager =
+            build_test_block_manager(Arc::new(leader), num_blocks, block_size).await?;
+
+        let device_pool = block_manager.device().unwrap();
+        let host_pool = block_manager.host().unwrap();
+        let disk_pool = block_manager.disk().unwrap();
+
+        let mut device_blocks = device_pool.allocate_blocks(num_blocks).await?;
+        let mut sequence_hashes = Vec::new();
+
+        for (idx, block) in device_blocks.iter_mut().enumerate() {
+            block.init_sequence(100 + idx as u64).unwrap();
+            for token in 0..block_size {
+                block.add_token((idx * block_size + token) as u32).unwrap();
+            }
+            let metadata = block.metadata().update_priority((idx as u32) + 1);
+            block.update_metadata(metadata);
+            block.commit().unwrap();
+            sequence_hashes.push(block.sequence_hash().unwrap());
+        }
+
+        let immutable_device_blocks = device_pool.register_blocks(device_blocks).await?;
+
+        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+
+        let host_blocks = host_pool
+            .match_sequence_hashes(sequence_hashes.as_slice())
+            .await?;
+        assert_eq!(host_blocks.len(), num_blocks);
+
+        let disk_blocks = disk_pool
+            .match_sequence_hashes(sequence_hashes.as_slice())
+            .await?;
+        assert_eq!(disk_blocks.len(), num_blocks);
+
+        for (expected_idx, disk_block) in disk_blocks.iter().enumerate() {
+            assert_eq!(disk_block.metadata().priority(), (expected_idx as u32) + 1);
+        }
+
+        drop(immutable_device_blocks);
+        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+        let _ = device_pool.allocate_blocks(num_blocks).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+
+        let onboarded_from_disk = block_manager.onboard_blocks(disk_blocks, None).await??;
+        assert_eq!(onboarded_from_disk.len(), num_blocks);
+        for (expected_idx, device_block) in onboarded_from_disk.iter().enumerate() {
+            assert_eq!(
+                device_block.metadata().priority(),
+                (expected_idx as u32) + 1
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[rstest]
+    #[serial]
+    #[case(1, 8, 4, 4, 8, 150)]
+    #[case(2, 8, 4, 6, 8, 150)]
+    async fn test_leader_worker_transfer_rejects_when_host_capacity_too_small(
+        #[case] num_workers: usize,
+        #[case] num_blocks: usize,
+        #[case] block_size: usize,
+        #[case] num_host_blocks: usize,
+        #[case] num_disk_blocks: usize,
+        #[case] wait_ms: u64,
+    ) -> Result<()> {
+        init_logging();
+
+        let (leader, _workers) = build_leader_and_workers(
+            num_workers,
+            num_blocks,
+            num_host_blocks,
+            num_disk_blocks,
+            block_size,
+        )
+        .await?;
+        let block_manager =
+            build_test_block_manager(Arc::new(leader), num_blocks, block_size).await?;
+
+        let device_pool = block_manager.device().unwrap();
+        let host_pool = block_manager.host().unwrap();
+        let disk_pool = block_manager.disk().unwrap();
+
+        let mut device_blocks = device_pool.allocate_blocks(num_blocks).await?;
+        let mut sequence_hashes = Vec::new();
+
+        for (idx, block) in device_blocks.iter_mut().enumerate() {
+            block.init_sequence(7 + idx as u64).unwrap();
+            for token in 0..block_size {
+                block.add_token((idx * block_size + token) as u32).unwrap();
+            }
+            block.commit().unwrap();
+            sequence_hashes.push(block.sequence_hash().unwrap());
+        }
+
+        let _immutable_device_blocks = device_pool.register_blocks(device_blocks).await?;
+
+        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+
+        let host_blocks = host_pool
+            .match_sequence_hashes(sequence_hashes.as_slice())
+            .await?;
+        let disk_blocks = disk_pool
+            .match_sequence_hashes(sequence_hashes.as_slice())
+            .await?;
+
+        assert!(
+            host_blocks.len() < num_blocks,
+            "host pool unexpectedly retained all blocks despite constrained capacity"
+        );
+        assert_eq!(
+            disk_blocks.len(),
+            0,
+            "disk persistence should not occur when host admission fails on the G1->G2->G3 path"
+        );
 
         Ok(())
     }

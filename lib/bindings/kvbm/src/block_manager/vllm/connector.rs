@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use dynamo_llm::block_manager::distributed::vllm as llm_vllm;
-use dynamo_llm::block_manager::{block::BlockId, connector::protocol::WorkerTransferRequest};
+use dynamo_llm::block_manager::{
+    block::BlockId,
+    connector::protocol::{SlotKey, WorkerTransferRequest},
+};
 
 pub mod leader;
 pub mod trtllm_leader;
@@ -148,7 +151,7 @@ impl std::fmt::Debug for CachedRequestData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewSlotInfo {
     /// The request ID for the new slot.
-    pub request_id: String,
+    pub key: SlotKey,
     /// Expected number of immediate (onboard) operations for this slot.
     /// This enables proper completion tracking and avoids race conditions in TP>1.
     pub expected_immediate_ops: u64,
@@ -176,14 +179,25 @@ impl ConnectorMetadata {
     }
 
     /// Create a slot with the expected number of immediate operations.
-    pub fn create_slot(&mut self, request_id: String, expected_immediate_ops: u64) {
+    pub fn create_slot_with_key(&mut self, key: SlotKey, expected_immediate_ops: u64) {
         self.new_slots.push(NewSlotInfo {
-            request_id,
+            key,
             expected_immediate_ops,
         });
     }
 
     pub fn add_operations(&mut self, xfer_reqs: Vec<WorkerTransferRequest>) {
+        self.operations.extend(xfer_reqs);
+    }
+
+    pub fn add_operations_for_key(
+        &mut self,
+        key: &SlotKey,
+        mut xfer_reqs: Vec<WorkerTransferRequest>,
+    ) {
+        for req in &mut xfer_reqs {
+            req.key = key.clone();
+        }
         self.operations.extend(xfer_reqs);
     }
 }

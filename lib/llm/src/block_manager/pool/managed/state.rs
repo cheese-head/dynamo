@@ -171,6 +171,7 @@ impl<S: Storage, L: LocalityProvider + 'static, M: BlockMetadata> State<S, L, M>
 
         let expected_len = blocks.len();
         let mut immutable_blocks = Vec::new();
+        let mut offload_blocks = Vec::new();
 
         // raii object that will collect all the publish handles and publish them when the object is dropped
         let mut publish_handles = self.publisher();
@@ -256,14 +257,22 @@ impl<S: Storage, L: LocalityProvider + 'static, M: BlockMetadata> State<S, L, M>
                 }
             }
 
-            if offload && let Some(priority) = immutable.metadata().offload_priority() {
-                immutable.enqueue_offload(priority).await.unwrap();
+            if offload && immutable.metadata().offload_priority().is_some() {
+                offload_blocks.push(immutable.clone());
             }
 
             immutable_blocks.push(immutable);
         }
 
         assert_eq!(immutable_blocks.len(), expected_len);
+
+        if !offload_blocks.is_empty() {
+            if let Some(manager) = offload_blocks.first().and_then(|block| block.manager()).cloned() {
+                manager.enqueue_offload_blocks(&offload_blocks).await?;
+            } else {
+                tracing::warn!("Block is not managed. Unable to enqueue batched offload.");
+            }
+        }
 
         Ok(immutable_blocks)
     }

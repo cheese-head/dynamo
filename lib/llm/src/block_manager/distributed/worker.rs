@@ -108,6 +108,23 @@ pub fn load_and_validate_tensors(
 fn build_agent(worker_id: usize, use_gds: bool) -> anyhow::Result<NixlAgent> {
     let agent = NixlAgent::new(&format!("kvbm-worker-{}", worker_id))?;
 
+    // Add UCX backend for local CUDA/pinned-memory transfers when available.
+    match agent.get_plugin_params("UCX") {
+        Ok((_, ucx_params)) => {
+            match agent.create_backend("UCX", &ucx_params) {
+                Ok(_) => {
+                    tracing::info!(worker_id = worker_id, "Created UCX backend for local transfers");
+                }
+                Err(e) => {
+                    tracing::warn!(worker_id = worker_id, error = %e, "UCX backend unavailable, continuing without it");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(worker_id = worker_id, error = %e, "UCX plugin not available");
+        }
+    }
+
     // Add GDS_MT backend if requested (for GPU Direct Storage)
     if use_gds {
         match agent.get_plugin_params("GDS_MT") {
@@ -323,7 +340,10 @@ async fn perform_allocation_and_build_handler(
     // - For local disk cache (G3): enabled if disk blocks are configured
     // - For remote disk storage (G4): enabled if DYN_KVBM_REMOTE_DISK_PATH(S) is set
     //   and DYN_KVBM_REMOTE_DISK_USE_GDS is true (default: true)
-    let use_gds_for_local_disk = leader_meta.num_disk_blocks > 0;
+    let use_gds_for_local_disk = leader_meta.num_disk_blocks > 0
+        && std::env::var("DYN_KVBM_LOCAL_DISK_USE_GDS")
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(true);
     let has_remote_disk = std::env::var("DYN_KVBM_REMOTE_DISK_PATH")
         .or_else(|_| std::env::var("DYN_KVBM_REMOTE_DISK_PATHS"))
         .is_ok();

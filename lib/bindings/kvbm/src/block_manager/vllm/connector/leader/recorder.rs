@@ -3,6 +3,7 @@
 
 use super::*;
 use anyhow;
+use dynamo_llm::block_manager::connector::protocol::SlotKey;
 use dynamo_llm::block_manager::kv_consolidator::EventSource;
 use dynamo_llm::block_manager::metrics_kvbm::{KvbmMetrics, KvbmMetricsRegistry};
 use dynamo_llm::recorder::Recorder;
@@ -222,7 +223,7 @@ impl KvConnectorLeaderRecorder {
 
 impl Leader for KvConnectorLeaderRecorder {
     #[inline]
-    fn slot_manager(&self) -> &ConnectorSlotManager<String> {
+    fn slot_manager(&self) -> &ConnectorSlotManager<SlotKey> {
         self.connector_leader.slot_manager()
     }
     /// Match the tokens in the request with the available block pools.

@@ -6,7 +6,7 @@ set -euo pipefail
 
 echo "=== Rebuilding KVBM wheel from workspace source ==="
 cd /workspace/lib/bindings/kvbm
-maturin build --profile dev --out /workspace/dist
+maturin build --profile release --out /workspace/dist
 uv pip install --upgrade --force-reinstall --no-deps /workspace/dist/*.whl
 echo "=== KVBM wheel rebuilt and installed ==="
 

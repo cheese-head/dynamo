@@ -1,12 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::block_manager::connector::protocol::{RequestType, TransferType, WorkerTransferRequest};
+use crate::block_manager::connector::protocol::{
+    RequestType, SlotKey, TransferType, WorkerTransferRequest,
+};
 use crate::tokens::TokenBlock;
 
 /// Parameters for G4 onboard operation.
 #[derive(Debug, Clone)]
 pub struct G4OnboardParams {
+    pub key: SlotKey,
     pub request_id: String,
     pub sequence_hashes: Vec<u64>,
     pub device_block_ids: Vec<usize>,
@@ -17,7 +20,7 @@ pub struct G4OnboardParams {
 
 /// Prepare G4 onboard operation.
 pub fn onboard_from_g4(
-    request_id: String,
+    key: SlotKey,
     sequence_hashes: Vec<u64>,
     device_block_ids: Vec<usize>,
     block_size: usize,
@@ -28,7 +31,7 @@ pub fn onboard_from_g4(
 
     tracing::debug!(
         target: "kvbm-g4",
-        request_id = %request_id,
+        request_id = %key.request_id,
         operation_id = %operation_id,
         num_blocks = num_blocks,
         "preparing onboard for {} blocks",
@@ -36,7 +39,8 @@ pub fn onboard_from_g4(
     );
 
     let params = G4OnboardParams {
-        request_id: request_id.clone(),
+        request_id: key.request_id.clone(),
+        key: key.clone(),
         sequence_hashes,
         device_block_ids: device_block_ids.clone(),
         operation_id,
@@ -45,7 +49,7 @@ pub fn onboard_from_g4(
     };
 
     let worker_req = WorkerTransferRequest {
-        request_id,
+        key,
         uuid: operation_id,
         transfer_type: TransferType::Load,
         request_type: RequestType::Immediate,

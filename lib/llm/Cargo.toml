@@ -127,7 +127,7 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower-http = { workspace = true }
 rustls = { version = "0.23" }
 utoipa = { version = "5.3", features = ["axum_extras"] }
-utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
+utoipa-swagger-ui = { version = "9.0", features = ["axum", "vendored"] }
 
 
 # grpc-service
@@ -185,6 +185,7 @@ insta = { version = "1.41", features = [
   "redactions",
   "filters",
 ] }
+serde_yaml = "0.9"
 
 lazy_static = "1.4"
 mockito = "1.7.0"

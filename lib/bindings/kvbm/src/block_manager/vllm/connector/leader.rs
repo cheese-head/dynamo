@@ -9,9 +9,10 @@ use anyhow;
 use dynamo_llm::block_manager::config::{
     cpu_cache_lookup_dirty, cpu_cache_lookup_disabled, set_cpu_cache_lookup_disabled,
 };
+use dynamo_llm::block_manager::connector::protocol::SlotKey;
 use dynamo_llm::block_manager::distributed::vllm::{
-    ConnectorSlotManager, KvConnectorLeaderCore, SlotManager, create_distributed_registry_client,
-    is_dev_mode, kvbm_metrics_endpoint_enabled, parse_kvbm_metrics_port,
+    ConnectorSlotManager, KvConnectorLeaderCore, create_distributed_registry_client, is_dev_mode,
+    kvbm_metrics_endpoint_enabled, parse_kvbm_metrics_port,
 };
 use dynamo_llm::block_manager::kv_consolidator::EventSource;
 use dynamo_llm::block_manager::metrics_kvbm::{KvbmMetrics, KvbmMetricsRegistry};
@@ -60,7 +61,7 @@ pub trait Leader: Send + Sync + std::fmt::Debug {
         traceparent: String,
     ) -> anyhow::Result<()>;
 
-    fn slot_manager(&self) -> &ConnectorSlotManager<String>;
+    fn slot_manager(&self) -> &ConnectorSlotManager<SlotKey>;
 
     fn clear_pool(&mut self, pool: String) -> anyhow::Result<()>;
 }
@@ -72,7 +73,7 @@ pub struct KvConnectorLeader {
 
 impl KvConnectorLeader {
     pub(crate) fn from_parts(
-        slot_manager: Arc<OnceLock<ConnectorSlotManager<String>>>,
+        slot_manager: Arc<OnceLock<ConnectorSlotManager<SlotKey>>>,
         page_size: usize,
         kvbm_metrics: KvbmMetrics,
     ) -> Self {
@@ -182,7 +183,7 @@ impl KvConnectorLeader {
 
 impl Leader for KvConnectorLeader {
     #[inline]
-    fn slot_manager(&self) -> &ConnectorSlotManager<String> {
+    fn slot_manager(&self) -> &ConnectorSlotManager<SlotKey> {
         self.core.slot_manager()
     }
 

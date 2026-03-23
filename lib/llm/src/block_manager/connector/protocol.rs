@@ -62,6 +62,27 @@ pub type LayerName = String;
 pub type LayerIndex = u32;
 pub type Iteration = u64;
 
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub struct SlotKey {
+    pub request_id: String,
+    pub generation: u64,
+}
+
+impl SlotKey {
+    pub fn new(request_id: String, generation: u64) -> Self {
+        Self {
+            request_id,
+            generation,
+        }
+    }
+}
+
+impl std::fmt::Display for SlotKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.request_id, self.generation)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RequestType {
     /// If Scheduled, then the [`super::scheduler::TransferSchedulerClient`] will commuicate with the scheudler
@@ -93,7 +114,7 @@ pub enum SchedulerRequirement {
 /// Issued by the leader, received by the TransferEngine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaderTransferRequest {
-    pub request_id: String,
+    pub key: SlotKey,
     pub uuid: uuid::Uuid,
     pub requirement: Option<SchedulerRequirement>,
     pub request_type: RequestType,
@@ -150,7 +171,7 @@ impl ScheduledTaskHandle {
 /// Scheduler requirements are only provided by the leader initiated transfer request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerTransferRequest {
-    pub request_id: String,
+    pub key: SlotKey,
     pub uuid: uuid::Uuid,
     pub transfer_type: TransferType,
     pub request_type: RequestType,
@@ -166,7 +187,7 @@ pub struct WorkerTransferRequest {
 ///
 /// This object has all the links to the worker to track completion and observe any cancellation signals.
 pub struct WorkerSchedulerRequest {
-    pub request_id: String,
+    pub key: SlotKey,
     pub uuid: uuid::Uuid,
     pub transfer_type: TransferType,
     pub cancel_token: CancellationToken,
@@ -229,7 +250,7 @@ impl Drop for ScheduledTransferCompletionHandle {
 }
 
 pub struct ImmediateTransferResult {
-    pub request_id: String,
+    pub key: SlotKey,
     pub uuid: uuid::Uuid,
     pub status: anyhow::Result<()>,
     /// If true, this result is from a chained operation (e.g., H2O after D2H).
@@ -238,7 +259,7 @@ pub struct ImmediateTransferResult {
 }
 
 pub struct ImmediateTransferCompletionHandle {
-    request_id: String,
+    key: SlotKey,
     uuid: uuid::Uuid,
     chained: bool,
     completion_tx: Mutex<Option<tokio::sync::mpsc::Sender<TransferToSchedulerMessage>>>,
@@ -246,13 +267,13 @@ pub struct ImmediateTransferCompletionHandle {
 
 impl ImmediateTransferCompletionHandle {
     pub(crate) fn new(
-        request_id: String,
+        key: SlotKey,
         uuid: uuid::Uuid,
         chained: bool,
         completion_tx: tokio::sync::mpsc::Sender<TransferToSchedulerMessage>,
     ) -> Self {
         Self {
-            request_id,
+            key,
             uuid,
             chained,
             completion_tx: Mutex::new(Some(completion_tx)),
@@ -276,7 +297,7 @@ impl TransferCompletionHandle for ImmediateTransferCompletionHandle {
             && completion_tx
                 .send(TransferToSchedulerMessage::ImmediateResult(
                     ImmediateTransferResult {
-                        request_id: self.request_id.clone(),
+                        key: self.key.clone(),
                         uuid: self.uuid,
                         status: result,
                         chained: self.chained,

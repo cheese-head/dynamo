@@ -106,7 +106,7 @@ impl LogicalResources for DistributedLeaderWorkerResources {
                 "DistributedLeaderWorkerResources::handle_transfer called with both sources and targets empty, skipping transfer"
             );
             let (tx, rx) = oneshot::channel();
-            tx.send(()).unwrap();
+            let _ = tx.send(());
             return Ok(rx);
         }
 
@@ -128,7 +128,9 @@ impl LogicalResources for DistributedLeaderWorkerResources {
             );
 
             let (tx, rx) = oneshot::channel();
-            transfer_tx.send((request, tx)).unwrap();
+            transfer_tx
+                .send((request, tx))
+                .map_err(|_| TransferError::Other(anyhow::anyhow!("leader transfer worker is unavailable")))?;
 
             Ok(rx)
         } else {

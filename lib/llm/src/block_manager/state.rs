@@ -20,6 +20,7 @@ use super::{
         OffloadFilters, OffloadManager, OffloadManagerConfig, filter::OffloadFilter,
         request::BlockResult,
     },
+    pool::BlockPoolError,
 };
 use derive_getters::Dissolve;
 use std::sync::Arc;
@@ -84,6 +85,13 @@ impl<Locality: LocalityProvider, Metadata: BlockMetadata> KvBlockManagerState<Lo
         self.offload_manager.offload(block, priority).await?;
 
         Ok(())
+    }
+
+    pub(crate) async fn enqueue_offload_blocks<S: Storage + 'static>(
+        &self,
+        blocks: &[ImmutableBlock<S, Locality, Metadata>],
+    ) -> core::result::Result<(), BlockPoolError> {
+        self.offload_manager.offload_blocks(blocks).await
     }
 
     pub fn onboard_blocks<S: Storage + 'static>(

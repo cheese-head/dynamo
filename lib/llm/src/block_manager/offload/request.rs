@@ -41,6 +41,7 @@ pub struct OffloadRequest<S: Storage, L: LocalityProvider, M: BlockMetadata> {
     pub key: OffloadRequestKey,
     pub block: Weak<MutableBlock<S, L, M>>,
     pub sequence_hash: u64,
+    pub cohort_id: Option<u64>,
 }
 
 impl<S: Storage, L: LocalityProvider, M: BlockMetadata> PartialOrd for OffloadRequest<S, L, M> {
