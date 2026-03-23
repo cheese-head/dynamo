@@ -1047,55 +1047,64 @@ def run_scenario(
                     time.sleep(5)
                     ensure_clear_cpu_pool(mgmt_url)
         else:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
-                future_meta = {}
-                for i in range(n):
-                    variant = i % variant_count
-                    fut = pool.submit(
-                        send_request,
-                        url,
-                        model,
-                        all_messages[variant],
-                        max_tokens,
-                        seed,
-                        stream,
-                        ttft_mode,
-                    )
-                    future_meta[fut] = variant
-                for i, fut in enumerate(concurrent.futures.as_completed(future_meta)):
-                    r = fut.result()
-                    if r["error"]:
-                        errors += 1
-                        print(
-                            f"    [{name}] ISL={fmt_isl(isl)} req {i+1}/{n}: ERROR {r['error']} trace_id={r.get('trace_id')}",
-                            file=sys.stderr,
+            req_counter = 0
+            for batch_start in range(0, n, concurrency):
+                batch_size = min(concurrency, n - batch_start)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+                    future_meta = {}
+                    for j in range(batch_size):
+                        i = batch_start + j
+                        variant = i % variant_count
+                        fut = pool.submit(
+                            send_request,
+                            url,
+                            model,
+                            all_messages[variant],
+                            max_tokens,
+                            seed,
+                            stream,
+                            ttft_mode,
                         )
-                    else:
-                        ttfts.append(r["ttft"])
-                        print(
-                            f"    [{name}] ISL={fmt_isl(isl)} req {i+1}/{n}: TTFT={fmt_time(r['ttft'])} trace_id={r.get('trace_id')} prompt=v{future_meta[fut]}"
-                        )
-                        determinism.record(
-                            name,
-                            isl,
-                            r["completion"],
-                            prompt_key=f"v{future_meta[fut]}",
-                            reasoning=r.get("reasoning"),
-                            traceparent=r.get("traceparent"),
-                            trace_id=r.get("trace_id"),
-                            response_id=r.get("response_id"),
-                            finish_reason=r.get("finish_reason"),
-                            stop_reason=r.get("stop_reason"),
-                            tool_calls=r.get("tool_calls"),
-                            refusal=r.get("refusal"),
-                            has_reasoning=bool(r.get("reasoning")),
-                            first_event_ttft=r.get("first_event_ttft"),
-                            first_reasoning_ttft=r.get("first_reasoning_ttft"),
-                            first_content_ttft=r.get("first_content_ttft"),
-                            prompt_tokens=r.get("prompt_tokens"),
-                            completion_tokens=r.get("completion_tokens"),
-                            seed=r.get("seed"),
-                        )
+                        future_meta[fut] = (i, variant)
+                    for fut in concurrent.futures.as_completed(future_meta):
+                        i, variant = future_meta[fut]
+                        req_counter += 1
+                        r = fut.result()
+                        if r["error"]:
+                            errors += 1
+                            print(
+                                f"    [{name}] ISL={fmt_isl(isl)} req {req_counter}/{n}: ERROR {r['error']} trace_id={r.get('trace_id')}",
+                                file=sys.stderr,
+                            )
+                        else:
+                            ttfts.append(r["ttft"])
+                            print(
+                                f"    [{name}] ISL={fmt_isl(isl)} req {req_counter}/{n}: TTFT={fmt_time(r['ttft'])} trace_id={r.get('trace_id')} prompt=v{variant}"
+                            )
+                            determinism.record(
+                                name,
+                                isl,
+                                r["completion"],
+                                prompt_key=f"v{variant}",
+                                reasoning=r.get("reasoning"),
+                                traceparent=r.get("traceparent"),
+                                trace_id=r.get("trace_id"),
+                                response_id=r.get("response_id"),
+                                finish_reason=r.get("finish_reason"),
+                                stop_reason=r.get("stop_reason"),
+                                tool_calls=r.get("tool_calls"),
+                                refusal=r.get("refusal"),
+                                has_reasoning=bool(r.get("reasoning")),
+                                first_event_ttft=r.get("first_event_ttft"),
+                                first_reasoning_ttft=r.get("first_reasoning_ttft"),
+                                first_content_ttft=r.get("first_content_ttft"),
+                                prompt_tokens=r.get("prompt_tokens"),
+                                completion_tokens=r.get("completion_tokens"),
+                                seed=r.get("seed"),
+                            )
+                if clear_between and not skip_cpu_flush and mgmt_url:
+                    time.sleep(5)
+                    ensure_clear_cpu_pool(mgmt_url)
 
         determinism.check_isl(name, isl)
 
