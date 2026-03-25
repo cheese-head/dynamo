@@ -70,8 +70,48 @@ use derive_builder::Builder;
 use derive_getters::Getters;
 use dynamo_runtime::utils::task::CriticalTaskExecutionHandle;
 
-pub const MAX_CONCURRENT_TRANSFERS: usize = 4;
-pub const MAX_TRANSFER_BATCH_SIZE: usize = 16;
+const DEFAULT_MAX_CONCURRENT_TRANSFERS: usize = 4;
+const DEFAULT_MAX_TRANSFER_BATCH_SIZE: usize = 16;
+
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+static MAX_CONCURRENT_TRANSFERS_ATOMIC: AtomicUsize =
+    AtomicUsize::new(DEFAULT_MAX_CONCURRENT_TRANSFERS);
+static MAX_TRANSFER_BATCH_SIZE_ATOMIC: AtomicUsize =
+    AtomicUsize::new(DEFAULT_MAX_TRANSFER_BATCH_SIZE);
+
+static OFFLOAD_INIT: once_cell::sync::Lazy<()> = once_cell::sync::Lazy::new(|| {
+    if let Some(v) = std::env::var("DYN_KVBM_MAX_CONCURRENT_TRANSFERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        MAX_CONCURRENT_TRANSFERS_ATOMIC.store(v, AtomicOrdering::Relaxed);
+    }
+    if let Some(v) = std::env::var("DYN_KVBM_TRANSFER_BATCH_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        MAX_TRANSFER_BATCH_SIZE_ATOMIC.store(v, AtomicOrdering::Relaxed);
+    }
+});
+
+pub fn max_concurrent_transfers() -> usize {
+    once_cell::sync::Lazy::force(&OFFLOAD_INIT);
+    MAX_CONCURRENT_TRANSFERS_ATOMIC.load(AtomicOrdering::Relaxed)
+}
+
+pub fn max_transfer_batch_size() -> usize {
+    once_cell::sync::Lazy::force(&OFFLOAD_INIT);
+    MAX_TRANSFER_BATCH_SIZE_ATOMIC.load(AtomicOrdering::Relaxed)
+}
+
+pub fn set_max_concurrent_transfers(val: usize) {
+    MAX_CONCURRENT_TRANSFERS_ATOMIC.store(val, AtomicOrdering::Relaxed);
+}
+
+pub fn set_max_transfer_batch_size(val: usize) {
+    MAX_TRANSFER_BATCH_SIZE_ATOMIC.store(val, AtomicOrdering::Relaxed);
+}
 
 /// Configuration for creating an OffloadManager
 pub struct OffloadManagerConfig {
@@ -83,6 +123,9 @@ pub struct OffloadManagerConfig {
     pub kvbm_metrics: Option<crate::block_manager::metrics_kvbm::KvbmMetrics>,
     /// If true, offload directly from device (G1) to disk (G3), bypassing host (G2)
     pub bypass_cpu_mem: bool,
+    /// CUDA device ordinal for this worker. Streams and memory pools are created
+    /// on this device so that D2H / H2D transfers use the correct GPU.
+    pub device_id: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -170,12 +213,12 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
             bypass_cpu_mem: config.bypass_cpu_mem,
         });
 
-        let cuda_ctx = Cuda::device_or_create(0)?;
+        let cuda_ctx = Cuda::device_or_create(config.device_id)?;
 
         let pool_config = PoolConfig {
             enable_pool: true,
-            max_concurrent_transfers: MAX_CONCURRENT_TRANSFERS,
-            max_transfer_batch_size: MAX_TRANSFER_BATCH_SIZE,
+            max_concurrent_transfers: max_concurrent_transfers(),
+            max_transfer_batch_size: max_transfer_batch_size(),
             num_outer_components: config.model_config.outer_dim,
             num_layers: config.model_config.num_layers,
         };
@@ -206,11 +249,11 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
             Arc::new(TransferBatcher::new(
                 LocalTransferManager::new(
                     device_offload_transfer_ctx,
-                    MAX_CONCURRENT_TRANSFERS,
+                    max_concurrent_transfers(),
                     &config.async_rt_handle,
                     config.cancellation_token.clone(),
                 )?,
-                MAX_TRANSFER_BATCH_SIZE,
+                max_transfer_batch_size(),
                 &config.async_rt_handle,
                 config.cancellation_token.clone(),
             )),
@@ -255,11 +298,11 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
             Arc::new(TransferBatcher::new(
                 LocalTransferManager::new(
                     transfer_ctx.clone(),
-                    MAX_CONCURRENT_TRANSFERS,
+                    max_concurrent_transfers(),
                     &config.async_rt_handle,
                     config.cancellation_token.clone(),
                 )?,
-                MAX_TRANSFER_BATCH_SIZE,
+                max_transfer_batch_size(),
                 &config.async_rt_handle,
                 config.cancellation_token.clone(),
             )),
@@ -289,11 +332,11 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
             Arc::new(TransferBatcher::new(
                 LocalTransferManager::new(
                     transfer_ctx.clone(),
-                    MAX_CONCURRENT_TRANSFERS,
+                    max_concurrent_transfers(),
                     &config.async_rt_handle,
                     config.cancellation_token.clone(),
                 )?,
-                MAX_TRANSFER_BATCH_SIZE,
+                max_transfer_batch_size(),
                 &config.async_rt_handle,
                 config.cancellation_token.clone(),
             )),
@@ -315,11 +358,11 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
             Arc::new(TransferBatcher::new(
                 LocalTransferManager::new(
                     transfer_ctx.clone(),
-                    MAX_CONCURRENT_TRANSFERS,
+                    max_concurrent_transfers(),
                     &config.async_rt_handle,
                     config.cancellation_token.clone(),
                 )?,
-                MAX_TRANSFER_BATCH_SIZE,
+                max_transfer_batch_size(),
                 &config.async_rt_handle,
                 config.cancellation_token.clone(),
             )),
@@ -346,11 +389,11 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
                 Arc::new(TransferBatcher::new(
                     LocalTransferManager::new(
                         transfer_ctx.clone(),
-                        MAX_CONCURRENT_TRANSFERS,
+                        max_concurrent_transfers(),
                         &config.async_rt_handle,
                         config.cancellation_token.clone(),
                     )?,
-                    MAX_TRANSFER_BATCH_SIZE,
+                    max_transfer_batch_size(),
                     &config.async_rt_handle,
                     config.cancellation_token.clone(),
                 )),
@@ -1108,6 +1151,7 @@ mod tests {
             model_config: minimal_config,
             kvbm_metrics: None,
             bypass_cpu_mem,
+            device_id: 0,
         };
 
         let manager = OffloadManager::new(
@@ -1812,10 +1856,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_transfer_batcher() -> Result<()> {
+        let batch_size = max_transfer_batch_size();
         let (offload_manager, device_pool, _, disk_pool) = build_pools(
-            2 * MAX_TRANSFER_BATCH_SIZE + 1,
+            2 * batch_size + 1,
             None,
-            Some(2 * MAX_TRANSFER_BATCH_SIZE + 1),
+            Some(2 * batch_size + 1),
             None,
         )?;
 
@@ -1824,7 +1869,7 @@ mod tests {
 
         let mut disk_blocks = Vec::new();
 
-        for i in 0..2 * MAX_TRANSFER_BATCH_SIZE + 1 {
+        for i in 0..2 * batch_size + 1 {
             let disk_block = completed_block(disk_pool, [i as u32; 4]).await?;
             populate_block(&disk_block, i as u8)?;
             disk_blocks.push(disk_block);
@@ -1835,7 +1880,7 @@ mod tests {
         let device_blocks = offload_manager
             .onboard(immutable_disk_blocks.clone(), None)
             .await??;
-        assert_eq!(device_blocks.len(), 2 * MAX_TRANSFER_BATCH_SIZE + 1);
+        assert_eq!(device_blocks.len(), 2 * batch_size + 1);
 
         for (i, device_block) in device_blocks.iter().enumerate() {
             let blocks = device_pool

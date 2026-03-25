@@ -332,10 +332,19 @@ impl Default for PinnedAllocator {
 }
 
 impl PinnedAllocator {
-    /// Create a new pinned allocator
+    /// Create a new pinned allocator (defaults to device 0).
     pub fn new() -> Result<Self, StorageError> {
         Ok(Self {
             ctx: Cuda::device_or_create(0)?,
+        })
+    }
+
+    /// Create a pinned allocator bound to a specific CUDA device.
+    /// This ensures host-pinned memory is registered against the correct GPU,
+    /// which matters for NUMA affinity and DMA performance in multi-GPU setups.
+    pub fn with_device(device_id: usize) -> Result<Self, StorageError> {
+        Ok(Self {
+            ctx: Cuda::device_or_create(device_id)?,
         })
     }
 }

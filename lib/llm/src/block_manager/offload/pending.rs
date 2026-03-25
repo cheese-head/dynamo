@@ -216,7 +216,7 @@ impl<Source: Storage, Target: Storage, Locality: LocalityProvider, Metadata: Blo
 {
     pub fn new(
         transfer_ctx: Arc<TransferContext>,
-        max_concurrent_transfers: usize,
+        _max_concurrent_transfers: usize,
         runtime: &Handle,
         cancellation_token: CancellationToken,
     ) -> Result<Self> {
@@ -235,8 +235,8 @@ impl<Source: Storage, Target: Storage, Locality: LocalityProvider, Metadata: Blo
                         }
 
                         Some(future) = futures_rx.recv() => {
-                            // If we're at max size, block the worker thread on the next() call until we have capacity.
-                            while pending_transfers.len() >= max_concurrent_transfers {
+                            let limit = super::max_concurrent_transfers();
+                            while pending_transfers.len() >= limit {
                                 if let Some(pending_transfer) = pending_transfers.next().await {
                                     completion_manager.handle_complete(pending_transfer).await?;
                                 } else {
@@ -314,7 +314,6 @@ where
     Manager: TransferManager<Source, Target, Locality, Metadata>,
 {
     transfer_manager: Manager,
-    max_transfer_batch_size: usize,
     runtime: Handle,
     cancellation_token: CancellationToken,
     _phantom: PhantomData<(Source, Target, Locality, Metadata)>,
@@ -331,13 +330,12 @@ where
 {
     pub fn new(
         transfer_manager: Manager,
-        max_transfer_batch_size: usize,
+        _max_transfer_batch_size: usize,
         runtime: &Handle,
         cancellation_token: CancellationToken,
     ) -> Self {
         Self {
             transfer_manager,
-            max_transfer_batch_size,
             runtime: runtime.clone(),
             cancellation_token,
             _phantom: PhantomData,
@@ -360,15 +358,14 @@ where
         &self,
         pending_transfer: PendingTransfer<Source, Target, Locality, Metadata>,
     ) -> Result<()> {
-        // If it's smaller than the max batch size, just enqueue it.
-        if pending_transfer.sources.len() < self.max_transfer_batch_size {
+        let batch_size = super::max_transfer_batch_size();
+
+        if pending_transfer.sources.len() < batch_size {
             return self
                 .transfer_manager
                 .enqueue_transfer(pending_transfer)
                 .await;
         }
-
-        // Otherwise, we need to split the transfer into multiple smaller transfers.
 
         let PendingTransfer {
             mut sources,
@@ -381,10 +378,10 @@ where
 
         while !sources.is_empty() {
             let sources = sources
-                .drain(..std::cmp::min(self.max_transfer_batch_size, sources.len()))
+                .drain(..std::cmp::min(batch_size, sources.len()))
                 .collect();
             let targets = targets
-                .drain(..std::cmp::min(self.max_transfer_batch_size, targets.len()))
+                .drain(..std::cmp::min(batch_size, targets.len()))
                 .collect();
 
             // If we have a completion indicator, we need to create a new one for each sub-transfer.

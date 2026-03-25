@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod remote;
-mod transfer;
+pub mod transfer;
 mod utils;
 pub mod vllm;
 mod zmq;

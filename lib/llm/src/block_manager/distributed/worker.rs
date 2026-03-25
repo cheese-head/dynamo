@@ -21,7 +21,7 @@ use crate::block_manager::{
     config::{RemoteStorageConfig, RemoteTransferContext},
     connector::scheduler::TransferSchedulerClient,
     layout::LayoutType,
-    offload::{MAX_CONCURRENT_TRANSFERS, MAX_TRANSFER_BATCH_SIZE},
+    offload::{max_concurrent_transfers, max_transfer_batch_size},
     storage::{DeviceAllocator, DeviceStorage, DiskAllocator, PinnedAllocator, torch::TorchTensor},
 };
 
@@ -353,23 +353,25 @@ async fn perform_allocation_and_build_handler(
             .unwrap_or(true);
 
     let agent = build_agent(worker_id, use_gds_for_local_disk || use_gds_for_remote_disk)?;
+    let nixl_agent = Arc::new(Some(agent));
+    let cuda_ctx = DeviceAllocator::new(device_id)?.ctx().clone();
     let pool_config = PoolConfig {
         enable_pool: true,
-        max_concurrent_transfers: MAX_CONCURRENT_TRANSFERS,
-        max_transfer_batch_size: MAX_TRANSFER_BATCH_SIZE,
+        max_concurrent_transfers: max_concurrent_transfers(),
+        max_transfer_batch_size: max_transfer_batch_size(),
         num_outer_components: device_layout.config().outer_dim,
         num_layers: device_layout.config().num_layers,
     };
-    let transfer_context = Arc::new(
+    let onboard_transfer_context = Arc::new(
         TransferContext::new(
-            Arc::new(Some(agent)),
-            DeviceAllocator::new(device_id)?.ctx().new_stream()?,
+            nixl_agent.clone(),
+            cuda_ctx.new_stream()?,
             Handle::current(),
-            Some(pool_config),
+            Some(pool_config.clone()),
         )
         .map_err(|e| {
             anyhow::anyhow!(
-                "Failed to create transfer context for worker {} with CUDA memory pool: {}. \
+                "Failed to create onboard transfer context for worker {} with CUDA memory pool: {}. \
                  This is a critical error - the worker cannot start without CUDA memory pools. \
                  Please ensure sufficient GPU memory is available on device {}.",
                 worker_id,
@@ -378,6 +380,24 @@ async fn perform_allocation_and_build_handler(
             )
         })?,
     );
+    let offload_transfer_context = Arc::new(
+        TransferContext::new(
+            nixl_agent.clone(),
+            cuda_ctx.new_stream()?,
+            Handle::current(),
+            Some(pool_config),
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to create offload transfer context for worker {} with CUDA memory pool: {}. \
+                 Please ensure sufficient GPU memory is available on device {}.",
+                worker_id,
+                e,
+                device_id
+            )
+        })?,
+    );
+    let transfer_context = &onboard_transfer_context;
 
     // device
     let device_blocks = Some(KvbmWorker::make_layout::<_, BasicMetadata>(
@@ -388,7 +408,7 @@ async fn perform_allocation_and_build_handler(
     )?);
     // host
     let host_blocks = if leader_meta.num_host_blocks > 0 {
-        let host_allocator = Arc::new(PinnedAllocator::default());
+        let host_allocator = Arc::new(PinnedAllocator::with_device(device_id)?);
         let host_layout = layout_builder
             .num_blocks(leader_meta.num_host_blocks)
             .build()?
@@ -422,20 +442,34 @@ async fn perform_allocation_and_build_handler(
     // Create remote context if we have host blocks (for bounce buffers)
     // Supports both Object storage (S3/MinIO) and Disk storage (shared filesystem)
     let remote_context_pool = if host_blocks.is_some() {
-        create_remote_context_pool(transfer_context.clone(), worker_id, leader_meta.world_size)?
+        create_remote_context_pool(onboard_transfer_context.clone(), worker_id, leader_meta.world_size)?
     } else {
         None
     };
+
+    // Use the shared remote abort token so clear_pool can cancel in-flight NIXL transfers.
+    // Also cancel when the worker's lifecycle token fires (normal shutdown).
+    let abort_token = super::vllm::remote_abort_token();
+    let remote_cancel = abort_token.child_token();
+    let lifecycle = cancel_token.clone();
+    tokio::spawn({
+        let remote_cancel = remote_cancel.clone();
+        async move {
+            lifecycle.cancelled().await;
+            remote_cancel.cancel();
+        }
+    });
 
     let handler = BlockTransferHandler::new(
         worker_id,
         device_blocks,
         host_blocks,
         disk_blocks,
-        transfer_context,
+        onboard_transfer_context,
+        offload_transfer_context,
         scheduler_client,
         remote_context_pool,
-        cancel_token,
+        remote_cancel,
     )?;
     Ok(handler)
 }
@@ -657,7 +691,7 @@ impl Handler for RemoteTransferDispatch {
 
         let linked_span = request.traceparent.as_deref().map(|tp| {
             dynamo_runtime::logging::make_linked_worker_span(
-                "kvbm.worker_remote_transfer",
+                "kvbm.g4_worker_transfer",
                 tp,
                 handler.worker_id,
             )

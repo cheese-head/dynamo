@@ -26,6 +26,7 @@ use crate::{
         distributed::registry::{NoMetadata, PositionalKey},
         distributed::{KvbmLeader, RemoteHashOperationsSync, vllm as vllm_int},
         metrics_kvbm::KvbmMetrics,
+        pool::PinRegistry,
     },
     tokens::{SaltHash, TokenBlock, TokenBlockSequence, Tokens},
 };
@@ -52,12 +53,14 @@ pub struct ConnectorSlotManager<R: RequestKey> {
     /// Cache statistics tracker
     cache_stats: Arc<CacheStatsTracker>,
     /// KVBM metrics for exposing cache hit rates
-    #[allow(dead_code)]
     kvbm_metrics: KvbmMetrics,
     /// Minimum priority threshold for host offload filtering (read once at init)
     offload_min_priority: u32,
     /// Reference to the leader for G4 operations
     leader: Arc<KvbmLeader>,
+    /// Pin registry shared with the transfer engine. Clearing this releases
+    /// host blocks pinned by in-flight H2R transfers.
+    pin_registry: PinRegistry,
 }
 
 impl std::fmt::Debug for ConnectorSlotManager<SlotKey> {
@@ -111,6 +114,8 @@ impl<R: RequestKey> ConnectorSlotManager<R> {
         let runtime_primary = Handle::current();
         let runtime_primary_clone = runtime_primary.clone();
         let kvbm_metrics_clone = kvbm_metrics.clone();
+        let pin_registry = PinRegistry::new();
+        let pin_registry_for_engine = pin_registry.clone();
 
         let xfer_engine_task = CriticalTaskExecutionHandle::new_with_runtime(
             |cancellation_token| async move {
@@ -120,6 +125,7 @@ impl<R: RequestKey> ConnectorSlotManager<R> {
                         runtime_primary_clone,
                         primary_token_clone,
                         kvbm_metrics_clone,
+                        pin_registry_for_engine,
                     )
                     .await
             },
@@ -138,6 +144,7 @@ impl<R: RequestKey> ConnectorSlotManager<R> {
             kvbm_metrics: kvbm_metrics.clone(),
             offload_min_priority,
             leader,
+            pin_registry,
         }
     }
 }
@@ -150,19 +157,31 @@ impl<R: RequestKey> ConnectorSlotManager<R> {
     ///
     /// `pool` must be one of: `"gpu"` / `"device"`, `"cpu"` / `"host"`, or `"disk"`.
     pub fn clear_pool(&self, pool: &str) -> Result<(), SlotError> {
-        // Step 1: Drop all slots so block references are released back to the pool.
+        // We intentionally do NOT clear slots here. Slots track per-request
+        // state and are cleaned up by request_finished(). Clearing them while
+        // a forward pass is in-flight causes save_kv_layer to panic.
+        // The pool reset (step 2) is sufficient to reclaim block memory.
         {
-            let mut slots = self.slots.lock().unwrap();
-            let count = slots.len();
-            if count > 0 {
-                tracing::warn!(
-                    "clear_pool({pool}): dropping {count} active connector slots to release block references"
+            let slots = self.slots.lock().unwrap();
+            if !slots.is_empty() {
+                tracing::info!(
+                    "clear_pool({pool}): {count} active slots preserved (will be cleaned up by request_finished)",
+                    count = slots.len()
                 );
-                slots.clear();
             }
         }
 
-        // Step 2: Reset the target pool.
+        // Step 1: Release pin guards for completed H2R transfers.
+        let pinned = self.pin_registry.total_pinned_blocks();
+        if pinned > 0 {
+            tracing::info!(
+                "clear_pool({pool}): releasing {pinned} pinned blocks from {} H2R transfers",
+                self.pin_registry.len()
+            );
+        }
+        self.pin_registry.clear();
+
+        // Step 3: Reset the target pool.
         match pool.to_lowercase().as_str() {
             "gpu" | "device" => {
                 if let Some(device) = self.block_manager.device() {
@@ -202,6 +221,29 @@ impl<R: RequestKey> ConnectorSlotManager<R> {
         }
 
         Ok(())
+    }
+
+    pub fn get_pool_status(&self) -> std::collections::HashMap<String, std::collections::HashMap<String, u64>> {
+        let mut pools = std::collections::HashMap::new();
+        if let Some(device) = self.block_manager.device() {
+            let mut m = std::collections::HashMap::new();
+            m.insert("total_blocks".into(), device.total_blocks());
+            m.insert("available_blocks".into(), device.available_blocks());
+            pools.insert("device".into(), m);
+        }
+        if let Some(host) = self.block_manager.host() {
+            let mut m = std::collections::HashMap::new();
+            m.insert("total_blocks".into(), host.total_blocks());
+            m.insert("available_blocks".into(), host.available_blocks());
+            pools.insert("host".into(), m);
+        }
+        if let Some(disk) = self.block_manager.disk() {
+            let mut m = std::collections::HashMap::new();
+            m.insert("total_blocks".into(), disk.total_blocks());
+            m.insert("available_blocks".into(), disk.available_blocks());
+            pools.insert("disk".into(), m);
+        }
+        pools
     }
 }
 
@@ -280,6 +322,7 @@ struct G4HostPrefetchState {
     sequence_hashes: Vec<u64>,
     num_external_tokens: usize,
     status: G4HostPrefetchStatus,
+    started_at: std::time::Instant,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -305,9 +348,14 @@ pub struct VllmConnectorSlot {
     request_id: String,
     generation: u64,
     traceparent: Option<String>,
+    baggage: Option<String>,
     request_poll_span: Option<tracing::Span>,
     host_prefetch: Option<G4HostPrefetchState>,
     staged_match_report_pending: StagedMatchReport,
+    /// After we return `(Some(N), true)` once from `get_num_new_matched_tokens`, vLLM may poll
+    /// again synchronously in the same scheduling step. Return `None` until
+    /// `update_state_after_alloc` clears the staged report so the scheduler yields.
+    staged_match_disclosed_to_scheduler: bool,
 
     /// The state of the slot.
     state: SlotState,
@@ -428,35 +476,41 @@ impl VllmConnectorSlot {
     /// In that situation incremental append is unsafe, so we resync local tracking and force
     /// conservative scheduler accounting on the next tick.
     fn resync_device_blocks_from_vllm(&mut self, block_ids: &[BlockId], reason: &str) {
-        tracing::warn!(
+        let old_len = self.device_blocks.len();
+        let new_len = block_ids.len();
+
+        tracing::info!(
             request_id = %self.request_id,
             reason,
-            old_len = self.device_blocks.len(),
-            new_len = block_ids.len(),
-            old_head = ?self.device_blocks.iter().take(8).copied().collect::<Vec<_>>(),
-            new_head = ?block_ids.iter().take(8).copied().collect::<Vec<_>>(),
-            "resyncing slot device block table from vLLM snapshot"
+            old_len,
+            new_len,
+            current_position = self.current_position,
+            evaluated_blocks = self.evaluated_blocks,
+            "adopting new device block IDs from vLLM (physical reassignment)"
         );
 
-        if self.operation_tracker.has_any() {
-            tracing::warn!(
-                request_id = %self.request_id,
-                pending_ops = self.operation_tracker.pending_count(),
-                dispatched_ops = self.operation_tracker.dispatched_count(),
-                "clearing pending/in-flight operations due to block-table resync"
-            );
-            self.operation_tracker.clear_all();
-        }
-
+        // Just adopt the new block IDs. The KV data content hasn't changed --
+        // vLLM only reassigned physical GPU memory addresses. Our offload
+        // pipeline targets CPU/disk, so the GPU block ID change doesn't
+        // invalidate any progress. Keep current_position, evaluated_blocks,
+        // and in-flight operations intact.
         self.device_blocks.clear();
         self.device_blocks.extend_from_slice(block_ids);
 
-        // Existing offload/onboard progression no longer maps to the new table layout.
-        self.current_position = 0;
-        self.evaluated_blocks = 0;
-        self.offload_terminated_at_block = None;
-        self.g1_residency_unprotected = false;
-        self.recovered_from_failed_transfer = true;
+        if new_len < old_len {
+            // Table shrank: genuine preemption. Clamp evaluated_blocks
+            // to the new table size to avoid out-of-bounds offload.
+            self.evaluated_blocks = self.evaluated_blocks.min(new_len);
+            if self.operation_tracker.has_any() {
+                tracing::warn!(
+                    request_id = %self.request_id,
+                    pending_ops = self.operation_tracker.pending_count(),
+                    dispatched_ops = self.operation_tracker.dispatched_count(),
+                    "clearing operations after table shrink"
+                );
+                self.operation_tracker.clear_all();
+            }
+        }
     }
 
     fn new(
@@ -478,9 +532,11 @@ impl VllmConnectorSlot {
             request_id,
             generation: 0,
             traceparent: None,
+            baggage: None,
             request_poll_span: None,
             host_prefetch: None,
             staged_match_report_pending: StagedMatchReport::default(),
+            staged_match_disclosed_to_scheduler: false,
             sequence,
             block_manager,
             block_size,
@@ -685,8 +741,16 @@ impl VllmConnectorSlot {
         self.tokens_cached_from_device = 0;
         crate::all_tiers!(reset self);
         self.request_poll_span = None;
-        self.host_prefetch = None;
-        self.staged_match_report_pending.clear();
+        if let Some(prefetch) = self.host_prefetch.take() {
+            tracing::debug!(
+                target: "kvbm-diag",
+                request_id = %self.request_id,
+                operation_id = %prefetch.operation_id,
+                "dropped host_prefetch during reset_core_state; \
+                 registered host blocks remain as cache entries"
+            );
+        }
+        self.clear_staged_match_report();
         self.performed_cache_lookup = false;
         self.total_blocks_queried = 0;
         self.prefetched_g4_blocks_used_for_stats = 0;
@@ -1003,9 +1067,6 @@ impl VllmConnectorSlot {
             return Ok(());
         }
 
-        self.host.stage_non_empty(host_blocks);
-        self.disk.stage_non_empty(disk_blocks);
-
         if !g4_hashes.is_empty() {
             let start_block = (num_computed_tokens / block_size)
                 + num_matched_host_blocks
@@ -1014,19 +1075,81 @@ impl VllmConnectorSlot {
                 self.sequence.blocks()[start_block..start_block + g4_hashes.len()].to_vec();
             if let Ok(operation_id) = self.prefetch_from_g4_to_host(g4_hashes.clone(), token_blocks)
             {
+                self.host.stage_non_empty(host_blocks);
+                self.disk.stage_non_empty(disk_blocks);
                 self.host_prefetch = Some(G4HostPrefetchState {
                     operation_id,
                     sequence_hashes: g4_hashes,
                     num_external_tokens: num_new_matched_tokens,
                     status: G4HostPrefetchStatus::Pending,
+                    started_at: std::time::Instant::now(),
                 });
                 return Ok(());
             }
-            self.g4.tier.stage_non_empty(g4_hashes);
+
+            // G4→host xfer could not be enqueued. Two options controlled by
+            // `DYN_KVBM_G4_XFER_FAIL_POLICY`: `abort` returns an error;
+            // `prefill` (default) drops G4 matches and stages host+disk only
+            // so vLLM prefills the G4 suffix on GPU.
+            tracing::error!(
+                target: "kvbm-g4",
+                request_id = %self.request_id,
+                g4_blocks = g4_hashes.len(),
+                host_blocks = host_blocks.len(),
+                disk_blocks = disk_blocks.len(),
+                "failed to enqueue G4→host prefetch; falling back"
+            );
+            self.g4.tier.record_cached_tokens(0);
+
+            let policy = std::env::var("DYN_KVBM_G4_XFER_FAIL_POLICY").unwrap_or_default();
+            if policy.eq_ignore_ascii_case("abort") {
+                return Err(SlotError::InvalidOperation(
+                    "G4 host prefetch could not be enqueued (transfer engine unavailable)".into(),
+                ));
+            }
+
+            let total_tokens = self.sequence.total_tokens();
+            let num_hd_blocks = host_blocks.len() + disk_blocks.len();
+            let mut num_hd_tokens = num_hd_blocks * block_size;
+            if num_hd_tokens == 0 {
+                tracing::warn!(
+                    target: "kvbm-g4",
+                    request_id = %self.request_id,
+                    "G4 xfer failed and no host/disk blocks matched — full prefill"
+                );
+                return Ok(());
+            }
+            if num_computed_tokens + num_hd_tokens == total_tokens {
+                if !disk_blocks.is_empty() {
+                    disk_blocks.pop();
+                } else if !host_blocks.is_empty() {
+                    host_blocks.pop();
+                }
+                num_hd_tokens = num_hd_tokens.saturating_sub(block_size);
+            }
+            if num_hd_tokens == 0 {
+                return Ok(());
+            }
+
+            self.host.stage_non_empty(host_blocks);
+            self.disk.stage_non_empty(disk_blocks);
+            self.state = SlotState::OnboardStaged(num_hd_tokens);
+            self.staged_match_report_pending.arm(num_hd_tokens);
+            self.staged_match_disclosed_to_scheduler = false;
+            tracing::info!(
+                target: "kvbm-g4",
+                request_id = %self.request_id,
+                num_hd_tokens,
+                "G4 xfer failed — host+disk only; vLLM must prefill G4 suffix"
+            );
+            return Ok(());
         }
 
+        self.host.stage_non_empty(host_blocks);
+        self.disk.stage_non_empty(disk_blocks);
         self.state = SlotState::OnboardStaged(num_new_matched_tokens);
         self.staged_match_report_pending.arm(num_new_matched_tokens);
+        self.staged_match_disclosed_to_scheduler = false;
         Ok(())
     }
 
@@ -1042,6 +1165,7 @@ impl VllmConnectorSlot {
         let xfer_req = LocalTransferRequest::Remote(RemoteTransferRequest::from_g4_params(
             &params,
             self.traceparent.clone(),
+            self.baggage.clone(),
         ));
 
         self.xfer_tx.send(xfer_req).map_err(|e| {
@@ -1084,6 +1208,7 @@ impl VllmConnectorSlot {
         self.state = SlotState::OnboardStaged(prefetch.num_external_tokens);
         self.staged_match_report_pending
             .arm(prefetch.num_external_tokens);
+        self.staged_match_disclosed_to_scheduler = false;
         Ok(true)
     }
 
@@ -1092,7 +1217,7 @@ impl VllmConnectorSlot {
             return false;
         };
         prefetch.status = G4HostPrefetchStatus::Cancelled;
-        self.staged_match_report_pending.clear();
+        self.clear_staged_match_report();
         self.g4.tier.stage_non_empty(prefetch.sequence_hashes);
         true
     }
@@ -1101,8 +1226,20 @@ impl VllmConnectorSlot {
         self.staged_match_report_pending.peek()
     }
 
+    /// First `get_num_new_matched_tokens` poll after staging returns `Some(n)`; further polls
+    /// while still staged return `None` so vLLM treats the match as pending and stops spinning.
+    pub(crate) fn disclose_staged_match_to_scheduler(&mut self) -> Option<usize> {
+        let n = self.staged_match_report_pending.peek()?;
+        if self.staged_match_disclosed_to_scheduler {
+            return None;
+        }
+        self.staged_match_disclosed_to_scheduler = true;
+        Some(n)
+    }
+
     pub(crate) fn clear_staged_match_report(&mut self) {
         self.staged_match_report_pending.clear();
+        self.staged_match_disclosed_to_scheduler = false;
     }
 
     pub(crate) fn has_staged_host_blocks(&self) -> bool {
@@ -1402,6 +1539,20 @@ impl Slot for VllmConnectorSlot {
             self.g4.pending_lookup.take();
         }
 
+        if let Some(prefetch) = self.host_prefetch.take() {
+            self.host
+                .clear_staging(&self.request_id, "mark_as_finished cleanup");
+            self.clear_staged_match_report();
+            self.prefetched_g4_blocks_used_for_stats = 0;
+            tracing::info!(
+                target: "kvbm-diag",
+                request_id = %self.request_id,
+                operation_id = %prefetch.operation_id,
+                "dropped host_prefetch and staging during mark_as_finished; \
+                 registered host blocks remain as cache entries"
+            );
+        }
+
         // Report cache statistics if we performed a cache lookup
         if self.performed_cache_lookup {
             let block_size = self.block_size;
@@ -1514,13 +1665,49 @@ impl Slot for VllmConnectorSlot {
                     state = ?self.state,
                     "prefetched G4 blocks are now resident in host memory"
                 );
-            } else {
-                tracing::debug!(
-                    target: "kvbm-g4",
-                    request_id = %self.request_id,
-                    "prefetched G4 blocks not yet resident in host memory"
-                );
+                return Ok(());
             }
+
+            let elapsed = self.host_prefetch.as_ref().map(|p| p.started_at.elapsed()).unwrap_or_default();
+            let timeout = std::time::Duration::from_secs(
+                std::env::var("DYN_KVBM_PREFETCH_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(10)
+            );
+            if elapsed >= timeout {
+                tracing::error!(
+                    target: "kvbm-diag",
+                    request_id = %self.request_id,
+                    elapsed_ms = elapsed.as_millis(),
+                    timeout_secs = timeout.as_secs(),
+                    "G4 host prefetch timed out — cancelling prefetch and falling back to recompute"
+                );
+                if let Some(prefetch) = self.host_prefetch.take() {
+                    self.host
+                        .clear_staging(&self.request_id, "g4 prefetch timeout");
+                    self.clear_staged_match_report();
+                    self.prefetched_g4_blocks_used_for_stats = 0;
+                    tracing::info!(
+                        target: "kvbm-diag",
+                        request_id = %self.request_id,
+                        operation_id = %prefetch.operation_id,
+                        num_hashes = prefetch.sequence_hashes.len(),
+                        "dropped host_prefetch and staging after G4 timeout; \
+                         registered host blocks remain as cache entries"
+                    );
+                }
+                self.state = SlotState::Preempted;
+                self.iteration_first_scheduled = None;
+                return Ok(());
+            }
+
+            tracing::debug!(
+                target: "kvbm-g4",
+                request_id = %self.request_id,
+                elapsed_ms = elapsed.as_millis(),
+                "prefetched G4 blocks not yet resident in host memory"
+            );
             return Ok(());
         }
 
@@ -1821,6 +2008,10 @@ impl ExternallyManagedDeviceSlot for VllmConnectorSlot {
         self.traceparent = traceparent;
     }
 
+    fn set_request_baggage(&mut self, baggage: Option<String>) {
+        self.baggage = baggage;
+    }
+
     fn set_generation(&mut self, generation: u64) {
         self.generation = generation;
     }
@@ -1854,7 +2045,7 @@ impl VllmConnectorSlot {
 
         self.host
             .clear_staging(&self.request_id, "prefetched host blocks");
-        self.staged_match_report_pending.clear();
+        self.clear_staged_match_report();
         self.prefetched_g4_blocks_used_for_stats = 0;
 
         let Some(host_pool) = self.block_manager.host() else {
@@ -1940,6 +2131,7 @@ impl VllmConnectorSlot {
             operation_id,
             self.block_size,
             self.traceparent.clone(),
+            self.baggage.clone(),
         ));
 
         let worker_req = WorkerTransferRequest {
@@ -2134,6 +2326,7 @@ impl VllmConnectorSlot {
         let xfer_req = LocalTransferRequest::Remote(RemoteTransferRequest::from_g4_params(
             &params,
             self.traceparent.clone(),
+            self.baggage.clone(),
         ));
 
         self.xfer_tx.send(xfer_req).map_err(|e| {

@@ -101,6 +101,7 @@ impl KvbmEmulationHarness {
             operation_id,
             block_size,
             None,
+            None,
         );
 
         let onboard = RemoteTransferRequest::from_g4_params(
@@ -113,6 +114,7 @@ impl KvbmEmulationHarness {
                 block_size,
                 token_blocks,
             },
+            None,
             None,
         );
 

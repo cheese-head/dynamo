@@ -25,7 +25,7 @@ use crate::block_manager::{
     config::RemoteTransferContext,
     connector::scheduler::{SchedulingDecision, TransferSchedulerClient},
     distributed::vllm::g4_checksum_enabled,
-    offload::MAX_TRANSFER_BATCH_SIZE,
+    offload::max_transfer_batch_size,
     storage::{DeviceStorage, DiskStorage, Local, PinnedStorage},
 };
 use tokio_util::sync::CancellationToken;
@@ -42,23 +42,36 @@ type LocalBlockDataList<S> = Vec<LocalBlockData<S>>;
 
 const DEFAULT_G4_PIPELINE_CHUNK_SIZE: usize = 16;
 
-static G4_PIPELINE_CHUNK_SIZE: Lazy<usize> = Lazy::new(|| {
-    std::env::var("DYN_KVBM_G4_PIPELINE_CHUNK_SIZE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_G4_PIPELINE_CHUNK_SIZE)
-});
+static G4_PIPELINE_CHUNK_SIZE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(DEFAULT_G4_PIPELINE_CHUNK_SIZE);
+
+static G4_PIPELINE_CHUNK_SIZE_INIT: once_cell::sync::Lazy<()> =
+    once_cell::sync::Lazy::new(|| {
+        if let Some(v) = std::env::var("DYN_KVBM_G4_PIPELINE_CHUNK_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+        {
+            G4_PIPELINE_CHUNK_SIZE.store(v, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
 
 fn g4_pipeline_chunk_size() -> usize {
-    *G4_PIPELINE_CHUNK_SIZE
+    once_cell::sync::Lazy::force(&G4_PIPELINE_CHUNK_SIZE_INIT);
+    G4_PIPELINE_CHUNK_SIZE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_g4_pipeline_chunk_size(size: usize) {
+    G4_PIPELINE_CHUNK_SIZE.store(size, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn g4_pipeline_chunk_size_pub() -> usize {
+    g4_pipeline_chunk_size()
 }
 
 /// A batching wrapper for connector transfers to prevent resource exhaustion.
 /// Splits large transfers into smaller batches that can be handled by the resource pools.
 #[derive(Clone, Debug)]
-pub struct ConnectorTransferBatcher {
-    max_batch_size: usize,
-}
+pub struct ConnectorTransferBatcher;
 
 #[derive(Clone)]
 pub struct RemoteTransferContextPool {
@@ -118,9 +131,7 @@ impl Drop for RemoteTransferContextLease {
 
 impl ConnectorTransferBatcher {
     pub fn new() -> Self {
-        Self {
-            max_batch_size: MAX_TRANSFER_BATCH_SIZE,
-        }
+        Self
     }
 
     pub async fn execute_batched_transfer(
@@ -128,14 +139,15 @@ impl ConnectorTransferBatcher {
         handler: &BlockTransferHandler,
         request: BlockTransferRequest,
     ) -> Result<()> {
+        let max_batch = max_transfer_batch_size();
         let blocks = request.blocks();
         let num_blocks = blocks.len();
 
-        if num_blocks <= self.max_batch_size {
+        if num_blocks <= max_batch {
             return handler.execute_transfer_direct(request).await;
         }
 
-        let batches = blocks.chunks(self.max_batch_size);
+        let batches = blocks.chunks(max_batch);
 
         let batch_futures: Vec<_> = batches
             .map(|batch| {
@@ -165,20 +177,24 @@ impl ConnectorTransferBatcher {
 
 /// A handler for all block transfers. Wraps a group of [`BlockTransferPoolManager`]s.
 /// Also handles remote storage transfers (G4 object storage, remote disk) when configured.
+///
+/// Uses two separate CUDA streams so that D2H offload and H2D onboard can overlap,
+/// utilizing both PCIe copy engines (full-duplex).
 #[derive(Clone)]
 pub struct BlockTransferHandler {
     pub worker_id: usize,
     device: Option<LocalBlockDataList<DeviceStorage>>,
     host: Option<LocalBlockDataList<PinnedStorage>>,
     disk: Option<LocalBlockDataList<DiskStorage>>,
-    context: Arc<TransferContext>,
+    onboard_transfer_context: Arc<TransferContext>,
+    offload_transfer_context: Arc<TransferContext>,
     /// Scheduler client for completion tracking.
     /// Public so `RemoteTransferDispatch` can propagate connector_req
     /// through the scheduler's completion system.
     pub scheduler_client: Option<TransferSchedulerClient>,
     batcher: ConnectorTransferBatcher,
     remote_context_pool: Option<Arc<RemoteTransferContextPool>>,
-    cancel_token: CancellationToken,
+    _cancel_token_legacy: CancellationToken,
 }
 
 impl BlockTransferHandler {
@@ -187,7 +203,8 @@ impl BlockTransferHandler {
         device_blocks: Option<Vec<LocalBlock<DeviceStorage, BasicMetadata>>>,
         host_blocks: Option<Vec<LocalBlock<PinnedStorage, BasicMetadata>>>,
         disk_blocks: Option<Vec<LocalBlock<DiskStorage, BasicMetadata>>>,
-        context: Arc<TransferContext>,
+        onboard_transfer_context: Arc<TransferContext>,
+        offload_transfer_context: Arc<TransferContext>,
         scheduler_client: Option<TransferSchedulerClient>,
         remote_context_pool: Option<Arc<RemoteTransferContextPool>>,
         cancel_token: CancellationToken,
@@ -197,12 +214,17 @@ impl BlockTransferHandler {
             device: Self::get_local_data(device_blocks),
             host: Self::get_local_data(host_blocks),
             disk: Self::get_local_data(disk_blocks),
-            context,
+            onboard_transfer_context,
+            offload_transfer_context,
             scheduler_client,
             batcher: ConnectorTransferBatcher::new(),
             remote_context_pool,
-            cancel_token,
+            _cancel_token_legacy: cancel_token,
         })
+    }
+
+    fn fresh_cancel_token(&self) -> CancellationToken {
+        super::vllm::remote_abort_token().child_token()
     }
 
     fn get_local_data<S: Storage>(
@@ -223,20 +245,19 @@ impl BlockTransferHandler {
         })
     }
 
-    /// Initiate a transfer between two pools.
+    /// Initiate a transfer between two pools using the provided transfer context.
     async fn begin_transfer<Source, Target>(
         &self,
         source_pool_list: &Option<LocalBlockDataList<Source>>,
         target_pool_list: &Option<LocalBlockDataList<Target>>,
         request: BlockTransferRequest,
+        ctx: &Arc<TransferContext>,
     ) -> Result<tokio::sync::oneshot::Receiver<()>>
     where
         Source: Storage + NixlDescriptor,
         Target: Storage + NixlDescriptor,
-        // Check that the source block is readable, local, and writable to the target block.
         LocalBlockData<Source>:
             ReadableBlock<StorageType = Source> + Local + WriteToStrategy<LocalBlockData<Target>>,
-        // Check that the target block is writable.
         LocalBlockData<Target>: WritableBlock<StorageType = Target>,
         LocalBlockData<Source>: BlockDataProvider<Locality = locality::Local>,
         LocalBlockData<Target>: BlockDataProviderMut<Locality = locality::Local>,
@@ -248,11 +269,9 @@ impl BlockTransferHandler {
             return Err(anyhow::anyhow!("Target pool manager not initialized"));
         };
 
-        // Extract the `from` and `to` indices from the request.
         let source_idxs = request.blocks().iter().map(|(from, _)| *from);
         let target_idxs = request.blocks().iter().map(|(_, to)| *to);
 
-        // Get the blocks corresponding to the indices.
         let sources: Vec<LocalBlockData<Source>> = source_idxs
             .map(|idx| {
                 source_pool_list.get(idx).cloned().ok_or_else(|| {
@@ -276,8 +295,7 @@ impl BlockTransferHandler {
             })
             .collect::<Result<_>>()?;
 
-        // Perform the transfer, and return the notifying channel.
-        match sources.write_to(&mut targets, self.context.clone()) {
+        match sources.write_to(&mut targets, ctx.clone()) {
             Ok(channel) => Ok(channel),
             Err(e) => {
                 tracing::error!("Failed to write to blocks: {:?}", e);
@@ -300,12 +318,17 @@ impl BlockTransferHandler {
     pub async fn execute_transfer_direct(&self, request: BlockTransferRequest) -> Result<()> {
         tracing::debug!("request: {request:#?}");
 
+        let ctx = match (request.from_pool(), request.to_pool()) {
+            (Device, Host) | (Device, Disk) => &self.offload_transfer_context,
+            _ => &self.onboard_transfer_context,
+        };
+
         let notify = match (request.from_pool(), request.to_pool()) {
-            (Device, Host) => self.begin_transfer(&self.device, &self.host, request).await,
-            (Device, Disk) => self.begin_transfer(&self.device, &self.disk, request).await,
-            (Host, Device) => self.begin_transfer(&self.host, &self.device, request).await,
-            (Host, Disk) => self.begin_transfer(&self.host, &self.disk, request).await,
-            (Disk, Device) => self.begin_transfer(&self.disk, &self.device, request).await,
+            (Device, Host) => self.begin_transfer(&self.device, &self.host, request, ctx).await,
+            (Device, Disk) => self.begin_transfer(&self.device, &self.disk, request, ctx).await,
+            (Host, Device) => self.begin_transfer(&self.host, &self.device, request, ctx).await,
+            (Host, Disk) => self.begin_transfer(&self.host, &self.disk, request, ctx).await,
+            (Disk, Device) => self.begin_transfer(&self.disk, &self.device, request, ctx).await,
             _ => {
                 return Err(anyhow::anyhow!("Invalid transfer type."));
             }
@@ -322,7 +345,7 @@ impl BlockTransferHandler {
     #[tracing::instrument(level = "info", skip_all, fields(
         request_id = %request.request_id,
         operation_id = %request.operation_id,
-        otel.name = "kvbm.remote_transfer",
+        otel.name = "kvbm.g4_transfer",
     ))]
     pub async fn execute_remote_transfer(&self, request: RemoteTransferRequest) -> Result<()> {
         let remote_ctx_lease = self
@@ -414,14 +437,15 @@ impl BlockTransferHandler {
                 use tracing::Instrument;
                 let r2h_span = tracing::info_span!(
                     "r2h_transfer",
-                    otel.name = "kvbm.r2h",
+                    otel.name = "kvbm.disk_to_host",
                     request_id = %request.request_id,
                     num_blocks,
                     backend,
                 );
 
+                let cancel = self.fresh_cancel_token();
                 pipeline
-                    .execute(&bounce_blocks, remote_ctx.as_ref(), &self.cancel_token)
+                    .execute(&bounce_blocks, remote_ctx.as_ref(), &cancel)
                     .instrument(r2h_span)
                     .await
                     .map_err(|e| anyhow::anyhow!("Remote transfer failed: {}", e))?;
@@ -470,7 +494,7 @@ impl BlockTransferHandler {
                         use tracing::Instrument;
                         let h2d_span = tracing::info_span!(
                             "h2d_transfer",
-                            otel.name = "kvbm.h2d",
+                            otel.name = "kvbm.host_to_device",
                             request_id = %request.request_id,
                             num_blocks = block_pairs.len(),
                         );
@@ -541,7 +565,7 @@ impl BlockTransferHandler {
         request_id = %request.request_id,
         chunk_size,
         backend,
-        otel.name = "kvbm.remote_transfer_chunked",
+        otel.name = "kvbm.g4_onboard_pipeline",
     ))]
     async fn execute_remote_transfer_chunked(
         &self,
@@ -601,13 +625,13 @@ impl BlockTransferHandler {
             let chunk_descs = descriptors[start..end].to_vec();
             let chunk_bounce = bounce_blocks[start..end].to_vec();
             let ctx = Arc::clone(remote_ctx);
-            let cancel = self.cancel_token.clone();
+            let cancel = self.fresh_cancel_token();
             let done_tx = done_tx.clone();
             let request_id = request.request_id.clone();
             let chunk_span = tracing::info_span!(
                 parent: &transfer_parent,
                 "chunk_r2h_transfer",
-                otel.name = "kvbm.remote_transfer_chunk_r2h",
+                otel.name = "kvbm.g4_chunk_disk_to_host",
                 request_id = %request_id,
                 chunk_idx,
                 chunk_blocks = end - start,
@@ -676,7 +700,7 @@ impl BlockTransferHandler {
                             let h2d_span = tracing::info_span!(
                                 parent: &tracing::Span::current(),
                                 "chunk_h2d_transfer",
-                                otel.name = "kvbm.remote_transfer_chunk_h2d",
+                                otel.name = "kvbm.g4_chunk_host_to_device",
                                 request_id = %request_id,
                                 chunk_idx,
                                 chunk_blocks = end - start,

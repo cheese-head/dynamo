@@ -20,7 +20,7 @@ use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
-const DEFAULT_REMOTE_DISK_FD_CACHE_MAX_ENTRIES: usize = 50_000;
+const DEFAULT_REMOTE_DISK_FD_CACHE_MAX_ENTRIES: usize = 131_072;
 const REMOTE_DISK_O_DIRECT_KEY: &str = "DYN_KVBM_REMOTE_DISK_O_DIRECT";
 const REMOTE_DISK_ALIGNMENT_VALIDATE_KEY: &str = "DYN_KVBM_REMOTE_DISK_VALIDATE_ALIGNMENT";
 const REMOTE_DISK_ALIGNMENT_OVERRIDE_KEY: &str = "DYN_KVBM_REMOTE_DISK_ALIGNMENT_BYTES";
@@ -652,14 +652,11 @@ where
 
     // Use a scope block to ensure all non-Send types are dropped before await
     // (OptArgs contains NonNull which is !Send)
-    let (xfer_req, still_pending, disk_storages) = {
-        // Dynamically create/open and register disk storage for each block
-        let mut disk_storages: Vec<Arc<SyncMutex<RemoteDiskStorage>>> =
-            Vec::with_capacity(num_blocks);
-
+    let (xfer_req, still_pending, _disk_storages) = {
         let worker_id = ctx.worker_id() as usize;
         let world_size = ctx.world_size();
 
+        let mut file_paths: Vec<String> = Vec::with_capacity(num_blocks);
         for desc in descriptors.iter() {
             let file_path = match desc.key() {
                 RemoteKey::Disk(disk_key) => {
@@ -677,29 +674,36 @@ where
                     ));
                 }
             };
-
-            if disk_storages.is_empty() {
-                tracing::info!(
-                    target: "kvbm-diag",
-                    direction = op,
-                    first_file = %file_path,
-                    num_blocks,
-                    "Disk transfer files (showing first)"
-                );
-            }
-
-            let disk_storage = get_or_open_remote_disk_storage(
-                agent,
-                &file_path,
-                block_size,
-                create_files,
-                use_odirect,
-                use_gds_backend,
-            )
-            .await?;
-
-            disk_storages.push(disk_storage);
+            file_paths.push(file_path);
         }
+
+        if let Some(first) = file_paths.first() {
+            tracing::info!(
+                target: "kvbm-diag",
+                direction = op,
+                first_file = %first,
+                num_blocks,
+                "Disk transfer files (showing first)"
+            );
+        }
+
+        let disk_storages = {
+            let mut storages: Vec<Arc<SyncMutex<RemoteDiskStorage>>> =
+                Vec::with_capacity(num_blocks);
+            for path in &file_paths {
+                let storage = get_or_open_remote_disk_storage(
+                    agent,
+                    path,
+                    block_size,
+                    create_files,
+                    use_odirect,
+                    use_gds_backend,
+                )
+                .await?;
+                storages.push(storage);
+            }
+            storages
+        };
 
         // Build transfer descriptor lists for disk
         let mut src_dl = XferDescList::new(MemType::Dram).map_err(|e| {
@@ -777,14 +781,22 @@ where
             TransferError::ExecutionError(format!("Failed to post xfer_req: {:?}", e))
         })?;
 
-        // Return disk_storages to keep them alive during the transfer
         (xfer_req, still_pending, disk_storages)
     };
 
-    // Wait for completion with cancellation support
     if still_pending {
-        // Try async notification system, fall back to inline polling if unavailable
-        match ctx.register_nixl_transfer(agent, xfer_req) {
+        let xfer_span = tracing::info_span!(
+            "disk_post_xfer",
+            otel.name = "kvbm.disk_transfer_wait",
+            num_blocks,
+            direction = op,
+        );
+        let _enter = xfer_span.enter();
+
+        let registered = ctx.register_nixl_transfer(agent, xfer_req);
+        drop(_enter);
+
+        match registered {
             Ok(notification) => {
                 tokio::select! {
                     result = notification => {
@@ -796,20 +808,8 @@ where
                 }
             }
             Err((_, xfer_req)) => {
-                // Fall back to inline polling
                 poll_transfer_completion_inline(agent, &xfer_req, cancel_token).await?;
             }
-        }
-    }
-
-    // After a POSIX offload, flush dirty page-cache pages to storage so that
-    // a subsequent GDS O_DIRECT read (which bypasses the page cache) sees
-    // the committed data.  This is a no-op for GDS writes and for onboard.
-    if create_files && !gds_write {
-        for ds in &disk_storages {
-            ds.lock()
-                .fdatasync()
-                .map_err(|e| TransferError::ExecutionError(format!("fdatasync failed: {:?}", e)))?;
         }
     }
 

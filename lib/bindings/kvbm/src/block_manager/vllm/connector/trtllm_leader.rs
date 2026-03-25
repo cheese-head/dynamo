@@ -51,6 +51,8 @@ pub trait Leader: Send + Sync + std::fmt::Debug {
     fn create_slot(&mut self, request: KvbmRequest, tokens: Vec<u32>) -> anyhow::Result<()>;
 
     fn slot_manager(&self) -> &ConnectorSlotManager<SlotKey>;
+
+    fn get_pool_status(&self) -> std::collections::HashMap<String, std::collections::HashMap<String, u64>>;
 }
 
 #[derive(Debug)]
@@ -87,6 +89,7 @@ impl KvConnectorLeader {
             kvbm_metrics_endpoint_enabled(),
             parse_kvbm_metrics_port(),
         );
+        crate::block_manager::register_global_metrics(kvbm_metrics.clone());
 
         let kvbm_metrics_clone = kvbm_metrics.clone();
 
@@ -563,6 +566,10 @@ impl Leader for KvConnectorLeader {
         self.inflight_requests.insert(request.request_id);
 
         Ok(())
+    }
+
+    fn get_pool_status(&self) -> std::collections::HashMap<String, std::collections::HashMap<String, u64>> {
+        self.slot_manager().get_pool_status()
     }
 }
 

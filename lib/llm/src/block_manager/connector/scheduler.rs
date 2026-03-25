@@ -249,7 +249,10 @@ impl WorkerSchedulerClient {
     }
 
     pub fn remove_key(&mut self, key: &SlotKey) -> Result<(), SchedulerError> {
-        let slot = self.slots.remove(key).expect("slot does not exist");
+        let Some(slot) = self.slots.remove(key) else {
+            tracing::warn!(request_id = %key, "remove_key: slot already removed, skipping");
+            return Ok(());
+        };
         assert!(slot.is_complete());
         self.scheduler_tx
             .send(SchedulerMessage::RequestFinished(
@@ -269,12 +272,16 @@ impl WorkerSchedulerClient {
         &mut self,
         request: WorkerTransferRequest,
     ) -> Result<(), SchedulerError> {
-        debug_assert!(self.slots.contains_key(&request.key), "slot does not exist");
-
-        let slot = self
-            .slots
-            .get_mut(&request.key)
-            .expect("slot does not exist");
+        let slot = match self.slots.get_mut(&request.key) {
+            Some(slot) => slot,
+            None => {
+                tracing::warn!(
+                    request_id = %request.key,
+                    "slot does not exist (may have been cleared while forward pass in-flight), skipping"
+                );
+                return Ok(());
+            }
+        };
 
         slot.operations.push(request.uuid);
 
@@ -297,8 +304,13 @@ impl WorkerSchedulerClient {
     /// Record operation in slot (bookkeeping only, no send).
     /// This updates the slot's expected operation count so is_complete() works correctly.
     pub fn record_operation_key(&mut self, key: &SlotKey, uuid: uuid::Uuid) {
-        let slot = self.slots.get_mut(key).expect("slot does not exist");
-        slot.operations.push(uuid);
+        match self.slots.get_mut(key) {
+            Some(slot) => slot.operations.push(uuid),
+            None => tracing::warn!(
+                request_id = %key,
+                "record_operation_key: slot does not exist (cleared mid-flight), skipping"
+            ),
+        }
     }
 
     /// Drain all pending failure notifications from the scheduler (non-blocking).

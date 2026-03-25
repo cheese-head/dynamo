@@ -61,9 +61,17 @@ pub trait Leader: Send + Sync + std::fmt::Debug {
         traceparent: String,
     ) -> anyhow::Result<()>;
 
+    fn set_request_baggage(
+        &mut self,
+        request_id: String,
+        baggage: String,
+    ) -> anyhow::Result<()>;
+
     fn slot_manager(&self) -> &ConnectorSlotManager<SlotKey>;
 
     fn clear_pool(&mut self, pool: String) -> anyhow::Result<()>;
+
+    fn get_pool_status(&self) -> std::collections::HashMap<String, std::collections::HashMap<String, u64>>;
 }
 
 #[derive(Debug)]
@@ -102,6 +110,7 @@ impl KvConnectorLeader {
             kvbm_metrics_endpoint_enabled(),
             parse_kvbm_metrics_port(),
         );
+        crate::block_manager::register_global_metrics(kvbm_metrics.clone());
         let kvbm_metrics_clone = kvbm_metrics.clone();
 
         let slot_manager_cell = Arc::new(OnceLock::new());
@@ -240,8 +249,21 @@ impl Leader for KvConnectorLeader {
         Ok(())
     }
 
+    fn set_request_baggage(
+        &mut self,
+        request_id: String,
+        baggage: String,
+    ) -> anyhow::Result<()> {
+        self.core.set_request_baggage(request_id, baggage);
+        Ok(())
+    }
+
     fn clear_pool(&mut self, pool: String) -> anyhow::Result<()> {
         self.core.clear_pool(pool)
+    }
+
+    fn get_pool_status(&self) -> std::collections::HashMap<String, std::collections::HashMap<String, u64>> {
+        self.core.get_pool_status()
     }
 }
 
@@ -340,8 +362,18 @@ impl PyKvConnectorLeader {
             .map_err(to_pyerr)
     }
 
+    fn set_request_baggage(&mut self, request_id: String, baggage: String) -> PyResult<()> {
+        self.connector_leader
+            .set_request_baggage(request_id, baggage)
+            .map_err(to_pyerr)
+    }
+
     fn clear_pool(&mut self, pool: String) -> PyResult<()> {
         self.connector_leader.clear_pool(pool).map_err(to_pyerr)
+    }
+
+    fn get_pool_status(&self) -> PyResult<std::collections::HashMap<String, std::collections::HashMap<String, u64>>> {
+        Ok(self.connector_leader.get_pool_status())
     }
 
     fn set_cpu_cache_lookup_disabled(&self, disabled: bool) -> PyResult<()> {

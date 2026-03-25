@@ -20,6 +20,13 @@ mod distributed;
 
 pub mod vllm;
 
+static KVBM_METRICS_GLOBAL: std::sync::OnceLock<dynamo_llm::block_manager::metrics_kvbm::KvbmMetrics> =
+    std::sync::OnceLock::new();
+
+pub fn register_global_metrics(metrics: dynamo_llm::block_manager::metrics_kvbm::KvbmMetrics) {
+    let _ = KVBM_METRICS_GLOBAL.set(metrics);
+}
+
 /// Add bingings from this crate to the provided module
 pub fn add_to_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<BlockManager>()?;
@@ -29,8 +36,84 @@ pub fn add_to_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<controller::BlockPoolStatus>()?;
     m.add_class::<controller::ResetBlocksResponse>()?;
 
+    m.add_function(pyo3::wrap_pyfunction!(get_tuning_params, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(set_tuning_param, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(reset_metrics, m)?)?;
+
     vllm::add_to_module(m)?;
 
+    Ok(())
+}
+
+#[pyo3::pyfunction]
+fn reset_metrics() -> pyo3::PyResult<()> {
+    match KVBM_METRICS_GLOBAL.get() {
+        Some(metrics) => {
+            metrics.reset_histograms();
+            Ok(())
+        }
+        None => Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "KVBM metrics not initialized",
+        )),
+    }
+}
+
+#[pyo3::pyfunction]
+fn get_tuning_params() -> pyo3::PyResult<std::collections::HashMap<String, u64>> {
+    use dynamo_llm::block_manager::distributed::transfer::set_g4_pipeline_chunk_size;
+    let _ = set_g4_pipeline_chunk_size; // ensure module is linked
+
+    let mut m = std::collections::HashMap::new();
+    m.insert(
+        "transfer_batch_size".into(),
+        dynamo_llm::block_manager::offload::max_transfer_batch_size() as u64,
+    );
+    m.insert(
+        "max_concurrent_transfers".into(),
+        dynamo_llm::block_manager::offload::max_concurrent_transfers() as u64,
+    );
+    m.insert(
+        "flush_batch_size".into(),
+        dynamo_llm::block_manager::distributed::vllm::flush_batch_size() as u64,
+    );
+    m.insert(
+        "g4_pipeline_chunk_size".into(),
+        dynamo_llm::block_manager::distributed::transfer::g4_pipeline_chunk_size_pub() as u64,
+    );
+    m.insert(
+        "g4_transfer_timeout_secs".into(),
+        dynamo_llm::block_manager::distributed::vllm::g4_transfer_timeout().as_secs(),
+    );
+    Ok(m)
+}
+
+#[pyo3::pyfunction]
+fn set_tuning_param(name: &str, value: u64) -> pyo3::PyResult<()> {
+    match name {
+        "transfer_batch_size" => {
+            dynamo_llm::block_manager::offload::set_max_transfer_batch_size(value as usize);
+        }
+        "max_concurrent_transfers" => {
+            dynamo_llm::block_manager::offload::set_max_concurrent_transfers(value as usize);
+        }
+        "flush_batch_size" => {
+            dynamo_llm::block_manager::distributed::vllm::set_flush_batch_size(value as usize);
+        }
+        "g4_pipeline_chunk_size" => {
+            dynamo_llm::block_manager::distributed::transfer::set_g4_pipeline_chunk_size(
+                value as usize,
+            );
+        }
+        "g4_transfer_timeout_secs" => {
+            dynamo_llm::block_manager::distributed::vllm::set_g4_transfer_timeout_secs(value);
+        }
+        _ => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown tuning parameter: '{}'. Valid: transfer_batch_size, max_concurrent_transfers, flush_batch_size, g4_pipeline_chunk_size, g4_transfer_timeout_secs",
+                name
+            )));
+        }
+    }
     Ok(())
 }
 

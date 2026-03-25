@@ -33,3 +33,32 @@ pub use slot_runtime::*;
 pub use slot_support::*;
 pub use transfer_engine::*;
 pub use transfer_types::*;
+
+use std::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+
+static REMOTE_ABORT_TOKEN: Mutex<Option<CancellationToken>> = Mutex::new(None);
+
+/// Get (or create) the shared remote-transfer abort token.
+/// Workers use this as a child token so `clear_pool` can cancel in-flight NIXL transfers.
+pub fn remote_abort_token() -> CancellationToken {
+    let mut guard = REMOTE_ABORT_TOKEN.lock().unwrap();
+    if let Some(ref token) = *guard {
+        token.clone()
+    } else {
+        let token = CancellationToken::new();
+        *guard = Some(token.clone());
+        token
+    }
+}
+
+/// Cancel the current abort token and replace it with a fresh one.
+/// Called by `clear_pool` to abort in-flight NIXL transfers.
+pub fn cancel_remote_transfers() {
+    let mut guard = REMOTE_ABORT_TOKEN.lock().unwrap();
+    if let Some(old) = guard.take() {
+        old.cancel();
+        tracing::info!("Cancelled remote abort token to abort in-flight NIXL transfers");
+    }
+    *guard = Some(CancellationToken::new());
+}
