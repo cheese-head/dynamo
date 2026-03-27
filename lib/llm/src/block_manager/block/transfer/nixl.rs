@@ -547,23 +547,42 @@ where
         (xfer_req, still_pending)
     };
 
-    // Wait for completion with cancellation support
     if still_pending {
-        // Try async notification system, fall back to inline polling if unavailable
-        match ctx.register_nixl_transfer(agent, xfer_req) {
+        let nixl_otel_name = match direction {
+            RemoteTransferDirection::Onboard => "kvbm.nixl_read",
+            RemoteTransferDirection::Offload => "kvbm.nixl_write",
+        };
+        let nixl_span = tracing::info_span!(
+            "nixl_io",
+            otel.name = nixl_otel_name,
+            description = "NIXL object store I/O (post + completion wait)",
+            num_blocks,
+            direction = ?direction,
+        );
+
+        let registered = {
+            let _enter = nixl_span.enter();
+            ctx.register_nixl_transfer(agent, xfer_req)
+        };
+
+        use tracing::Instrument;
+        match registered {
             Ok(notification) => {
-                tokio::select! {
-                    result = notification => {
-                        result.map_err(|e| TransferError::ExecutionError(e.to_string()))?;
+                async {
+                    tokio::select! {
+                        result = notification => {
+                            result.map_err(|e| TransferError::ExecutionError(e.to_string()))
+                        }
+                        _ = cancel_token.cancelled() => {
+                            Err(TransferError::Cancelled)
+                        }
                     }
-                    _ = cancel_token.cancelled() => {
-                        return Err(TransferError::Cancelled);
-                    }
-                }
+                }.instrument(nixl_span.clone()).await?;
             }
             Err((_, xfer_req)) => {
-                // Fall back to inline polling
-                poll_transfer_completion_inline(agent, &xfer_req, cancel_token).await?;
+                poll_transfer_completion_inline(agent, &xfer_req, cancel_token)
+                    .instrument(nixl_span)
+                    .await?;
             }
         }
     }
@@ -785,30 +804,41 @@ where
     };
 
     if still_pending {
-        let xfer_span = tracing::info_span!(
-            "disk_post_xfer",
-            otel.name = "kvbm.disk_transfer_wait",
+        let nixl_otel_name = match direction {
+            RemoteTransferDirection::Onboard => "kvbm.nixl_read",
+            RemoteTransferDirection::Offload => "kvbm.nixl_write",
+        };
+        let nixl_span = tracing::info_span!(
+            "nixl_io",
+            otel.name = nixl_otel_name,
+            description = "NIXL disk I/O (post + completion wait)",
             num_blocks,
             direction = op,
         );
-        let _enter = xfer_span.enter();
 
-        let registered = ctx.register_nixl_transfer(agent, xfer_req);
-        drop(_enter);
+        let registered = {
+            let _enter = nixl_span.enter();
+            ctx.register_nixl_transfer(agent, xfer_req)
+        };
 
+        use tracing::Instrument;
         match registered {
             Ok(notification) => {
-                tokio::select! {
-                    result = notification => {
-                        result.map_err(|e| TransferError::ExecutionError(e.to_string()))?;
+                async {
+                    tokio::select! {
+                        result = notification => {
+                            result.map_err(|e| TransferError::ExecutionError(e.to_string()))
+                        }
+                        _ = cancel_token.cancelled() => {
+                            Err(TransferError::Cancelled)
+                        }
                     }
-                    _ = cancel_token.cancelled() => {
-                        return Err(TransferError::Cancelled);
-                    }
-                }
+                }.instrument(nixl_span.clone()).await?;
             }
             Err((_, xfer_req)) => {
-                poll_transfer_completion_inline(agent, &xfer_req, cancel_token).await?;
+                poll_transfer_completion_inline(agent, &xfer_req, cancel_token)
+                    .instrument(nixl_span)
+                    .await?;
             }
         }
     }
@@ -829,7 +859,7 @@ mod tests {
     use crate::block_manager::{
         LayoutConfig,
         block::{BasicMetadata, Block, BlockData, locality},
-        config::{RemoteStorageConfig, RemoteTransferContext},
+        config::{RemoteStorageConfig, RemoteTransferContext, DISK_FLAGS_POSIX_BOTH},
         layout::{BlockLayoutConfig, FullyContiguous, nixl::NixlLayout},
         storage::{PinnedAllocator, PinnedStorage},
     };
@@ -887,16 +917,14 @@ mod tests {
     fn create_transfer_context() -> Arc<TransferContext> {
         let stream = CUDA_CTX.default_stream();
         let handle = tokio::runtime::Handle::current();
-        Arc::new(TransferContext::new(
-            TEST_AGENT.clone(),
-            stream,
-            handle,
-            None,
-        ))
+        Arc::new(
+            TransferContext::new(TEST_AGENT.clone(), stream, handle, None)
+                .expect("TransferContext::new for NIXL tests"),
+        )
     }
 
     fn create_disk_remote_context(base: Arc<TransferContext>, path: &str) -> RemoteTransferContext {
-        RemoteTransferContext::new(base, RemoteStorageConfig::disk(path, false))
+        RemoteTransferContext::new(base, RemoteStorageConfig::disk(path, DISK_FLAGS_POSIX_BOTH))
     }
 
     fn create_object_remote_context(
@@ -1075,7 +1103,7 @@ mod tests {
             .unwrap();
         let onboard_layout = Arc::new(onboard_layout);
 
-        let mut onboard_blocks: Vec<Block<PinnedStorage, locality::Local, BasicMetadata>> = (0..2)
+        let onboard_blocks: Vec<Block<PinnedStorage, locality::Local, BasicMetadata>> = (0..2)
             .map(|i| {
                 let data = BlockData::new(onboard_layout.clone(), i, 0, 0);
                 Block::new(data, BasicMetadata::default()).unwrap()
@@ -1194,7 +1222,7 @@ mod tests {
             .unwrap();
         let onboard_layout = Arc::new(onboard_layout);
 
-        let mut onboard_blocks: Vec<Block<PinnedStorage, locality::Local, BasicMetadata>> = (0..2)
+        let onboard_blocks: Vec<Block<PinnedStorage, locality::Local, BasicMetadata>> = (0..2)
             .map(|i| {
                 let data = BlockData::new(onboard_layout.clone(), i, 0, 0);
                 Block::new(data, BasicMetadata::default()).unwrap()

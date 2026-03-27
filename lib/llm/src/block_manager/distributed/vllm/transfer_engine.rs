@@ -4,7 +4,6 @@
 use std::{sync::Arc, time::Instant};
 
 use dynamo_runtime::utils::task::CriticalTaskExecutionHandle;
-use once_cell::sync::Lazy;
 use tokio::task::JoinSet;
 use tokio::{runtime::Handle, sync::mpsc};
 use tokio_util::sync::CancellationToken;
@@ -32,39 +31,7 @@ use super::{
 
 type VllmBlockManager = KvBlockManager<Logical<DistributedLeaderWorkerResources>, BasicMetadata>;
 
-const DEFAULT_DRAIN_QUEUE_CAP: usize = 512;
-const DEFAULT_MAX_REMOTE_INFLIGHT: usize = 64;
-const DEFAULT_REMOTE_HIGH_QUEUE_CAP: usize = 256;
-const DEFAULT_REMOTE_LOW_QUEUE_CAP: usize = 512;
 use super::g4_transfer_timeout;
-
-static DRAIN_QUEUE_CAP: Lazy<usize> = Lazy::new(|| {
-    std::env::var("DYN_KVBM_G4_DRAIN_QUEUE_CAP")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_DRAIN_QUEUE_CAP)
-});
-
-static MAX_REMOTE_INFLIGHT: Lazy<usize> = Lazy::new(|| {
-    std::env::var("DYN_KVBM_G4_MAX_REMOTE_INFLIGHT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_MAX_REMOTE_INFLIGHT)
-});
-
-static REMOTE_HIGH_QUEUE_CAP: Lazy<usize> = Lazy::new(|| {
-    std::env::var("DYN_KVBM_G4_REMOTE_HIGH_QUEUE_CAP")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_REMOTE_HIGH_QUEUE_CAP)
-});
-
-static REMOTE_LOW_QUEUE_CAP: Lazy<usize> = Lazy::new(|| {
-    std::env::var("DYN_KVBM_G4_REMOTE_LOW_QUEUE_CAP")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_REMOTE_LOW_QUEUE_CAP)
-});
 
 pub struct LocalTransferEngine {
     block_manager: VllmBlockManager,
@@ -92,13 +59,13 @@ impl LocalTransferEngine {
         task_token: CancellationToken,
         kvbm_metrics: KvbmMetrics,
         pin_registry: PinRegistry,
+        prefetch_completed: Arc<std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>>,
+        prefetch_failed: Arc<std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>>,
+        signal: Arc<dyn super::transfer_signal::TransferSignal>,
     ) -> anyhow::Result<()> {
         let (onboard_tx, mut onboard_rx) = mpsc::unbounded_channel::<LocalOnboardRequest>();
         let (offload_tx, mut offload_rx) = mpsc::unbounded_channel::<LocalOffloadRequest>();
-        let (remote_tx, remote_rx) = priority_channel::<RemoteTransferRequest>(
-            *REMOTE_HIGH_QUEUE_CAP,
-            *REMOTE_LOW_QUEUE_CAP,
-        );
+        let (remote_tx, remote_rx) = priority_channel::<RemoteTransferRequest>(0, 0);
         let (drain_tx, mut drain_rx) = mpsc::unbounded_channel::<DrainItem>();
 
         let pin_registry_drain = pin_registry.clone();
@@ -115,6 +82,9 @@ impl LocalTransferEngine {
         let kvbm_metrics_onboard = kvbm_metrics.clone();
         let kvbm_metrics_offload = kvbm_metrics.clone();
         let kvbm_metrics_remote = kvbm_metrics.clone();
+
+        let signal_offload = Arc::clone(&signal);
+        let signal_remote = Arc::clone(&signal);
 
         let onboard_task = CriticalTaskExecutionHandle::new_with_runtime(
             |cancellation_token_onboard| async move {
@@ -133,9 +103,17 @@ impl LocalTransferEngine {
                                 Some(req) => {
                                     let leader = Arc::clone(&leader_onboard);
                                     let metrics = kvbm_metrics_onboard.clone();
+                                    let sig = Arc::clone(&signal);
                                     join_set.spawn(async move {
-                                        if let Err(e) = process_onboard_request(req, &leader, metrics).await {
-                                            tracing::error!("LocalOnboardTask error: {:?}", e);
+                                        let op_id = req.operation_id;
+                                        match process_onboard_request(req, &leader, metrics).await {
+                                            Ok(()) => {
+                                                sig.complete(op_id);
+                                            }
+                                            Err(e) => {
+                                                tracing::error!("LocalOnboardTask error: {:?}", e);
+                                                sig.fail(op_id);
+                                            }
                                         }
                                     });
                                 }
@@ -179,9 +157,10 @@ impl LocalTransferEngine {
                                     let leader = Arc::clone(&leader_offload);
                                     let metrics = kvbm_metrics_offload.clone();
                                     let drain_tx = drain_tx_for_offload.clone();
+                                    let sig = Arc::clone(&signal_offload);
 
                                     join_set.spawn(async move {
-                                        if let Err(e) = process_offload_request(
+                                        match process_offload_request(
                                             req,
                                             &block_manager,
                                             &leader,
@@ -190,22 +169,29 @@ impl LocalTransferEngine {
                                         )
                                         .await
                                         {
-                                            tracing::error!("LocalOffloadTask error: {:?}", e);
-                                            let fake_xfer = BlockTransferRequest {
-                                                from_pool: BlockTransferPool::Device,
-                                                to_pool: BlockTransferPool::Host,
-                                                blocks: vec![],
-                                                connector_req: Some(LeaderTransferRequest {
-                                                    key: key.clone(),
-                                                    uuid: operation_id,
-                                                    requirement: None,
-                                                    request_type: RequestType::Immediate,
-                                                    chained: false,
-                                                }),
-                                                sequence_hashes: None,
-                                            };
-                                            if let Ok(notify_receiver) = leader.transfer_blocks_request(fake_xfer).await {
-                                                let _ = notify_receiver.await;
+                                            Ok(()) => {
+                                                sig.complete(operation_id);
+                                            }
+                                            Err(e) => {
+                                                tracing::error!("LocalOffloadTask error: {:?}", e);
+                                                sig.fail(operation_id);
+                                                let fake_xfer = BlockTransferRequest {
+                                                    from_pool: BlockTransferPool::Device,
+                                                    to_pool: BlockTransferPool::Host,
+                                                    blocks: vec![],
+                                                    connector_req: Some(LeaderTransferRequest {
+                                                        key: key.clone(),
+                                                        uuid: operation_id,
+                                                        requirement: None,
+                                                        request_type: RequestType::Immediate,
+                                                        chained: false,
+                                                    }),
+                                                    sequence_hashes: None,
+                                                    traceparent: None,
+                                                };
+                                                if let Ok(notify_receiver) = leader.transfer_blocks_request(fake_xfer).await {
+                                                    let _ = notify_receiver.await;
+                                                }
                                             }
                                         }
                                     });
@@ -229,19 +215,27 @@ impl LocalTransferEngine {
         )
         .unwrap();
 
+        let prefetch_completed_remote = prefetch_completed;
+        let prefetch_failed_remote = prefetch_failed;
         let remote_task = CriticalTaskExecutionHandle::new_with_runtime(
             |cancellation_token_remote| async move {
                 run_priority_worker(
                     cancellation_token_remote,
                     remote_rx,
-                    *MAX_REMOTE_INFLIGHT,
+                    0,
                     move |req| {
                         let block_manager = block_manager_remote.clone();
                         let leader = Arc::clone(&leader_remote);
                         let metrics = kvbm_metrics_remote.clone();
                         let pin_reg = pin_registry_remote.clone();
+                        let prefetch_ok = prefetch_completed_remote.clone();
+                        let prefetch_err = prefetch_failed_remote.clone();
+                        let sig = Arc::clone(&signal_remote);
                         async move {
-                            if let Err(e) = process_remote_transfer_request(
+                            let op_id = req.operation_id;
+                            let is_prefetch = req.is_onboard
+                                && req.device_block_ids.is_empty();
+                            match process_remote_transfer_request(
                                 req,
                                 &block_manager,
                                 &leader,
@@ -250,7 +244,24 @@ impl LocalTransferEngine {
                             )
                             .await
                             {
-                                tracing::error!("RemoteTransferTask error: {:?}", e);
+                                Ok(()) if is_prefetch => {
+                                    if let Ok(mut set) = prefetch_ok.lock() {
+                                        set.insert(op_id);
+                                    }
+                                }
+                                Err(e) if is_prefetch => {
+                                    tracing::error!("RemoteTransferTask (prefetch) error: {:?}", e);
+                                    if let Ok(mut set) = prefetch_err.lock() {
+                                        set.insert(op_id);
+                                    }
+                                }
+                                Ok(()) => {
+                                    sig.complete(op_id);
+                                }
+                                Err(e) => {
+                                    tracing::error!("RemoteTransferTask error: {:?}", e);
+                                    sig.fail(op_id);
+                                }
                             }
                         }
                     },
@@ -272,12 +283,15 @@ impl LocalTransferEngine {
                         item = drain_rx.recv() => match item { Some(item) => item, None => break }
                     };
 
-                    let drain_span = tracing::info_span!(
-                        "drain_item",
-                        otel.name = "kvbm.drain_host_to_disk",
-                        request_id = %item.request_id,
-                        num_blocks = item.host_block_ids.len(),
-                    );
+                    let drain_span = item.traceparent.as_deref()
+                        .map(|tp| dynamo_runtime::logging::make_linked_span("kvbm.drain", tp))
+                        .unwrap_or_else(|| tracing::info_span!(
+                            "drain_item",
+                            otel.name = "kvbm.drain",
+                            description = "Async host-to-disk drain after offload",
+                            request_id = %item.request_id,
+                            num_blocks = item.host_block_ids.len(),
+                        ));
 
                     let h2o_operation_id = uuid::Uuid::new_v4();
                     let h2o_req = {
@@ -348,13 +362,30 @@ impl LocalTransferEngine {
     }
 }
 
-#[tracing::instrument(level = "info", skip_all, fields(
-    request_id = %offload_req.request_id,
-    operation_id = %offload_req.operation_id,
-    num_blocks = offload_req.block_ids.len(),
-    otel.name = "kvbm.offload_device_to_host",
-))]
 async fn process_offload_request(
+    offload_req: LocalOffloadRequest,
+    block_manager: &VllmBlockManager,
+    leader: &Arc<KvbmLeader>,
+    kvbm_metrics: KvbmMetrics,
+    drain_tx: &mpsc::UnboundedSender<DrainItem>,
+) -> anyhow::Result<()> {
+    let request_id = offload_req.request_id.clone();
+    let operation_id = offload_req.operation_id;
+    let offload_span = offload_req.traceparent.as_deref()
+        .map(|tp| dynamo_runtime::logging::make_linked_span("kvbm.offload", tp))
+        .unwrap_or_else(|| tracing::info_span!("kvbm.offload",
+            request_id = %request_id,
+            operation_id = %operation_id,
+            num_blocks = offload_req.block_ids.len(),
+            otel.name = "kvbm.offload",
+            description = "Device-to-host offload (GPU VRAM to pinned RAM)",
+        ));
+    _process_offload_request_inner(offload_req, block_manager, leader, kvbm_metrics, drain_tx)
+        .instrument(offload_span)
+        .await
+}
+
+async fn _process_offload_request_inner(
     offload_req: LocalOffloadRequest,
     block_manager: &VllmBlockManager,
     leader: &Arc<KvbmLeader>,
@@ -419,6 +450,7 @@ where
         let _alloc_span = tracing::info_span!(
             "bounce_alloc",
             otel.name = "kvbm.bounce_alloc",
+            description = "Allocate pinned host bounce buffers for offload",
             num_blocks = offload_req.block_ids.len(),
         ).entered();
         tokio::task::block_in_place(|| {
@@ -466,6 +498,7 @@ where
             chained: false,
         }),
         sequence_hashes,
+        traceparent: None,
     };
     let notify_receiver = leader.transfer_blocks_request(block_xfer_req).await?;
     notify_receiver
@@ -496,14 +529,27 @@ where
     Ok(())
 }
 
-#[tracing::instrument(level = "info", skip_all, fields(
-    request_id = %onboard_req.request_id,
-    operation_id = %onboard_req.operation_id,
-    num_blocks = onboard_req.src_blocks.len(),
-    src_pool = ?onboard_req.src_blocks.storage_pool(),
-    otel.name = "kvbm.onboard_host_to_device",
-))]
 async fn process_onboard_request(
+    onboard_req: LocalOnboardRequest,
+    leader: &Arc<KvbmLeader>,
+    kvbm_metrics: KvbmMetrics,
+) -> anyhow::Result<()> {
+    let onboard_span = onboard_req.traceparent.as_deref()
+        .map(|tp| dynamo_runtime::logging::make_linked_span("kvbm.onboard.from_host", tp))
+        .unwrap_or_else(|| tracing::info_span!("kvbm.onboard.from_host",
+            request_id = %onboard_req.request_id,
+            operation_id = %onboard_req.operation_id,
+            num_blocks = onboard_req.src_blocks.len(),
+            src_pool = ?onboard_req.src_blocks.storage_pool(),
+            otel.name = "kvbm.onboard.from_host",
+            description = "Onboard from host cache hit (H2D DMA only, no disk read)",
+        ));
+    _process_onboard_request_inner(onboard_req, leader, kvbm_metrics)
+        .instrument(onboard_span)
+        .await
+}
+
+async fn _process_onboard_request_inner(
     onboard_req: LocalOnboardRequest,
     leader: &Arc<KvbmLeader>,
     kvbm_metrics: KvbmMetrics,
@@ -536,21 +582,17 @@ async fn process_onboard_request(
             chained: false,
         }),
         sequence_hashes: None,
+        traceparent: onboard_req.traceparent.clone(),
     };
-    let notify_receiver = leader.transfer_blocks_request(block_xfer_req).await?;
+    let notify_receiver = leader
+        .transfer_blocks_request(block_xfer_req)
+        .await?;
     notify_receiver
         .await
         .map_err(|_| anyhow::anyhow!("onboarding transfer completion failed"))?;
     Ok(())
 }
 
-#[tracing::instrument(level = "info", skip_all, fields(
-    request_id = %req.request_id,
-    operation_id = %req.operation_id,
-    is_onboard = req.is_onboard,
-    num_blocks = req.sequence_hashes.len(),
-    otel.name = "kvbm.g4_process_transfer",
-))]
 async fn process_remote_transfer_request(
     req: RemoteTransferRequest,
     block_manager: &VllmBlockManager,
@@ -565,15 +607,16 @@ async fn process_remote_transfer_request(
     let process_span = req
         .traceparent
         .as_deref()
-        .map(|tp| dynamo_runtime::logging::make_linked_span("kvbm.g4_process_transfer", tp))
+        .map(|tp| dynamo_runtime::logging::make_linked_span("kvbm.remote_transfer", tp))
         .unwrap_or_else(|| {
             tracing::info_span!(
-                "kvbm.g4_process_transfer",
+                "kvbm.remote_transfer",
                 request_id = %request_id,
                 operation_id = %operation_id,
                 is_onboard = req.is_onboard,
                 num_blocks = req.sequence_hashes.len(),
-                otel.name = "kvbm.g4_process_transfer",
+                otel.name = "kvbm.remote_transfer",
+                description = "Leader-side remote transfer orchestration (NIXL + H2D pipeline)",
             )
         });
 
@@ -652,6 +695,7 @@ async fn process_remote_transfer_request(
         is_onboard = req.is_onboard,
         num_blocks = num_blocks,
         otel.name = "kvbm.g4_allocate",
+        description = "Allocate host bounce buffers for remote transfer",
     )
     .entered();
     let (bounce, device, onboard_host_blocks) = if req.is_h2o() {
@@ -678,6 +722,7 @@ async fn process_remote_transfer_request(
         is_onboard = req.is_onboard,
         num_blocks = num_blocks,
         otel.name = "kvbm.g4_build_pipeline",
+        description = "Build NIXL transfer pipeline (descriptors + storage config)",
     )
     .entered();
     let pipeline = vllm_int::create_transfer_pipeline(
@@ -716,6 +761,7 @@ async fn process_remote_transfer_request(
         is_onboard = req.is_onboard,
         num_blocks = num_blocks,
         otel.name = "kvbm.g4_dispatch",
+        description = "ZMQ dispatch of remote transfer request to workers",
     );
     let notify_receiver = leader
         .remote_transfer_request(wire_req)

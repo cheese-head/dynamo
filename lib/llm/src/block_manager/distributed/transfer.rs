@@ -32,9 +32,8 @@ use tokio_util::sync::CancellationToken;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use once_cell::sync::Lazy;
 use std::{any::Any, sync::Arc};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tracing::Instrument;
 
 type LocalBlock<S, M> = Block<S, locality::Local, M>;
@@ -73,61 +72,6 @@ pub fn g4_pipeline_chunk_size_pub() -> usize {
 #[derive(Clone, Debug)]
 pub struct ConnectorTransferBatcher;
 
-#[derive(Clone)]
-pub struct RemoteTransferContextPool {
-    tx: mpsc::UnboundedSender<Arc<RemoteTransferContext>>,
-    rx: Arc<Mutex<mpsc::UnboundedReceiver<Arc<RemoteTransferContext>>>>,
-}
-
-impl RemoteTransferContextPool {
-    pub fn new(contexts: Vec<Arc<RemoteTransferContext>>) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
-        for ctx in contexts {
-            let _ = tx.send(ctx);
-        }
-        Self {
-            tx,
-            rx: Arc::new(Mutex::new(rx)),
-        }
-    }
-
-    pub async fn acquire(&self) -> Result<RemoteTransferContextLease> {
-        let mut rx = self.rx.lock().await;
-        let ctx = rx
-            .recv()
-            .await
-            .ok_or_else(|| anyhow::anyhow!("remote transfer context pool is closed"))?;
-        Ok(RemoteTransferContextLease {
-            ctx: Some(ctx),
-            pool: self.clone(),
-        })
-    }
-
-    fn release(&self, ctx: Arc<RemoteTransferContext>) {
-        let _ = self.tx.send(ctx);
-    }
-}
-
-pub struct RemoteTransferContextLease {
-    ctx: Option<Arc<RemoteTransferContext>>,
-    pool: RemoteTransferContextPool,
-}
-
-impl RemoteTransferContextLease {
-    fn context(&self) -> &Arc<RemoteTransferContext> {
-        self.ctx
-            .as_ref()
-            .expect("remote transfer context lease missing")
-    }
-}
-
-impl Drop for RemoteTransferContextLease {
-    fn drop(&mut self) {
-        if let Some(ctx) = self.ctx.take() {
-            self.pool.release(ctx);
-        }
-    }
-}
 
 impl ConnectorTransferBatcher {
     pub fn new() -> Self {
@@ -157,6 +101,7 @@ impl ConnectorTransferBatcher {
                     blocks: batch.to_vec(),
                     connector_req: None,
                     sequence_hashes: None,
+                    traceparent: request.traceparent.clone(),
                 };
                 handler.execute_transfer_direct(batch_request)
             })
@@ -193,7 +138,7 @@ pub struct BlockTransferHandler {
     /// through the scheduler's completion system.
     pub scheduler_client: Option<TransferSchedulerClient>,
     batcher: ConnectorTransferBatcher,
-    remote_context_pool: Option<Arc<RemoteTransferContextPool>>,
+    remote_ctx: Option<Arc<RemoteTransferContext>>,
     _cancel_token_legacy: CancellationToken,
 }
 
@@ -206,7 +151,7 @@ impl BlockTransferHandler {
         onboard_transfer_context: Arc<TransferContext>,
         offload_transfer_context: Arc<TransferContext>,
         scheduler_client: Option<TransferSchedulerClient>,
-        remote_context_pool: Option<Arc<RemoteTransferContextPool>>,
+        remote_ctx: Option<Arc<RemoteTransferContext>>,
         cancel_token: CancellationToken,
     ) -> Result<Self> {
         Ok(Self {
@@ -218,7 +163,7 @@ impl BlockTransferHandler {
             offload_transfer_context,
             scheduler_client,
             batcher: ConnectorTransferBatcher::new(),
-            remote_context_pool,
+            remote_ctx,
             _cancel_token_legacy: cancel_token,
         })
     }
@@ -342,19 +287,15 @@ impl BlockTransferHandler {
     ///
     /// Handles both onboard (remote -> host -> device) and offload (device -> host -> remote)
     /// transfers, with optional checksum logging when G4 validation is enabled.
-    #[tracing::instrument(level = "info", skip_all, fields(
-        request_id = %request.request_id,
-        operation_id = %request.operation_id,
-        otel.name = "kvbm.g4_transfer",
-    ))]
     pub async fn execute_remote_transfer(&self, request: RemoteTransferRequest) -> Result<()> {
-        let remote_ctx_lease = self
-            .remote_context_pool
+        self._execute_remote_transfer(request).await
+    }
+
+    async fn _execute_remote_transfer(&self, request: RemoteTransferRequest) -> Result<()> {
+        let remote_ctx = self
+            .remote_ctx
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Remote transfer context pool not configured"))?
-            .acquire()
-            .await?;
-        let remote_ctx = remote_ctx_lease.context();
+            .ok_or_else(|| anyhow::anyhow!("Remote transfer context not configured"))?;
 
         let host_blocks = self
             .host
@@ -437,7 +378,8 @@ impl BlockTransferHandler {
                 use tracing::Instrument;
                 let r2h_span = tracing::info_span!(
                     "r2h_transfer",
-                    otel.name = "kvbm.disk_to_host",
+                    otel.name = "kvbm.nixl_read",
+                    description = "NIXL read from remote/disk storage to host (non-chunked)",
                     request_id = %request.request_id,
                     num_blocks,
                     backend,
@@ -492,12 +434,15 @@ impl BlockTransferHandler {
 
                     if !block_pairs.is_empty() {
                         use tracing::Instrument;
-                        let h2d_span = tracing::info_span!(
-                            "h2d_transfer",
-                            otel.name = "kvbm.host_to_device",
-                            request_id = %request.request_id,
-                            num_blocks = block_pairs.len(),
-                        );
+                        let h2d_span = request.traceparent.as_deref()
+                            .map(|tp| dynamo_runtime::logging::make_linked_span("kvbm.h2d", tp))
+                            .unwrap_or_else(|| tracing::info_span!(
+                                "h2d_transfer",
+                                otel.name = "kvbm.h2d",
+                                description = "CUDA async host-to-device DMA (non-chunked)",
+                                request_id = %request.request_id,
+                                num_blocks = block_pairs.len(),
+                            ));
 
                         let local_request = BlockTransferRequest {
                             from_pool: if is_onboard { Host } else { Device },
@@ -505,6 +450,7 @@ impl BlockTransferHandler {
                             blocks: block_pairs,
                             connector_req: None,
                             sequence_hashes: None,
+                            traceparent: None,
                         };
                         self.execute_transfer(local_request)
                             .instrument(h2d_span)
@@ -561,13 +507,45 @@ impl BlockTransferHandler {
     ///
     /// This overlaps R2H of later chunks with H2D of earlier chunks, and enables
     /// concurrent NFS reads that would otherwise be serialized in a single NIXL request.
-    #[tracing::instrument(level = "info", skip_all, fields(
-        request_id = %request.request_id,
-        chunk_size,
-        backend,
-        otel.name = "kvbm.g4_onboard_pipeline",
-    ))]
     async fn execute_remote_transfer_chunked(
+        &self,
+        request: &RemoteTransferRequest,
+        pipeline: &RemoteTransferPipeline,
+        bounce_blocks: &[LocalBlockData<PinnedStorage>],
+        bounce_ids: &[usize],
+        remote_ctx: &Arc<RemoteTransferContext>,
+        backend: &str,
+        chunk_size: usize,
+        host_prefetch_only: bool,
+    ) -> Result<()> {
+        let pipeline_otel_name = if host_prefetch_only {
+            "kvbm.prefetch"
+        } else {
+            "kvbm.onboard.from_remote"
+        };
+        let pipeline_span = request.traceparent.as_deref()
+            .map(|tp| dynamo_runtime::logging::make_linked_span(pipeline_otel_name, tp))
+            .unwrap_or_else(|| {
+                let desc = if host_prefetch_only {
+                    "Chunked disk-to-host prefetch (no H2D, populates host cache)"
+                } else {
+                    "Chunked disk-to-host + H2D onboard from remote storage"
+                };
+                tracing::info_span!("kvbm.pipeline",
+                    request_id = %request.request_id,
+                    chunk_size,
+                    backend,
+                    host_prefetch_only,
+                    otel.name = pipeline_otel_name,
+                    description = desc,
+                )
+            });
+        self._execute_remote_transfer_chunked_inner(
+            request, pipeline, bounce_blocks, bounce_ids, remote_ctx, backend, chunk_size, host_prefetch_only,
+        ).instrument(pipeline_span).await
+    }
+
+    async fn _execute_remote_transfer_chunked_inner(
         &self,
         request: &RemoteTransferRequest,
         pipeline: &RemoteTransferPipeline,
@@ -631,7 +609,8 @@ impl BlockTransferHandler {
             let chunk_span = tracing::info_span!(
                 parent: &transfer_parent,
                 "chunk_r2h_transfer",
-                otel.name = "kvbm.g4_chunk_disk_to_host",
+                otel.name = "kvbm.nixl_read",
+                description = "NIXL chunk read from remote/disk storage to host bounce buffer",
                 request_id = %request_id,
                 chunk_idx,
                 chunk_blocks = end - start,
@@ -700,7 +679,8 @@ impl BlockTransferHandler {
                             let h2d_span = tracing::info_span!(
                                 parent: &tracing::Span::current(),
                                 "chunk_h2d_transfer",
-                                otel.name = "kvbm.g4_chunk_host_to_device",
+                                otel.name = "kvbm.h2d",
+                                description = "CUDA async host-to-device DMA for chunk",
                                 request_id = %request_id,
                                 chunk_idx,
                                 chunk_blocks = end - start,
@@ -713,6 +693,7 @@ impl BlockTransferHandler {
                                         blocks: block_pairs,
                                         connector_req: None,
                                         sequence_hashes: None,
+                                        traceparent: None,
                                     };
                                     h2d_handler
                                         .execute_transfer(local_request)
@@ -924,11 +905,14 @@ impl Handler for BlockTransferHandler {
             let mut request: BlockTransferRequest =
                 decode_transfer_blocks_message(&message.data[0])?;
 
+            let traceparent = request.traceparent.take();
+
             if let Some(req) = request.connector_req.take() {
                 let operation_id = req.uuid;
+                let request_id = req.key.request_id.clone();
 
                 tracing::debug!(
-                    request_id = %req.key.request_id,
+                    request_id = %request_id,
                     operation_id = %operation_id,
                     "scheduling transfer"
                 );
@@ -944,7 +928,19 @@ impl Handler for BlockTransferHandler {
                 // we don't support cancellation yet
                 assert_eq!(handle.scheduler_decision(), SchedulingDecision::Execute);
 
-                match self.execute_transfer(request).await {
+                let dma_span = traceparent.as_deref()
+                    .map(|tp| dynamo_runtime::logging::make_linked_span("kvbm.h2d", tp))
+                    .unwrap_or_else(|| tracing::info_span!("kvbm.h2d",
+                        request_id = %request_id,
+                        operation_id = %operation_id,
+                        num_blocks = request.blocks.len(),
+                        from_pool = ?request.from_pool,
+                        to_pool = ?request.to_pool,
+                        otel.name = "kvbm.h2d",
+                        description = "Worker-side block transfer DMA execution",
+                    ));
+
+                match self.execute_transfer(request).instrument(dma_span).await {
                     Ok(_) => {
                         handle.mark_complete(Ok(())).await;
                         Ok(())

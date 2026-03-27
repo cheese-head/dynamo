@@ -8,6 +8,7 @@ use crate::block_manager::distributed::notifications::{
     NixlNotificationSender, NixlStatusChecker, RegisterTransferNotification, RegistrationError,
     TransferCompleteNotification, spawn_notification_handler,
 };
+use crate::block_manager::v2::physical::transfer::notifications::nixl_events::RegisterNixlNotification;
 use dynamo_runtime::config::environment_names::kvbm as env_kvbm;
 use dynamo_runtime::config::environment_names::kvbm::cpu_cache as env_cpu_cache;
 use dynamo_runtime::config::environment_names::kvbm::disk_cache as env_disk_cache;
@@ -537,6 +538,20 @@ impl RemoteTransferContext {
         }
     }
 
+    pub fn with_notification_sender(
+        base: Arc<TransferContext>,
+        config: RemoteStorageConfig,
+        tx: NixlNotificationSender,
+    ) -> Self {
+        Self {
+            base,
+            config,
+            worker_id: 0,
+            world_size: 1,
+            tx_notifications: Some(tx),
+        }
+    }
+
     pub fn with_topology(mut self, worker_id: u64, world_size: usize) -> Self {
         self.worker_id = worker_id;
         self.world_size = world_size;
@@ -606,26 +621,39 @@ impl RemoteTransferContext {
         agent: &NixlAgent,
         xfer_req: nixl_sys::XferRequest,
     ) -> Result<TransferCompleteNotification, (RegistrationError, nixl_sys::XferRequest)> {
-        let tx = match self.tx_notifications.as_ref() {
-            Some(tx) => tx,
+        let sender = match self.tx_notifications.as_ref() {
+            Some(s) => s,
             None => return Err((RegistrationError::HandlerNotAvailable, xfer_req)),
         };
 
-        // Check channel capacity before moving xfer_req into notification
-        if tx.capacity() == 0 {
-            return Err((RegistrationError::ChannelUnavailable, xfer_req));
-        }
-
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        let notification = RegisterTransferNotification {
-            uuid: uuid::Uuid::new_v4(),
-            checker: NixlStatusChecker::new(agent.clone(), xfer_req),
-            done: done_tx,
-        };
 
-        // This should succeed since we checked capacity above
-        tx.try_send(notification)
-            .expect("channel became unavailable between capacity check and send");
+        match sender {
+            NixlNotificationSender::Polling(tx) => {
+                if tx.capacity() == 0 {
+                    return Err((RegistrationError::ChannelUnavailable, xfer_req));
+                }
+                let notification = RegisterTransferNotification {
+                    uuid: uuid::Uuid::new_v4(),
+                    checker: NixlStatusChecker::new(agent.clone(), xfer_req),
+                    done: done_tx,
+                };
+                tx.try_send(notification)
+                    .expect("channel became unavailable between capacity check and send");
+            }
+            NixlNotificationSender::Events(tx) => {
+                if tx.capacity() == 0 {
+                    return Err((RegistrationError::ChannelUnavailable, xfer_req));
+                }
+                let notification = RegisterNixlNotification {
+                    uuid: uuid::Uuid::new_v4(),
+                    xfer_req,
+                    done: done_tx,
+                };
+                tx.try_send(notification)
+                    .expect("channel became unavailable between capacity check and send");
+            }
+        }
 
         Ok(TransferCompleteNotification::new(done_rx))
     }

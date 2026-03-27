@@ -121,6 +121,7 @@ pub struct LocalOnboardRequest {
     pub src_blocks: Box<dyn AnyBlocks>,
     pub dst_block_ids: Vec<BlockId>,
     pub operation_id: uuid::Uuid,
+    pub traceparent: Option<String>,
 }
 
 impl LocalOnboardRequest {
@@ -129,6 +130,7 @@ impl LocalOnboardRequest {
         src_blocks: Box<dyn AnyBlocks>,
         dst_block_ids: Vec<BlockId>,
         operation_id: uuid::Uuid,
+        traceparent: Option<String>,
     ) -> Self {
         debug_assert!(src_blocks.len() == dst_block_ids.len());
         Self {
@@ -137,6 +139,7 @@ impl LocalOnboardRequest {
             src_blocks,
             dst_block_ids,
             operation_id,
+            traceparent,
         }
     }
 }

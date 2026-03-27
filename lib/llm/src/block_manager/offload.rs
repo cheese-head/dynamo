@@ -143,13 +143,6 @@ struct OffloadCohortProgress {
     sequence_hashes: Vec<u64>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CohortTrackingMode {
-    None,
-    FinalizeDeviceAdmissions,
-    GateHostOffload,
-}
-
 /// The offload manager handles all block transfers between different cache levels.
 pub struct OffloadManager<Locality: LocalityProvider, Metadata: BlockMetadata> {
     // Handles to the device, host, and disk pools.

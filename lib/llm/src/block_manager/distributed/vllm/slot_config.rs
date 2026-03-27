@@ -8,10 +8,12 @@ use dynamo_runtime::config::environment_names::kvbm::remote_storage as env_g4;
 use once_cell::sync::Lazy;
 
 const DEFAULT_G4_TRANSFER_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_PREFETCH_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_G4_MIN_CANDIDATE_BLOCKS: usize = 8;
 const DEFAULT_FLUSH_BATCH_SIZE: usize = 512;
 
 static G4_TRANSFER_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(DEFAULT_G4_TRANSFER_TIMEOUT_SECS);
+static PREFETCH_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(DEFAULT_PREFETCH_TIMEOUT_SECS);
 
 static G4_MIN_CANDIDATE_BLOCKS: Lazy<usize> = Lazy::new(|| {
     std::env::var(env_g4::DYN_KVBM_G4_MIN_CANDIDATE_BLOCKS)
@@ -28,6 +30,12 @@ static INIT: Lazy<()> = Lazy::new(|| {
         .and_then(|s| s.parse().ok())
     {
         G4_TRANSFER_TIMEOUT_SECS.store(v, Ordering::Relaxed);
+    }
+    if let Some(v) = std::env::var("DYN_KVBM_PREFETCH_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        PREFETCH_TIMEOUT_SECS.store(v, Ordering::Relaxed);
     }
     if let Some(v) = std::env::var("DYN_KVBM_FLUSH_BATCH_SIZE")
         .ok()
@@ -49,6 +57,12 @@ pub fn g4_transfer_timeout() -> Duration {
 
 pub fn set_g4_transfer_timeout_secs(secs: u64) {
     G4_TRANSFER_TIMEOUT_SECS.store(secs, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn prefetch_timeout() -> Duration {
+    ensure_init();
+    Duration::from_secs(PREFETCH_TIMEOUT_SECS.load(Ordering::Relaxed))
 }
 
 #[inline]

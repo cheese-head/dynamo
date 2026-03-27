@@ -61,6 +61,9 @@ pub struct KvConnectorWorker {
     connector: WorkerSchedulerClient,
     transfer_client: TransferSchedulerClient,
 
+    loads_done: HashSet<String>,
+    stores_done: HashSet<String>,
+    failed_requests: HashSet<String>,
     active_keys: HashMap<String, SlotKey>,
     local_epochs: HashMap<SlotKey, LocalEpochState>,
 
@@ -109,6 +112,9 @@ impl KvConnectorWorker {
             kvbm_worker: OnceLock::new(),
             connector: worker_client,
             transfer_client,
+            loads_done: HashSet::new(),
+            stores_done: HashSet::new(),
+            failed_requests: HashSet::new(),
             active_keys: HashMap::new(),
             local_epochs: HashMap::new(),
             onboarding_operations: Vec::new(),
@@ -169,6 +175,9 @@ impl Worker for KvConnectorWorker {
 
     fn bind_connector_meta(&mut self, metadata: Vec<u8>) -> anyhow::Result<()> {
         let metadata: ConnectorMetadata = serde_json::from_slice(&metadata)?;
+        self.loads_done = metadata.loads_done.clone();
+        self.stores_done = metadata.stores_done.clone();
+        self.failed_requests = metadata.failed.clone();
         self.bound = true;
         self.iteration = metadata.iteration;
         self.layers_complete = 0;
@@ -300,7 +309,8 @@ impl Worker for KvConnectorWorker {
             .filter_map(|(key, state)| state.offloading_pending.then_some(key.clone()))
             .collect();
         for key in offloading_keys {
-            if !self.connector.has_key(&key) || self.connector.is_key_complete(&key) {
+            let stores_done = self.stores_done.contains(&key.request_id);
+            if !self.connector.has_key(&key) || stores_done {
                 is_finished_offloading.insert(key.request_id.clone());
             }
         }
@@ -326,7 +336,8 @@ impl Worker for KvConnectorWorker {
             .filter_map(|(key, state)| state.onboarding_pending.then_some(key.clone()))
             .collect();
         for key in onboarding_keys {
-            if !self.connector.has_key(&key) || self.connector.is_key_complete(&key) {
+            let loads_done = self.loads_done.contains(&key.request_id);
+            if !self.connector.has_key(&key) || loads_done {
                 is_finished_onboarding.insert(key.request_id.clone());
             }
         }
@@ -364,12 +375,6 @@ impl Worker for KvConnectorWorker {
     fn submit_offload_on_event(&mut self, event: u64) -> anyhow::Result<()> {
         let operations = std::mem::take(&mut self.offloading_operations);
 
-        // Bookkeeping done synchronously while we have &mut self
-        for op in &operations {
-            self.connector.record_operation_key(&op.key, op.uuid);
-        }
-
-        // Clone channel for async use
         let tx = self.connector.get_scheduler_tx();
 
         // Use std::thread since we may be in a subprocess without tokio runtime

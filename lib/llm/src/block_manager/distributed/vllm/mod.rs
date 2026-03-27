@@ -9,6 +9,7 @@
 //! - Transfer pipeline construction
 
 mod checksum;
+mod effect_executor;
 mod g4_onboard;
 mod integration;
 mod leader_core;
@@ -17,22 +18,60 @@ mod offload_planner;
 mod registry_ops;
 mod slot_api;
 mod slot_config;
+mod slot_machine;
 mod slot_ops;
 mod slot_runtime;
 mod slot_support;
 mod transfer_engine;
+mod transfer_signal;
 mod transfer_types;
 
+pub use effect_executor::*;
 pub use integration::*;
 pub use leader_core::*;
 pub use leader_utils::*;
 pub use slot_api::*;
 pub use slot_config::*;
+pub use slot_machine::*;
 pub use slot_ops::*;
 pub use slot_runtime::*;
 pub use slot_support::*;
 pub use transfer_engine::*;
+pub use transfer_signal::*;
 pub use transfer_types::*;
+
+#[cfg(test)]
+mod slot_phase_tests;
+
+#[cfg(test)]
+mod slot_machine_tests;
+
+#[cfg(test)]
+mod vllm_kv_semantics_tests;
+
+#[cfg(test)]
+mod kvbm_vllm_hazard_tests;
+
+#[cfg(test)]
+mod workflow_scenario_tests;
+
+#[cfg(test)]
+mod g4_registry_harness_tests;
+
+#[cfg(test)]
+mod worker_metadata_merge;
+
+#[cfg(test)]
+mod test_harness;
+
+#[cfg(all(test, feature = "testing-cuda"))]
+mod vllm_connector_e2e_tests;
+
+#[cfg(all(test, feature = "testing-nixl", feature = "testing-cuda"))]
+mod transfer_tests;
+
+#[cfg(all(test, feature = "testing-nixl", feature = "testing-cuda"))]
+mod e2e_tests;
 
 use std::sync::Mutex;
 use tokio_util::sync::CancellationToken;

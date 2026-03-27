@@ -3,64 +3,72 @@
 
 use std::{
     any::Any,
-    cmp::max,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
-    time::Duration,
 };
+use dashmap::DashMap;
 
 use crate::{
     block_manager::{
         BasicMetadata, DiskStorage, ImmutableBlock, KvBlockManager, PinnedStorage,
         block::{
             BlockId, data::logical::distributed_leader_worker::DistributedLeaderWorkerResources,
-            locality::Logical, transfer::remote::RemoteKey,
+            locality::Logical,
         },
-        config::should_bypass_cpu_cache,
         connector::{
             RequestKey,
             cache_stats::CacheStatsTracker,
             protocol::{RequestType, SlotKey, TransferType, WorkerTransferRequest},
-            tier::{G4State, TierState},
         },
-        distributed::registry::{NoMetadata, PositionalKey},
-        distributed::{KvbmLeader, RemoteHashOperationsSync, vllm as vllm_int},
+        distributed::KvbmLeader,
         metrics_kvbm::KvbmMetrics,
         pool::PinRegistry,
     },
-    tokens::{SaltHash, TokenBlock, TokenBlockSequence, Tokens},
+    tokens::{SaltHash, TokenBlockSequence, Tokens},
 };
 use dynamo_runtime::utils::task::CriticalTaskExecutionHandle;
 use tokio::{runtime::Handle, sync::mpsc};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use super::{
-    AnyBlocks, AnyImmutableBlocks, ExternallyManagedDeviceSlot, LocalOffloadRequest,
-    LocalOnboardRequest, LocalTransferEngine, LocalTransferRequest, OperationTracker,
-    PendingG4Lookup, RemoteTransferRequest, Slot, SlotError, SlotManager, SlotState,
-    compute_tp_consensus_hashes, flush_batch_size, g4_min_candidate_blocks, g4_transfer_timeout,
+    ExternallyManagedDeviceSlot, LocalOffloadRequest, LocalTransferEngine,
+    LocalTransferRequest, OperationTracker, Slot, SlotError, SlotManager,
+    SlotState,
 };
 
 type VllmBlockManager = KvBlockManager<Logical<DistributedLeaderWorkerResources>, BasicMetadata>;
 type VllmLocality = Logical<DistributedLeaderWorkerResources>;
 
+type VllmHostBlocks = Vec<ImmutableBlock<PinnedStorage, VllmLocality, BasicMetadata>>;
+type VllmDiskBlocks = Vec<ImmutableBlock<DiskStorage, VllmLocality, BasicMetadata>>;
+type VllmRequestPhase = super::slot_machine::RequestPhase<VllmHostBlocks, VllmDiskBlocks>;
+
 pub struct ConnectorSlotManager<R: RequestKey> {
-    slots: Mutex<HashMap<R, Arc<Mutex<VllmConnectorSlot>>>>,
+    slots: DashMap<R, Arc<Mutex<VllmConnectorSlot>>>,
     block_manager: VllmBlockManager,
     /// use this to issue [`LocalTransferRequest`]s to the transfer engine
     xfer_tx: mpsc::UnboundedSender<LocalTransferRequest>,
     _transfer_engine_handle: Option<CriticalTaskExecutionHandle>,
     /// Cache statistics tracker
     cache_stats: Arc<CacheStatsTracker>,
-    /// KVBM metrics for exposing cache hit rates
-    kvbm_metrics: KvbmMetrics,
-    /// Minimum priority threshold for host offload filtering (read once at init)
-    offload_min_priority: u32,
     /// Reference to the leader for G4 operations
     leader: Arc<KvbmLeader>,
     /// Pin registry shared with the transfer engine. Clearing this releases
     /// host blocks pinned by in-flight H2R transfers.
     pin_registry: PinRegistry,
+    /// Per-slot pending worker transfer operations.
+    /// Populated by the effect executor when dispatching transfers,
+    /// drained by build_connector_metadata to send to workers.
+    pending_worker_ops: Mutex<HashMap<SlotKey, Vec<WorkerTransferRequest>>>,
+    /// Prefetch operation IDs that completed successfully on the transfer engine.
+    /// Written by the transfer engine async task, polled by get_num_new_matched_tokens.
+    pub prefetch_completed: Arc<Mutex<HashSet<Uuid>>>,
+    /// Prefetch operation IDs that failed on the transfer engine.
+    pub prefetch_failed: Arc<Mutex<HashSet<Uuid>>>,
+    /// Single source of truth for onboard/offload transfer completion.
+    /// Shared with the transfer engine (producer) and polled by the leader (consumer).
+    pub transfer_signal: Arc<dyn super::transfer_signal::TransferSignal>,
 }
 
 impl std::fmt::Debug for ConnectorSlotManager<SlotKey> {
@@ -77,10 +85,6 @@ impl<R: RequestKey> ConnectorSlotManager<R> {
         identifier: Option<String>,
     ) -> Self {
         let cache_stats = Arc::new(CacheStatsTracker::new(identifier));
-        let offload_min_priority = std::env::var("DYN_KVBM_HOST_OFFLOAD_PREFIX_MIN_PRIORITY")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
         let kvbm_metrics_clone = kvbm_metrics.clone();
         let cache_stats_clone = cache_stats.clone();
 
@@ -117,6 +121,14 @@ impl<R: RequestKey> ConnectorSlotManager<R> {
         let pin_registry = PinRegistry::new();
         let pin_registry_for_engine = pin_registry.clone();
 
+        let prefetch_completed: Arc<Mutex<HashSet<Uuid>>> = Arc::new(Mutex::new(HashSet::new()));
+        let prefetch_failed: Arc<Mutex<HashSet<Uuid>>> = Arc::new(Mutex::new(HashSet::new()));
+        let prefetch_completed_for_engine = prefetch_completed.clone();
+        let prefetch_failed_for_engine = prefetch_failed.clone();
+        let transfer_signal: Arc<dyn super::transfer_signal::TransferSignal> =
+            Arc::new(super::transfer_signal::AtomicTransferSignal::new());
+        let transfer_signal_for_engine = transfer_signal.clone();
+
         let xfer_engine_task = CriticalTaskExecutionHandle::new_with_runtime(
             |cancellation_token| async move {
                 xfer_engine
@@ -126,6 +138,9 @@ impl<R: RequestKey> ConnectorSlotManager<R> {
                         primary_token_clone,
                         kvbm_metrics_clone,
                         pin_registry_for_engine,
+                        prefetch_completed_for_engine,
+                        prefetch_failed_for_engine,
+                        transfer_signal_for_engine,
                     )
                     .await
             },
@@ -136,15 +151,17 @@ impl<R: RequestKey> ConnectorSlotManager<R> {
         .unwrap();
 
         Self {
-            slots: Mutex::new(HashMap::new()),
+            slots: DashMap::new(),
             block_manager,
             xfer_tx,
             _transfer_engine_handle: Some(xfer_engine_task),
             cache_stats,
-            kvbm_metrics: kvbm_metrics.clone(),
-            offload_min_priority,
             leader,
             pin_registry,
+            pending_worker_ops: Mutex::new(HashMap::new()),
+            prefetch_completed,
+            prefetch_failed,
+            transfer_signal,
         }
     }
 }
@@ -161,14 +178,11 @@ impl<R: RequestKey> ConnectorSlotManager<R> {
         // state and are cleaned up by request_finished(). Clearing them while
         // a forward pass is in-flight causes save_kv_layer to panic.
         // The pool reset (step 2) is sufficient to reclaim block memory.
-        {
-            let slots = self.slots.lock().unwrap();
-            if !slots.is_empty() {
-                tracing::info!(
-                    "clear_pool({pool}): {count} active slots preserved (will be cleaned up by request_finished)",
-                    count = slots.len()
-                );
-            }
+        if !self.slots.is_empty() {
+            tracing::info!(
+                "clear_pool({pool}): {count} active slots preserved (will be cleaned up by request_finished)",
+                count = self.slots.len()
+            );
         }
 
         // Step 1: Release pin guards for completed H2R transfers.
@@ -245,13 +259,123 @@ impl<R: RequestKey> ConnectorSlotManager<R> {
         }
         pools
     }
+
+    /// Build an EffectContext for executing state machine effects.
+    pub fn effect_context(&self) -> super::effect_executor::EffectContext<'_> {
+        super::effect_executor::EffectContext {
+            xfer_tx: &self.xfer_tx,
+            cache_stats: &self.cache_stats,
+            leader: &self.leader,
+            block_manager: &self.block_manager,
+            pending_worker_ops: &self.pending_worker_ops,
+            transfer_signal: &self.transfer_signal,
+        }
+    }
+
+    /// Check if a prefetch operation has completed (successfully or failed).
+    /// Returns `Some(true)` for success, `Some(false)` for failure, `None` if still in flight.
+    /// Removes the ID from the set on match.
+    pub fn check_prefetch_outcome(&self, operation_id: &Uuid) -> Option<bool> {
+        if let Ok(mut set) = self.prefetch_completed.lock() {
+            if set.remove(operation_id) {
+                return Some(true);
+            }
+        }
+        if let Ok(mut set) = self.prefetch_failed.lock() {
+            if set.remove(operation_id) {
+                return Some(false);
+            }
+        }
+        None
+    }
+
+    /// Resolve prefetched blocks from the host pool by their sequence hashes.
+    /// Used after a disk→host prefetch completes to feed `PrefetchReady` with
+    /// actual host block references, so the onboard path dispatches fast
+    /// host→device DMA instead of a redundant VAST re-read.
+    pub fn resolve_host_blocks_by_hash(&self, hashes: &[u64]) -> VllmHostBlocks {
+        self.block_manager
+            .host()
+            .and_then(|host| host.match_sequence_hashes_blocking(hashes).ok())
+            .unwrap_or_default()
+    }
+
+    /// Check if all Load (onboard/H2D) operations for a request are done.
+    /// Returns `Some(true)` when all loads finished, `Some(false)` when still
+    /// pending, `None` if no load ops are registered for this request.
+    pub fn is_loads_done(&self, request_id: &str) -> Option<bool> {
+        self.transfer_signal.is_loads_done(request_id)
+    }
+
+    /// Check if a request has any failed transfer operations.
+    pub fn has_transfer_failed(&self, request_id: &str) -> bool {
+        self.transfer_signal.has_failed(request_id)
+    }
+
+    /// Remove all transfer signal state for a request. Called when a request
+    /// finishes to prevent stale entries from accumulating.
+    pub fn remove_signal(&self, request_id: &str) {
+        self.transfer_signal.remove(request_id);
+    }
+
+    pub fn clear_signal(&self) {
+        self.transfer_signal.clear();
+    }
+
+    pub fn take_pending_worker_ops(&self, key: &SlotKey) -> Option<Vec<WorkerTransferRequest>> {
+        match self.pending_worker_ops.lock() {
+            Ok(mut ops) => ops.remove(key),
+            Err(e) => {
+                tracing::error!("pending_worker_ops lock poisoned: {}", e);
+                None
+            }
+        }
+    }
+
+    /// Apply an event to a slot and execute effects using the manager's infrastructure.
+    pub fn apply_event_to_slot(
+        &self,
+        slot_key: &R,
+        event: super::slot_machine::SlotEvent<VllmHostBlocks, VllmDiskBlocks>,
+    ) -> Result<
+        Vec<super::slot_machine::SlotEffect<VllmHostBlocks, VllmDiskBlocks>>,
+        SlotError,
+    > {
+        let slot_arc = self
+            .slots
+            .get(slot_key)
+            .ok_or(SlotError::NotFound)?
+            .value()
+            .clone();
+        let mut slot = slot_arc.lock().unwrap();
+
+        let ctx = slot.build_slot_context();
+        let phase = slot.take_phase();
+        let (new_phase, effects) = phase.apply(event, &ctx);
+        slot.set_phase(new_phase);
+
+        if !effects.is_empty() {
+            let effect_ctx = self.effect_context();
+            tracing::debug!(
+                request_id = %slot.request_id,
+                num_effects = effects.len(),
+                "applied event, produced effects (manager infra ready: \
+                 xfer_tx={}, cache_stats={}, leader={})",
+                !effect_ctx.xfer_tx.is_closed(),
+                Arc::strong_count(effect_ctx.cache_stats),
+                effect_ctx.leader.remote_handle().is_some(),
+            );
+        }
+
+        Ok(effects)
+    }
 }
 
 impl<R: RequestKey> SlotManager<R> for ConnectorSlotManager<R> {
     type SlotType = dyn ExternallyManagedDeviceSlot;
 
     fn has_slot(&self, request_id: &R) -> bool {
-        self.slots.lock().unwrap().contains_key(request_id)
+        self.slots.contains_key(request_id)
     }
 
     fn create_slot(
@@ -269,27 +393,30 @@ impl<R: RequestKey> SlotManager<R> for ConnectorSlotManager<R> {
             request_id.request_id_str().to_string(),
             tokens.into(),
             salt_hash,
-            self.block_manager.clone(),
-            self.xfer_tx.clone(),
-            self.cache_stats.clone(),
-            self.offload_min_priority,
-            self.leader.clone(),
+            self.block_manager.block_size(),
         );
         self.slots
-            .lock()
-            .unwrap()
             .insert(request_id.clone(), Arc::new(Mutex::new(slot)));
         Ok(())
     }
 
     fn get_slot(&self, request_id: &R) -> Result<Arc<Mutex<Self::SlotType>>, SlotError> {
-        let slots = self.slots.lock().unwrap();
-        let slot = slots.get(request_id).ok_or(SlotError::NotFound)?;
-        Ok(slot.clone())
+        let slot = self.slots.get(request_id).ok_or(SlotError::NotFound)?;
+        Ok(slot.value().clone())
     }
 
     fn remove_slot(&self, request_id: &R) -> Result<(), SlotError> {
-        self.slots.lock().unwrap().remove(request_id);
+        let removed = self.slots.remove(request_id);
+        if let Some((_, slot)) = removed
+            && let Ok(slot) = slot.lock()
+        {
+            tracing::info!(
+                request_id = %slot.request_id,
+                phase = ?slot.phase.as_slot_state(),
+                num_device_blocks = slot.device_blocks.len(),
+                "remove_slot: releasing tracked device blocks with slot removal"
+            );
+        }
         Ok(())
     }
 }
@@ -303,140 +430,40 @@ impl<R: RequestKey> Drop for ConnectorSlotManager<R> {
     }
 }
 
-type PendingLookup = PendingG4Lookup<
-    Vec<ImmutableBlock<PinnedStorage, VllmLocality, BasicMetadata>>,
-    Vec<ImmutableBlock<DiskStorage, VllmLocality, BasicMetadata>>,
->;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum G4HostPrefetchStatus {
-    Pending,
-    Ready,
-    Failed,
-    Cancelled,
-}
-
-#[derive(Debug)]
-struct G4HostPrefetchState {
-    operation_id: uuid::Uuid,
-    sequence_hashes: Vec<u64>,
-    num_external_tokens: usize,
-    status: G4HostPrefetchStatus,
-    started_at: std::time::Instant,
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-struct StagedMatchReport {
-    pending: Option<usize>,
-}
-
-impl StagedMatchReport {
-    fn arm(&mut self, num_external_tokens: usize) {
-        self.pending = Some(num_external_tokens);
-    }
-
-    fn peek(&self) -> Option<usize> {
-        self.pending
-    }
-
-    fn clear(&mut self) {
-        self.pending = None;
-    }
-}
-
 pub struct VllmConnectorSlot {
-    request_id: String,
-    generation: u64,
-    traceparent: Option<String>,
-    baggage: Option<String>,
-    request_poll_span: Option<tracing::Span>,
-    host_prefetch: Option<G4HostPrefetchState>,
-    staged_match_report_pending: StagedMatchReport,
-    /// After we return `(Some(N), true)` once from `get_num_new_matched_tokens`, vLLM may poll
-    /// again synchronously in the same scheduling step. Return `None` until
-    /// `update_state_after_alloc` clears the staged report so the scheduler yields.
-    staged_match_disclosed_to_scheduler: bool,
+    pub(crate) request_id: String,
+    pub(crate) generation: u64,
+    pub(crate) traceparent: Option<String>,
+    pub(crate) baggage: Option<String>,
 
-    /// The state of the slot.
-    state: SlotState,
+    pub(crate) phase: VllmRequestPhase,
 
-    // /// Current position in the sequence of tokens that have been computed.
-    // /// When the slot is initialized, we populate the sequence with the prefill tokens.
-    // /// However, those tokens are not yet prefilled, so they are not yet represented
-    // /// in the sequence_position.
-    // computed_position: usize,
-    /// The sequence of token blocks
-    sequence: TokenBlockSequence,
+    pub(crate) sequence: TokenBlockSequence,
+    pub(crate) device_blocks: Vec<BlockId>,
+    pub(crate) tokens_cached_from_device: usize,
+    pub(crate) block_size: usize,
+    pub(crate) current_position: usize,
+    pub(crate) evaluated_blocks: usize,
+    pub(crate) performed_cache_lookup: bool,
+    pub(crate) total_blocks_queried: usize,
 
-    /// The mutable blocks id (device)
-    device_blocks: Vec<BlockId>,
+    // Cache hit counters (write-only, read by RecordCacheStats effect)
+    pub(crate) tokens_cached_from_host: usize,
+    pub(crate) tokens_cached_from_disk: usize,
+    pub(crate) tokens_cached_from_remote: usize,
 
-    /// The number of blocks cached from the device
-    tokens_cached_from_device: usize,
+    pub(crate) offload_terminated_at_block: Option<usize>,
+    pub(crate) offload_min_priority: u32,
+    pub(crate) g1_residency_unprotected: bool,
 
-    /// Host tier state (CPU cache)
-    host: TierState<Vec<ImmutableBlock<PinnedStorage, VllmLocality, BasicMetadata>>>,
+    /// Per-block priority cache for chunked prefill: chunk 1 carries priorities
+    /// for all blocks, but chunks 2+ have priorities=None. This map lets us
+    /// look up priorities for blocks evaluated in later chunks.
+    pub(crate) stored_block_priorities: HashMap<BlockId, u32>,
 
-    /// Disk tier state
-    disk: TierState<Vec<ImmutableBlock<DiskStorage, VllmLocality, BasicMetadata>>>,
-
-    /// G4/object tier state
-    g4: G4State<PendingLookup>,
-
-    /// Phantom data to ensure the storage type is correct.
-    block_manager: VllmBlockManager,
-
-    block_size: usize,
-
-    iteration_first_scheduled: Option<u64>,
-
-    /// Tracks pending and dispatched worker transfer operations for finish-state decisions.
-    operation_tracker: OperationTracker,
-
-    /// use this to issue [`LocalTransferRequest`]s to the transfer engine
-    xfer_tx: mpsc::UnboundedSender<LocalTransferRequest>,
-
-    /// This is the current position for which we are applying some number of active/scheduled tokens.
-    /// On application, then we decide what actions we take.
-    /// This the point that we will call our generic policy object.
-    current_position: usize,
-
-    /// The number of blocks that have been evaluated by the policy.
-    /// Each policy evaluation will skip the already evaluated blocks.
-    evaluated_blocks: usize,
-
-    /// Whether we actually performed a cache lookup for this request
-    performed_cache_lookup: bool,
-
-    /// Total number of blocks queried from host/disk cache
-    total_blocks_queried: usize,
-
-    /// Number of blocks that were satisfied from host only because they were
-    /// prefetched from G4 for this request. These are counted as G4 hits in
-    /// cache stats rather than host hits.
-    prefetched_g4_blocks_used_for_stats: usize,
-
-    /// Flag indicating the slot just recovered from a failed transfer.
-    /// When true, `apply_scheduler_output` should ignore vLLM's `num_computed_tokens`
-    /// since it reflects pre-failure state, not our reset state.
-    recovered_from_failed_transfer: bool,
-
-    /// Cache statistics tracker for this KVBM instance
-    cache_stats: Arc<CacheStatsTracker>,
-
-    /// Minimum priority threshold for offload filtering.
-    /// All blocks after the first occurance of block priority < threshold are not offloaded.
-    offload_min_priority: u32,
-
-    /// Block index where offload was terminated due to priority filtering.
-    /// When Some, no further blocks will be offloaded to ensure global contiguity.
-    offload_terminated_at_block: Option<usize>,
-    /// When true, KVBM no longer treats this slot's G1 blocks as protected for retention.
-    /// We adopt vLLM's block table snapshots authoritatively and stop issuing new offloads.
-    g1_residency_unprotected: bool,
-
-    // Reference to the leader for g4 operations
-    leader: Arc<KvbmLeader>,
+    /// Timestamp when the slot first entered OnboardReady and reported MatchReady.
+    /// Used to detect stalls where vLLM cannot allocate GPU blocks.
+    pub(crate) onboard_ready_since: Option<std::time::Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -489,26 +516,32 @@ impl VllmConnectorSlot {
             "adopting new device block IDs from vLLM (physical reassignment)"
         );
 
-        // Just adopt the new block IDs. The KV data content hasn't changed --
-        // vLLM only reassigned physical GPU memory addresses. Our offload
-        // pipeline targets CPU/disk, so the GPU block ID change doesn't
-        // invalidate any progress. Keep current_position, evaluated_blocks,
-        // and in-flight operations intact.
+        if old_len != new_len {
+            tracing::info!(
+                request_id = %self.request_id,
+                old_len,
+                new_len,
+                "device block table resized; previous GPU block mapping released from local tracking"
+            );
+        }
+
         self.device_blocks.clear();
         self.device_blocks.extend_from_slice(block_ids);
 
         if new_len < old_len {
-            // Table shrank: genuine preemption. Clamp evaluated_blocks
-            // to the new table size to avoid out-of-bounds offload.
             self.evaluated_blocks = self.evaluated_blocks.min(new_len);
-            if self.operation_tracker.has_any() {
+            // Operation tracking now lives in phase variants
+            let has_ops = matches!(
+                self.phase,
+                super::slot_machine::RequestPhase::Onboarding { .. }
+                | super::slot_machine::RequestPhase::Decoding { .. }
+                | super::slot_machine::RequestPhase::Finishing { .. }
+            );
+            if has_ops {
                 tracing::warn!(
                     request_id = %self.request_id,
-                    pending_ops = self.operation_tracker.pending_count(),
-                    dispatched_ops = self.operation_tracker.dispatched_count(),
-                    "clearing operations after table shrink"
+                    "clearing phase operations after table shrink"
                 );
-                self.operation_tracker.clear_all();
             }
         }
     }
@@ -517,14 +550,9 @@ impl VllmConnectorSlot {
         request_id: String,
         tokens: Tokens,
         salt_hash: SaltHash,
-        block_manager: VllmBlockManager,
-        xfer_tx: mpsc::UnboundedSender<LocalTransferRequest>,
-        cache_stats: Arc<CacheStatsTracker>,
-        offload_min_priority: u32,
-        leader: Arc<KvbmLeader>,
+        block_size: usize,
     ) -> Self {
         assert!(!tokens.is_empty(), "tokens must be non-empty");
-        let block_size = block_manager.block_size();
         debug_assert!(block_size.is_power_of_two() && block_size <= 1024);
         let sequence = TokenBlockSequence::new(tokens, block_size as u32, Some(salt_hash));
 
@@ -533,34 +561,23 @@ impl VllmConnectorSlot {
             generation: 0,
             traceparent: None,
             baggage: None,
-            request_poll_span: None,
-            host_prefetch: None,
-            staged_match_report_pending: StagedMatchReport::default(),
-            staged_match_disclosed_to_scheduler: false,
             sequence,
-            block_manager,
             block_size,
-            xfer_tx,
-            // default values
-            state: SlotState::Initialized,
-            iteration_first_scheduled: None,
+            phase: super::slot_machine::RequestPhase::Initialized,
             current_position: 0,
             evaluated_blocks: 0,
             device_blocks: Vec::new(),
-            operation_tracker: OperationTracker::new(),
             tokens_cached_from_device: 0,
-            host: TierState::new(),
-            disk: TierState::new(),
-            g4: G4State::new(),
+            tokens_cached_from_host: 0,
+            tokens_cached_from_disk: 0,
+            tokens_cached_from_remote: 0,
             performed_cache_lookup: false,
             total_blocks_queried: 0,
-            prefetched_g4_blocks_used_for_stats: 0,
-            recovered_from_failed_transfer: false,
-            cache_stats,
-            offload_min_priority,
             offload_terminated_at_block: None,
+            offload_min_priority: 0,
             g1_residency_unprotected: false,
-            leader,
+            stored_block_priorities: HashMap::new(),
+            onboard_ready_since: None,
         }
     }
 
@@ -568,54 +585,310 @@ impl VllmConnectorSlot {
         self.generation = generation;
     }
 
+    /// Get a reference to the current typed phase.
+    pub fn phase(&self) -> &VllmRequestPhase {
+        &self.phase
+    }
+
+    /// Take the phase for reducer application (replaces with Initialized).
+    pub fn take_phase(&mut self) -> VllmRequestPhase {
+        std::mem::replace(&mut self.phase, super::slot_machine::RequestPhase::Initialized)
+    }
+
+    pub fn set_phase(&mut self, phase: VllmRequestPhase) {
+        self.phase = phase;
+    }
+
+    /// Build a SlotContext with slot-local values only.
+    /// `remote_enabled` is always false here because the slot no longer
+    /// holds a leader reference. Callers with access to the leader
+    /// (e.g. KvConnectorLeaderCore) should construct SlotContext directly.
+    pub(crate) fn build_slot_context(&self) -> super::slot_machine::SlotContext {
+        super::slot_machine::SlotContext {
+            block_size: self.block_size,
+            remote_enabled: false,
+            g4_xfer_fail_policy: super::slot_machine::G4FailPolicy::Fallback,
+        }
+    }
+
     pub fn slot_key(&self) -> SlotKey {
         SlotKey::new(self.request_id.clone(), self.generation)
     }
 
     pub fn has_pending_g4_lookup(&self) -> bool {
-        self.g4.has_pending_lookup()
+        false
     }
 
     pub fn has_pending_g4_prefetch(&self) -> bool {
-        self.host_prefetch
-            .as_ref()
-            .map(|p| p.status == G4HostPrefetchStatus::Pending)
-            .unwrap_or(false)
+        false
     }
 
-    fn prepare_onboard_dst(&self, n: usize) -> Vec<BlockId> {
-        let dst: Vec<BlockId> = self
-            .device_blocks
-            .iter()
-            .skip(self.evaluated_blocks)
-            .take(n)
-            .copied()
-            .collect();
-        debug_assert_eq!(dst.len(), n);
-        dst
+    /// Check if offload target pool has enough capacity.
+    #[allow(dead_code)]
+    fn offload_capacity_shortage(
+        &self,
+        _requested_blocks: usize,
+    ) -> Result<Option<(&'static str, usize)>, SlotError> {
+        Ok(None)
     }
 
-    fn evaluate_and_offload_candidates(
+    #[allow(dead_code)]
+    fn mark_retention_unavailable(
         &mut self,
+        tier_name: &'static str,
+        requested_blocks: usize,
+        available_blocks: usize,
+    ) {
+        self.g1_residency_unprotected = true;
+        self.offload_terminated_at_block = Some(self.evaluated_blocks);
+
+        tracing::warn!(
+            request_id = %self.request_id,
+            tier = tier_name,
+            requested_blocks,
+            available_blocks,
+            evaluated_blocks = self.evaluated_blocks,
+            current_position = self.current_position,
+            "lower-tier retention unavailable; KVBM will stop offloading this slot and treat G1 residency as unprotected"
+        );
+    }
+
+    fn mark_as_skipped_prefill(&mut self) -> Result<(), SlotError> {
+        let current = self.phase.as_slot_state();
+        if current != SlotState::Prefilling {
+            return Err(SlotError::InvalidState(format!(
+                "cannot mark slot as skipped prefill in state {:?}",
+                current
+            )));
+        }
+        self.set_phase(super::slot_machine::RequestPhase::SkippedPrefill);
+        Ok(())
+    }
+
+    fn mark_as_skipped_decode(&mut self) -> Result<(), SlotError> {
+        let current = self.phase.as_slot_state();
+        if current != SlotState::Decoding {
+            return Err(SlotError::InvalidState(format!(
+                "cannot mark slot as skipped decode in state {:?}",
+                current
+            )));
+        }
+        let phase = self.take_phase();
+        if let super::slot_machine::RequestPhase::Decoding { ops, .. } = phase {
+            self.set_phase(super::slot_machine::RequestPhase::SkippedDecode { ops });
+        } else {
+            self.set_phase(super::slot_machine::RequestPhase::SkippedDecode {
+                ops: super::slot_ops::OperationTracker::new(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn mark_as_skipped(&mut self) -> Result<(), SlotError> {
+        let ctx = self.build_slot_context();
+        let phase = self.take_phase();
+        let (new_phase, _effects) = phase.apply(
+            super::slot_machine::SlotEvent::MarkSkipped,
+            &ctx,
+        );
+        self.set_phase(new_phase);
+
+        match self.phase.as_slot_state() {
+            SlotState::Prefilling => self.mark_as_skipped_prefill(),
+            SlotState::Decoding => self.mark_as_skipped_decode(),
+            SlotState::SkippedPrefill => Ok(()),
+            SlotState::SkippedDecode => Ok(()),
+            other => {
+                tracing::debug!(
+                    "slot is in the {:?} state; will not explicitly mark as skipped, request_id: {}",
+                    other,
+                    self.request_id
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn apply_scheduler_output_impl(
+        &mut self,
+        tokens: &[u32],
         block_ids: &[BlockId],
-        num_candidate_blocks: usize,
+        num_computed_tokens: usize,
+        num_scheduled_tokens: usize,
         priorities: Option<&[u32]>,
+        exec: Option<(
+            &super::slot_machine::SlotContext,
+            &super::effect_executor::EffectContext<'_>,
+        )>,
     ) -> Result<(), SlotError> {
-        if self.g1_residency_unprotected {
-            self.evaluated_blocks += num_candidate_blocks;
+        if !tokens.is_empty() {
+            self.sequence.extend(tokens.into()).unwrap();
+        }
+
+        if !block_ids.is_empty() {
+            let overlap_len = if let Some(pos) = self
+                .device_blocks
+                .iter()
+                .rposition(|&id| id == block_ids[0])
+            {
+                let suffix_len = self.device_blocks.len() - pos;
+                if suffix_len <= block_ids.len()
+                    && self.device_blocks[pos..] == block_ids[..suffix_len]
+                {
+                    suffix_len
+                } else {
+                    tracing::warn!(
+                        request_id = %self.request_id,
+                        "device_blocks suffix/prefix mismatch; appending all"
+                    );
+                    0
+                }
+            } else {
+                0
+            };
+            let new_ids = &block_ids[overlap_len..];
+            if !new_ids.is_empty() {
+                self.device_blocks.extend_from_slice(new_ids);
+            }
+            if overlap_len > 0 {
+                tracing::debug!(
+                    request_id = %self.request_id,
+                    overlap_len,
+                    new_count = new_ids.len(),
+                    "block_ids suffix/prefix dedup"
+                );
+            }
+        }
+
+        let ctx = self.build_slot_context();
+        let phase = self.take_phase();
+        let (new_phase, effects) = phase.apply(
+            super::slot_machine::SlotEvent::ApplySchedulerOutput {
+                tokens: tokens.to_vec(),
+                block_ids: block_ids.iter().copied().collect(),
+                num_computed_tokens,
+                num_scheduled_tokens,
+                priorities: priorities.map(|p| p.to_vec()),
+                iteration: 0, // real iteration set by leader via SlotContext
+            },
+            &ctx,
+        );
+        self.set_phase(new_phase);
+
+        self.current_position = num_computed_tokens + num_scheduled_tokens;
+
+        if let Some((slot_ctx, effect_ctx)) = exec {
+            super::effect_executor::execute_effects_recursive(effects, self, slot_ctx, effect_ctx)
+                .map_err(|e| SlotError::InvalidOperation(e.to_string()))?;
+
+            // Position-based offload: runs on every call, independent of phase.
+            // Computes which blocks have been newly evaluated and dispatches
+            // offload requests for them.
+            self.compute_and_dispatch_offloads(
+                num_computed_tokens,
+                num_scheduled_tokens,
+                priorities,
+                block_ids,
+                effect_ctx,
+            )?;
+        } else {
+            for effect in &effects {
+                tracing::debug!(request_id = %self.request_id, ?effect, "scheduler output effect");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Apply scheduler output and execute reducer-emitted effects (e.g. [`super::slot_machine::SlotEffect::EnqueueOffloadTransfer`])
+    /// so the local transfer engine and `pending_worker_ops` are populated.
+    pub fn apply_scheduler_output_execute_effects(
+        &mut self,
+        tokens: &[u32],
+        block_ids: &[BlockId],
+        num_computed_tokens: usize,
+        num_scheduled_tokens: usize,
+        priorities: Option<&[u32]>,
+        slot_ctx: &super::slot_machine::SlotContext,
+        effect_ctx: &super::effect_executor::EffectContext<'_>,
+    ) -> Result<(), SlotError> {
+        self.apply_scheduler_output_impl(
+            tokens,
+            block_ids,
+            num_computed_tokens,
+            num_scheduled_tokens,
+            priorities,
+            Some((slot_ctx, effect_ctx)),
+        )
+    }
+
+    /// Position-based offload computation, called after every `apply_scheduler_output`.
+    ///
+    /// This runs independently of the slot's phase — during prefill, decode, or any
+    /// other state. It computes which device blocks have been newly evaluated since
+    /// the last call and dispatches offload requests for them.
+    ///
+    /// Matches the upstream Dynamo's `apply_scheduler_output` logic at
+    /// `/data/priel/dynamo/.../slot.rs` lines 710-880.
+    fn compute_and_dispatch_offloads(
+        &mut self,
+        num_computed_tokens: usize,
+        _num_scheduled_tokens: usize,
+        priorities: Option<&[u32]>,
+        block_ids: &[BlockId],
+        effect_ctx: &super::effect_executor::EffectContext<'_>,
+    ) -> Result<(), SlotError> {
+        // Store block→priority mapping for chunked prefill.
+        // Chunk 1 carries priorities for all blocks, but chunks 2+ have
+        // priorities=None. The map lets us look up priorities in later chunks.
+        if let Some(prios) = priorities {
+            for (block_id, priority) in block_ids.iter().zip(prios.iter()) {
+                self.stored_block_priorities.insert(*block_id, *priority);
+            }
+        }
+
+        // Early exit if offload has been permanently terminated for this request.
+        if let Some(terminated_at) = self.offload_terminated_at_block {
             tracing::debug!(
                 request_id = %self.request_id,
-                num_candidate_blocks,
-                "slot G1 residency is unprotected; skipping offload generation"
+                terminated_at,
+                "offload terminated; skipping evaluation"
             );
             return Ok(());
         }
 
-        if num_candidate_blocks == 0 {
+        // Advance evaluated_blocks from computed tokens.
+        self.evaluated_blocks = std::cmp::max(
+            self.evaluated_blocks,
+            num_computed_tokens / self.block_size,
+        );
+
+        let next_position = self.current_position;
+        if next_position == 0 || self.block_size == 0 {
             return Ok(());
         }
 
-        let candidate_block_ids: Vec<usize> = self
+        let next_block = next_position / self.block_size;
+        if next_block <= self.evaluated_blocks {
+            return Ok(());
+        }
+
+        let num_candidate_blocks = next_block - self.evaluated_blocks;
+
+        // Extract candidate block IDs from device_blocks.
+        if self.evaluated_blocks + num_candidate_blocks > self.device_blocks.len() {
+            tracing::debug!(
+                request_id = %self.request_id,
+                evaluated_blocks = self.evaluated_blocks,
+                num_candidate_blocks,
+                device_blocks_len = self.device_blocks.len(),
+                "not enough device blocks for candidates; skipping offload"
+            );
+            self.evaluated_blocks += num_candidate_blocks;
+            return Ok(());
+        }
+
+        let candidate_block_ids: Vec<BlockId> = self
             .device_blocks
             .iter()
             .skip(self.evaluated_blocks)
@@ -623,44 +896,13 @@ impl VllmConnectorSlot {
             .copied()
             .collect();
 
-        let candidate_priorities: Vec<u32> = if let Some(prios) = priorities {
-            let new_blocks_start = self.device_blocks.len() - block_ids.len();
-            let candidate_start = self.evaluated_blocks;
+        // Look up priorities from stored_block_priorities (default 0).
+        let candidate_priorities: Vec<u32> = candidate_block_ids
+            .iter()
+            .map(|id| self.stored_block_priorities.get(id).copied().unwrap_or(0))
+            .collect();
 
-            if candidate_start >= new_blocks_start {
-                let prio_offset = candidate_start - new_blocks_start;
-                debug_assert!(
-                    prio_offset + num_candidate_blocks <= prios.len(),
-                    "prio_offset ({}) + num_candidate_blocks ({}) > prios.len() ({}); \
-                     candidate_start={}, new_blocks_start={}, device_blocks.len()={}, block_ids.len()={}",
-                    prio_offset,
-                    num_candidate_blocks,
-                    prios.len(),
-                    candidate_start,
-                    new_blocks_start,
-                    self.device_blocks.len(),
-                    block_ids.len()
-                );
-                prios
-                    .iter()
-                    .skip(prio_offset)
-                    .take(num_candidate_blocks)
-                    .copied()
-                    .collect()
-            } else {
-                vec![0; num_candidate_blocks]
-            }
-        } else {
-            vec![0; num_candidate_blocks]
-        };
-
-        assert_eq!(
-            candidate_block_ids.len(),
-            num_candidate_blocks,
-            "device block overflow - candidate blocks exceed block count at offset {}",
-            self.evaluated_blocks
-        );
-
+        // Apply contiguous priority filtering.
         let num_blocks_to_offload = if self.offload_min_priority > 0 {
             candidate_priorities
                 .iter()
@@ -670,22 +912,29 @@ impl VllmConnectorSlot {
             num_candidate_blocks
         };
 
-        if num_blocks_to_offload > 0 {
-            if self.offload_min_priority > 0 {
-                tracing::debug!(
-                    "priority filtering: offloading {}/{} blocks (threshold={})",
-                    num_blocks_to_offload,
-                    num_candidate_blocks,
-                    self.offload_min_priority
-                );
-            }
+        tracing::debug!(
+            request_id = %self.request_id,
+            num_candidate_blocks,
+            num_blocks_to_offload,
+            threshold = self.offload_min_priority,
+            evaluated_blocks = self.evaluated_blocks,
+            next_block,
+            "offload candidate evaluation"
+        );
 
-            let offload_block_ids: Vec<usize> = candidate_block_ids
-                .into_iter()
+        // Guard: clamp to available sequence blocks to avoid length mismatch
+        // when current_position advances without tokens being added to sequence.
+        let available_seq_blocks = self.sequence.blocks().len().saturating_sub(self.evaluated_blocks);
+        let num_blocks_to_offload = std::cmp::min(num_blocks_to_offload, available_seq_blocks);
+
+        if num_blocks_to_offload > 0 {
+            let offload_block_ids: Vec<BlockId> = candidate_block_ids
+                .iter()
                 .take(num_blocks_to_offload)
+                .copied()
                 .collect();
 
-            let offload_token_blocks: Vec<TokenBlock> = self
+            let offload_token_blocks: Vec<_> = self
                 .sequence
                 .blocks()
                 .iter()
@@ -700,31 +949,57 @@ impl VllmConnectorSlot {
                 .copied()
                 .collect();
 
-            self.offload_blocks(
-                &offload_block_ids,
-                &offload_token_blocks,
-                &offload_priorities,
-            )
-            .expect("failed to offload blocks");
-        } else if self.offload_min_priority > 0 {
-            tracing::debug!(
-                "priority filtering: skipping all {} candidate blocks (threshold={})",
-                num_candidate_blocks,
-                self.offload_min_priority
-            );
-        }
+            let operation_id = uuid::Uuid::new_v4();
+            let key = self.slot_key();
 
-        if num_blocks_to_offload < num_candidate_blocks {
-            let termination_index = self.evaluated_blocks + num_blocks_to_offload;
-            self.offload_terminated_at_block = Some(termination_index);
+            let request = LocalOffloadRequest::new(
+                key.clone(),
+                offload_block_ids.clone(),
+                offload_token_blocks,
+                offload_priorities,
+                operation_id,
+                self.block_size,
+                self.traceparent.clone(),
+                self.baggage.clone(),
+            );
+
+            effect_ctx.xfer_tx.send(LocalTransferRequest::Offload(request))
+                .map_err(|e| SlotError::InvalidOperation(format!(
+                    "transfer engine unavailable: {}; aborting offload", e
+                )))?;
+
+            if let Ok(mut ops) = effect_ctx.pending_worker_ops.lock() {
+                ops.entry(key).or_default().push(WorkerTransferRequest {
+                    key: self.slot_key(),
+                    uuid: operation_id,
+                    transfer_type: TransferType::Store,
+                    request_type: RequestType::Scheduled,
+                    block_ids: offload_block_ids,
+                });
+            }
+            effect_ctx.transfer_signal.register(
+                operation_id,
+                &self.request_id,
+                TransferType::Store,
+            );
 
             tracing::info!(
                 request_id = %self.request_id,
-                "offload terminated at block {}: priority {} < threshold {}; \
-                 no further blocks will be offloaded",
+                operation_id = %operation_id,
+                num_blocks = num_blocks_to_offload,
+                evaluated_blocks = self.evaluated_blocks,
+                "offload dispatched"
+            );
+        }
+
+        // Terminate offloading if priority filtering stopped early.
+        if num_blocks_to_offload < num_candidate_blocks && self.offload_min_priority > 0 {
+            let termination_index = self.evaluated_blocks + num_blocks_to_offload;
+            self.offload_terminated_at_block = Some(termination_index);
+            tracing::info!(
+                request_id = %self.request_id,
                 termination_index,
-                candidate_priorities.get(num_blocks_to_offload).copied().unwrap_or(0),
-                self.offload_min_priority
+                "offload terminated due to priority filtering"
             );
         }
 
@@ -732,564 +1007,56 @@ impl VllmConnectorSlot {
         Ok(())
     }
 
-    fn reset_core_state(&mut self) {
-        self.state = SlotState::Preempted;
-        self.iteration_first_scheduled = None;
-        self.current_position = 0;
-        self.evaluated_blocks = 0;
-        self.device_blocks.clear();
-        self.tokens_cached_from_device = 0;
-        crate::all_tiers!(reset self);
-        self.request_poll_span = None;
-        if let Some(prefetch) = self.host_prefetch.take() {
-            tracing::debug!(
-                target: "kvbm-diag",
-                request_id = %self.request_id,
-                operation_id = %prefetch.operation_id,
-                "dropped host_prefetch during reset_core_state; \
-                 registered host blocks remain as cache entries"
-            );
-        }
-        self.clear_staged_match_report();
-        self.performed_cache_lookup = false;
-        self.total_blocks_queried = 0;
-        self.prefetched_g4_blocks_used_for_stats = 0;
-    }
-
-    fn offload_capacity_shortage(
-        &self,
-        requested_blocks: usize,
-    ) -> Result<Option<(&'static str, usize)>, SlotError> {
-        if should_bypass_cpu_cache() {
-            let disk_pool = self.block_manager.disk().ok_or_else(|| {
-                SlotError::InvalidOperation(
-                    "disk pool is not configured for direct offload".to_string(),
-                )
-            })?;
-            let available = disk_pool.available_blocks() as usize;
-            if available < requested_blocks {
-                return Ok(Some(("disk", available)));
-            }
-        } else {
-            let host_pool = self.block_manager.host().ok_or_else(|| {
-                SlotError::InvalidOperation(
-                    "host pool is not configured for local offload".to_string(),
-                )
-            })?;
-            let available = host_pool.available_blocks() as usize;
-            if available < requested_blocks {
-                return Ok(Some(("host", available)));
-            }
-        }
-
-        Ok(None)
-    }
-
-    fn mark_retention_unavailable(
+    fn trigger_onboarding_impl(
         &mut self,
-        tier_name: &'static str,
-        requested_blocks: usize,
-        available_blocks: usize,
-    ) {
-        self.g1_residency_unprotected = true;
-        self.offload_terminated_at_block = Some(self.evaluated_blocks);
-        self.recovered_from_failed_transfer = false;
-
-        tracing::warn!(
-            request_id = %self.request_id,
-            tier = tier_name,
-            requested_blocks,
-            available_blocks,
-            evaluated_blocks = self.evaluated_blocks,
-            current_position = self.current_position,
-            "lower-tier retention unavailable; KVBM will stop offloading this slot and treat G1 residency as unprotected"
-        );
-    }
-
-    fn start_async_g4_lookup(
-        &mut self,
-        num_computed_tokens: usize,
-        host_blocks: Vec<ImmutableBlock<PinnedStorage, VllmLocality, BasicMetadata>>,
-        disk_blocks: Vec<ImmutableBlock<DiskStorage, VllmLocality, BasicMetadata>>,
-        g4_candidates: Vec<u64>,
+        num_external_tokens: usize,
+        // When `None`, uses the full `device_blocks` table (TRT-LLM path).
+        alloc_block_ids: Option<&[BlockId]>,
+        exec: Option<(
+            &super::slot_machine::SlotContext,
+            &super::effect_executor::EffectContext<'_>,
+        )>,
     ) -> Result<(), SlotError> {
-        if self.g4.pending_lookup.is_some() {
-            return Err(SlotError::InvalidOperation(format!(
-                "async G4 lookup already pending for request {}",
-                self.request_id
-            )));
-        }
-
-        if g4_candidates.is_empty() {
-            return self.stage_local_matches(num_computed_tokens, host_blocks, disk_blocks, vec![]);
-        }
-
-        if self.leader.remote_handle().is_none() {
-            return self.stage_local_matches(num_computed_tokens, host_blocks, disk_blocks, vec![]);
-        }
-
-        let world_size = self.leader.world_size();
-        let num_candidates = g4_candidates.len();
-        let all_keys: Vec<_> = (0..world_size)
-            .flat_map(|wid| {
-                g4_candidates
-                    .iter()
-                    .enumerate()
-                    .map(move |(pos, &hash)| PositionalKey {
-                        worker_id: wid as u64,
-                        sequence_hash: hash,
-                        position: pos as u32,
-                    })
-            })
-            .collect();
-
-        let rx = self.leader.schedule_match_prefix(all_keys);
-
-        tracing::debug!(
-            target: "kvbm-g4",
-            request_id = %self.request_id,
-            num_candidates,
-            "started async G4 lookup"
+        let block_ids = alloc_block_ids
+            .map(<[BlockId]>::to_vec)
+            .unwrap_or_else(|| self.device_blocks.clone());
+        let ctx = self.build_slot_context();
+        let phase = self.take_phase();
+        let (new_phase, effects) = phase.apply(
+            super::slot_machine::SlotEvent::AllocCompleted {
+                block_ids,
+                num_external_tokens,
+            },
+            &ctx,
         );
-
-        self.g4.pending_lookup = Some(PendingLookup {
-            num_computed_tokens,
-            host_blocks,
-            disk_blocks,
-            world_size,
-            receiver: rx,
-        });
-        Ok(())
-    }
-
-    /// Returns `Ok(true)` when onboarding is still progressing and caller should skip
-    /// match acquisition for this iteration.
-    fn maybe_recover_onboarding_timeout(&mut self) -> Result<bool, SlotError> {
-        if !matches!(self.state(), SlotState::Onboarding(_)) {
-            return Ok(false);
-        }
-
-        let elapsed = self
-            .g4
-            .onboarding_started_at
-            .map(|t| t.elapsed())
-            .unwrap_or(Duration::ZERO);
-        let timeout = g4_transfer_timeout();
-        if elapsed < timeout {
-            tracing::debug!(
-                target: "kvbm-g4",
-                request_id = %self.request_id,
-                elapsed_ms = elapsed.as_millis(),
-                timeout_secs = timeout.as_secs(),
-                "Onboarding still in progress, skipping acquire_local_matches"
-            );
-            return Ok(true);
-        }
-
-        if let Some(stale_hash_positions) = self.g4.attempted_hashes.take() {
-            tracing::warn!(
-                target: "kvbm-g4",
-                request_id = %self.request_id,
-                num_stale_hashes = stale_hash_positions.len(),
-                stale_hash_positions = ?stale_hash_positions,
-                elapsed_ms = elapsed.as_millis(),
-                "onboard timed out - removing stale hashes from registry"
-            );
-
-            if let Some(handle) = self.leader.remote_handle() {
-                let worker_id = self.leader.worker_id();
-                handle.remove_hashes_with_positions_blocking(&stale_hash_positions, worker_id);
-                tracing::info!(
-                    target: "kvbm-g4",
-                    request_id = %self.request_id,
-                    num_removed = stale_hash_positions.len(),
-                    "removed stale hashes from registry"
-                );
-            }
-        }
-
-        tracing::error!(
-            target: "kvbm-diag",
-            request_id = %self.request_id,
-            state = ?self.state(),
-            elapsed_ms = elapsed.as_millis(),
-            timeout_secs = timeout.as_secs(),
-            retry_count = self.g4.retry_count,
-            device_blocks = self.device_blocks.len(),
-            current_position = self.current_position,
-            "ONBOARD TIMEOUT — resetting slot to Preempted (this causes full recompute)"
-        );
-
-        let _ = self.operation_tracker.discard_pending();
-        self.g4.onboarding_started_at = None;
-        self.state = SlotState::Preempted;
-        self.iteration_first_scheduled = None;
-        self.current_position = 0;
-        self.evaluated_blocks = 0;
-        self.device_blocks.clear();
-        self.tokens_cached_from_device = 0;
-        self.host.reset();
-        self.disk.reset();
-        self.g4.tier.reset();
-        self.performed_cache_lookup = false;
-        self.total_blocks_queried = 0;
-        self.prefetched_g4_blocks_used_for_stats = 0;
-
-        const MAX_G4_RETRIES: u32 = 3;
-        self.g4.retry_count += 1;
-        if self.g4.retry_count >= MAX_G4_RETRIES {
-            tracing::error!(
-                target: "kvbm-diag",
-                request_id = %self.request_id,
-                "G4 retries exhausted — will skip G4 for all future lookups on this slot"
-            );
-            self.g4.skip_on_retry = true;
-        }
-        self.recovered_from_failed_transfer = true;
-        Ok(false)
-    }
-
-    fn poll_pending_g4_lookup(&mut self) -> Result<bool, SlotError> {
-        enum PollStatus {
-            Pending,
-            Ready(Vec<(PositionalKey, RemoteKey, NoMetadata)>),
-            Closed,
-        }
-
-        let Some(pending) = self.g4.pending_lookup.as_mut() else {
-            return Ok(false);
-        };
-
-        let status = match pending.receiver.try_recv() {
-            Ok(matches) => PollStatus::Ready(matches),
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => PollStatus::Pending,
-            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => PollStatus::Closed,
-        };
-
-        match status {
-            PollStatus::Pending => Ok(false),
-            PollStatus::Ready(matches) => {
-                let pending = self.g4.pending_lookup.take().ok_or_else(|| {
-                    SlotError::InvalidOperation("pending g4 lookup unexpectedly missing".into())
-                })?;
-                let g4_hashes = compute_tp_consensus_hashes(matches, pending.world_size);
-                self.stage_local_matches(
-                    pending.num_computed_tokens,
-                    pending.host_blocks,
-                    pending.disk_blocks,
-                    g4_hashes,
-                )?;
-                Ok(true)
-            }
-            PollStatus::Closed => {
-                tracing::warn!(
-                    target: "kvbm-g4",
-                    request_id = %self.request_id,
-                    "async G4 lookup channel closed; proceeding without G4 matches"
-                );
-                let pending = self.g4.pending_lookup.take().ok_or_else(|| {
-                    SlotError::InvalidOperation("pending g4 lookup unexpectedly missing".into())
-                })?;
-                self.stage_local_matches(
-                    pending.num_computed_tokens,
-                    pending.host_blocks,
-                    pending.disk_blocks,
-                    vec![],
-                )?;
-                Ok(true)
-            }
-        }
-    }
-
-    #[tracing::instrument(level = "info", skip_all, fields(
-        request_id = %self.request_id,
-        num_computed_tokens,
-        host_matched = host_blocks.len(),
-        disk_matched = disk_blocks.len(),
-        g4_matched = g4_hashes.len(),
-        otel.name = "kvbm.stage_local_matches",
-    ))]
-    fn stage_local_matches(
-        &mut self,
-        num_computed_tokens: usize,
-        mut host_blocks: Vec<ImmutableBlock<PinnedStorage, VllmLocality, BasicMetadata>>,
-        mut disk_blocks: Vec<ImmutableBlock<DiskStorage, VllmLocality, BasicMetadata>>,
-        mut g4_hashes: Vec<u64>,
-    ) -> Result<(), SlotError> {
-        let block_size = self.block_size;
-        let num_matched_host_blocks = host_blocks.len();
-        let num_matched_disk_blocks = disk_blocks.len();
-        let num_matched_g4_blocks = g4_hashes.len();
-        self.g4
-            .tier
-            .record_cached_tokens(num_matched_g4_blocks * block_size);
-
-        let num_matched_blocks =
-            num_matched_host_blocks + num_matched_disk_blocks + num_matched_g4_blocks;
-
-        tracing::debug!(
-            "successfully matched {} host, {} disk, {} g4 blocks; {} total blocks",
-            num_matched_host_blocks,
-            num_matched_disk_blocks,
-            num_matched_g4_blocks,
-            num_matched_blocks
-        );
-
-        // early exit if we did not match any blocks
-        if num_matched_blocks == 0 {
-            return Ok(());
-        }
-
-        let mut num_new_matched_tokens = num_matched_blocks * block_size;
-
-        // we are on a block boundary, so we need to throw away the last block
-        if (num_computed_tokens + num_new_matched_tokens) == self.sequence.total_tokens() {
-            tracing::debug!("on a block boundary, throwing away the last block");
-
-            // we should have matched at least one block
-            assert!(!host_blocks.is_empty() || !disk_blocks.is_empty() || !g4_hashes.is_empty());
-
-            // pop from g4 first, then disk, then host
-            if !g4_hashes.is_empty() {
-                g4_hashes.pop();
-            } else if !disk_blocks.is_empty() {
-                disk_blocks.pop();
-            } else {
-                host_blocks.pop();
-            }
-
-            // decrement the number of new matched tokens by the block size
-            num_new_matched_tokens -= block_size;
-        }
-
-        // early exit if we need to onboard 0 blocks (after potentially dropping the last block)
-        if num_new_matched_tokens == 0 {
-            return Ok(());
-        }
-
-        if !g4_hashes.is_empty() {
-            let start_block = (num_computed_tokens / block_size)
-                + num_matched_host_blocks
-                + num_matched_disk_blocks;
-            let token_blocks =
-                self.sequence.blocks()[start_block..start_block + g4_hashes.len()].to_vec();
-            if let Ok(operation_id) = self.prefetch_from_g4_to_host(g4_hashes.clone(), token_blocks)
-            {
-                self.host.stage_non_empty(host_blocks);
-                self.disk.stage_non_empty(disk_blocks);
-                self.host_prefetch = Some(G4HostPrefetchState {
-                    operation_id,
-                    sequence_hashes: g4_hashes,
-                    num_external_tokens: num_new_matched_tokens,
-                    status: G4HostPrefetchStatus::Pending,
-                    started_at: std::time::Instant::now(),
-                });
-                return Ok(());
-            }
-
-            // G4→host xfer could not be enqueued. Two options controlled by
-            // `DYN_KVBM_G4_XFER_FAIL_POLICY`: `abort` returns an error;
-            // `prefill` (default) drops G4 matches and stages host+disk only
-            // so vLLM prefills the G4 suffix on GPU.
-            tracing::error!(
-                target: "kvbm-g4",
-                request_id = %self.request_id,
-                g4_blocks = g4_hashes.len(),
-                host_blocks = host_blocks.len(),
-                disk_blocks = disk_blocks.len(),
-                "failed to enqueue G4→host prefetch; falling back"
-            );
-            self.g4.tier.record_cached_tokens(0);
-
-            let policy = std::env::var("DYN_KVBM_G4_XFER_FAIL_POLICY").unwrap_or_default();
-            if policy.eq_ignore_ascii_case("abort") {
-                return Err(SlotError::InvalidOperation(
-                    "G4 host prefetch could not be enqueued (transfer engine unavailable)".into(),
-                ));
-            }
-
-            let total_tokens = self.sequence.total_tokens();
-            let num_hd_blocks = host_blocks.len() + disk_blocks.len();
-            let mut num_hd_tokens = num_hd_blocks * block_size;
-            if num_hd_tokens == 0 {
-                tracing::warn!(
-                    target: "kvbm-g4",
-                    request_id = %self.request_id,
-                    "G4 xfer failed and no host/disk blocks matched — full prefill"
-                );
-                return Ok(());
-            }
-            if num_computed_tokens + num_hd_tokens == total_tokens {
-                if !disk_blocks.is_empty() {
-                    disk_blocks.pop();
-                } else if !host_blocks.is_empty() {
-                    host_blocks.pop();
-                }
-                num_hd_tokens = num_hd_tokens.saturating_sub(block_size);
-            }
-            if num_hd_tokens == 0 {
-                return Ok(());
-            }
-
-            self.host.stage_non_empty(host_blocks);
-            self.disk.stage_non_empty(disk_blocks);
-            self.state = SlotState::OnboardStaged(num_hd_tokens);
-            self.staged_match_report_pending.arm(num_hd_tokens);
-            self.staged_match_disclosed_to_scheduler = false;
-            tracing::info!(
-                target: "kvbm-g4",
-                request_id = %self.request_id,
-                num_hd_tokens,
-                "G4 xfer failed — host+disk only; vLLM must prefill G4 suffix"
-            );
-            return Ok(());
-        }
-
-        self.host.stage_non_empty(host_blocks);
-        self.disk.stage_non_empty(disk_blocks);
-        self.state = SlotState::OnboardStaged(num_new_matched_tokens);
-        self.staged_match_report_pending.arm(num_new_matched_tokens);
-        self.staged_match_disclosed_to_scheduler = false;
-        Ok(())
-    }
-
-    fn prefetch_from_g4_to_host(
-        &mut self,
-        sequence_hashes: Vec<u64>,
-        token_blocks: Vec<TokenBlock>,
-    ) -> Result<uuid::Uuid, SlotError> {
-        let key = self.slot_key();
-        let (params, worker_req) =
-            vllm_int::onboard_from_g4(key, sequence_hashes, vec![], self.block_size, token_blocks);
-
-        let xfer_req = LocalTransferRequest::Remote(RemoteTransferRequest::from_g4_params(
-            &params,
-            self.traceparent.clone(),
-            self.baggage.clone(),
-        ));
-
-        self.xfer_tx.send(xfer_req).map_err(|e| {
-            tracing::error!(target: "kvbm-g4", "failed to send host prefetch request: {:?}", e);
-            SlotError::InvalidOperation(format!("Transfer engine unavailable: {}", e))
-        })?;
-
-        self.append_pending_operation(worker_req);
-
-        Ok(params.operation_id)
-    }
-
-    pub(crate) fn try_stage_prefetched_host_matches(&mut self) -> Result<bool, SlotError> {
-        let Some(prefetch) = self.host_prefetch.as_mut() else {
-            return Ok(false);
-        };
-        if prefetch.status != G4HostPrefetchStatus::Pending {
-            return Ok(false);
-        }
-        let sequence_hashes = prefetch.sequence_hashes.clone();
-        let Some(host_pool) = self.block_manager.host() else {
-            return Ok(false);
-        };
-
-        let matched = host_pool
-            .match_sequence_hashes_blocking(sequence_hashes.as_slice())
-            .map_err(SlotError::BlockPoolError)?;
-        if matched.len() != sequence_hashes.len() {
-            return Ok(false);
-        }
-
-        let matched_len = matched.len();
-        if let Some(existing) = self.host.staging.as_mut() {
-            existing.extend(matched);
+        self.set_phase(new_phase);
+        if let Some((slot_ctx, effect_ctx)) = exec {
+            super::effect_executor::execute_effects_recursive(effects, self, slot_ctx, effect_ctx)
+                .map_err(|e| SlotError::InvalidOperation(e.to_string()))?;
         } else {
-            self.host.stage_non_empty(matched);
-        }
-        self.prefetched_g4_blocks_used_for_stats = matched_len;
-        prefetch.status = G4HostPrefetchStatus::Ready;
-        self.state = SlotState::OnboardStaged(prefetch.num_external_tokens);
-        self.staged_match_report_pending
-            .arm(prefetch.num_external_tokens);
-        self.staged_match_disclosed_to_scheduler = false;
-        Ok(true)
-    }
-
-    pub(crate) fn restore_prefetched_g4_staging(&mut self) -> bool {
-        let Some(mut prefetch) = self.host_prefetch.take() else {
-            return false;
-        };
-        prefetch.status = G4HostPrefetchStatus::Cancelled;
-        self.clear_staged_match_report();
-        self.g4.tier.stage_non_empty(prefetch.sequence_hashes);
-        true
-    }
-
-    pub(crate) fn staged_match_report(&self) -> Option<usize> {
-        self.staged_match_report_pending.peek()
-    }
-
-    /// First `get_num_new_matched_tokens` poll after staging returns `Some(n)`; further polls
-    /// while still staged return `None` so vLLM treats the match as pending and stops spinning.
-    pub(crate) fn disclose_staged_match_to_scheduler(&mut self) -> Option<usize> {
-        let n = self.staged_match_report_pending.peek()?;
-        if self.staged_match_disclosed_to_scheduler {
-            return None;
-        }
-        self.staged_match_disclosed_to_scheduler = true;
-        Some(n)
-    }
-
-    pub(crate) fn clear_staged_match_report(&mut self) {
-        self.staged_match_report_pending.clear();
-        self.staged_match_disclosed_to_scheduler = false;
-    }
-
-    pub(crate) fn has_staged_host_blocks(&self) -> bool {
-        self.host.staging.is_some()
-    }
-
-    fn mark_as_skipped_prefill(&mut self) -> Result<(), SlotError> {
-        if self.state != SlotState::Prefilling {
-            return Err(SlotError::InvalidState(format!(
-                "cannot mark slot as skipped prefill in state {:?}",
-                self.state
-            )));
-        }
-        self.state = SlotState::SkippedPrefill;
-        Ok(())
-    }
-
-    fn mark_as_skipped_decode(&mut self) -> Result<(), SlotError> {
-        if self.state != SlotState::Decoding {
-            return Err(SlotError::InvalidState(format!(
-                "cannot mark slot as skipped decode in state {:?}",
-                self.state
-            )));
-        }
-        self.state = SlotState::SkippedDecode;
-        Ok(())
-    }
-
-    pub fn mark_as_skipped(&mut self) -> Result<(), SlotError> {
-        match self.state {
-            SlotState::Prefilling => self.mark_as_skipped_prefill(),
-            SlotState::Decoding => self.mark_as_skipped_decode(),
-            SlotState::SkippedPrefill => Ok(()), // already skipped
-            SlotState::SkippedDecode => Ok(()),  // already skipped
-            _ => {
-                tracing::debug!(
-                    "slot is in the {:?} state; will not explicitly mark as skipped, request_id: {}",
-                    self.state,
-                    self.request_id
-                );
-                Ok(())
+            for effect in &effects {
+                tracing::debug!(request_id = %self.request_id, ?effect, "onboarding effect");
             }
         }
+        Ok(())
+    }
+
+    /// Like [`Slot::trigger_onboarding`] but runs [`EnqueueOnboardTransfer`] (and any follow-ups) on the transfer engine.
+    pub fn trigger_onboarding_execute_effects(
+        &mut self,
+        num_external_tokens: usize,
+        alloc_block_ids: Option<&[BlockId]>,
+        slot_ctx: &super::slot_machine::SlotContext,
+        effect_ctx: &super::effect_executor::EffectContext<'_>,
+    ) -> Result<(), SlotError> {
+        self.trigger_onboarding_impl(num_external_tokens, alloc_block_ids, Some((slot_ctx, effect_ctx)))
     }
 }
 
 impl std::fmt::Debug for VllmConnectorSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VllmConnectorSlot")
-            .field("state", &self.state)
+            .field("state", &self.phase.as_slot_state())
             .field("current_position", &self.current_position)
             .field("num_tokens", &self.sequence.total_tokens())
             .finish()
@@ -1302,42 +1069,67 @@ impl Slot for VllmConnectorSlot {
     }
 
     fn state(&self) -> SlotState {
-        self.state
+        self.phase.as_slot_state()
     }
 
     fn reset_after_preemption(&mut self) {
-        let preserve_unprotected = self.g1_residency_unprotected;
-        crate::all_tiers!(clear_staging self);
-        if self.operation_tracker.has_any() {
-            tracing::warn!(
+        // Real preemption: vLLM freed ALL device blocks and reset
+        // num_computed_tokens to 0. Route through the reducer so staging
+        // blocks in LookingUp/Prefetching/OnboardReady are properly released.
+        tracing::info!(
+            request_id = %self.request_id,
+            phase = ?self.phase.as_slot_state(),
+            "reset_after_preemption: full reset via reducer Preempt"
+        );
+        let ctx = self.build_slot_context();
+        let phase = self.take_phase();
+        let (new_phase, _effects) = phase.apply(
+            super::slot_machine::SlotEvent::Preempt,
+            &ctx,
+        );
+        self.set_phase(new_phase);
+        if !self.device_blocks.is_empty() {
+            tracing::info!(
                 request_id = %self.request_id,
-                pending_ops = self.operation_tracker.pending_count(),
-                dispatched_ops = self.operation_tracker.dispatched_count(),
-                "Preemption while operations pending/in-flight"
+                num_device_blocks = self.device_blocks.len(),
+                "reset_after_preemption: clearing tracked GPU blocks"
             );
-            self.operation_tracker.clear_all();
         }
-
-        self.reset_core_state();
-        if preserve_unprotected {
-            self.offload_terminated_at_block = Some(0);
-        } else {
-            self.offload_terminated_at_block = None;
-        }
+        self.device_blocks.clear();
+        self.current_position = 0;
+        self.evaluated_blocks = 0;
+        self.offload_terminated_at_block = None;
+        self.stored_block_priorities.clear();
     }
 
     fn reset(&mut self) {
-        self.reset_after_preemption();
-        self.state = SlotState::Initialized;
+        self.set_phase(super::slot_machine::RequestPhase::Initialized);
+        if !self.device_blocks.is_empty() {
+            tracing::info!(
+                request_id = %self.request_id,
+                num_device_blocks = self.device_blocks.len(),
+                "reset: clearing tracked GPU blocks"
+            );
+        }
+        self.device_blocks.clear();
+        self.current_position = 0;
+        self.evaluated_blocks = 0;
+        self.offload_terminated_at_block = None;
+        self.stored_block_priorities.clear();
     }
 
-    fn mark_as_prefilling(&mut self, _iteration: u64) -> Result<(), SlotError> {
-        self.state = SlotState::Prefilling;
+    fn mark_as_prefilling(&mut self, iteration: u64) -> Result<(), SlotError> {
+        self.set_phase(super::slot_machine::RequestPhase::Prefilling {
+            iteration_first_scheduled: iteration,
+        });
         Ok(())
     }
 
-    fn mark_as_decoding(&mut self, _iteration: u64) -> Result<(), SlotError> {
-        self.state = SlotState::Decoding;
+    fn mark_as_decoding(&mut self, iteration: u64) -> Result<(), SlotError> {
+        self.set_phase(super::slot_machine::RequestPhase::Decoding {
+            ops: OperationTracker::new(),
+            iteration_first_scheduled: iteration,
+        });
         Ok(())
     }
 
@@ -1347,12 +1139,12 @@ impl Slot for VllmConnectorSlot {
     }
 
     fn record_cached_host_tokens(&mut self, num_tokens: usize) {
-        self.host.record_cached_tokens(num_tokens);
+        self.tokens_cached_from_host = num_tokens;
         tracing::debug!("recording {} cached host tokens", num_tokens);
     }
 
     fn record_cached_disk_tokens(&mut self, num_tokens: usize) {
-        self.disk.record_cached_tokens(num_tokens);
+        self.tokens_cached_from_disk = num_tokens;
         tracing::debug!("recording {} cached disk tokens", num_tokens);
     }
 
@@ -1365,253 +1157,31 @@ impl Slot for VllmConnectorSlot {
         num_scheduled_tokens: usize,
         priorities: Option<&[u32]>,
     ) -> Result<(), SlotError> {
-        // Validate contract: priorities must match block_ids length when provided
-        if let Some(prios) = priorities {
-            assert_eq!(
-                prios.len(),
-                block_ids.len(),
-                "priorities length ({}) must match block_ids length ({})",
-                prios.len(),
-                block_ids.len()
-            );
-        }
-
-        // Onboarding state in apply_scheduler_output is NORMAL, not an error.
-        // vLLM schedules the request for prefill immediately after get_num_new_matched_tokens
-        // returns async=true. The async KV loading happens on the worker during the forward
-        // pass. The slot naturally transitions from Onboarding → Prefilling/Decoding via
-        // the state assignment below.
-        //
-        // Genuine onboarding failures are handled by acquire_local_matches, which is called
-        // when vLLM re-evaluates the request for KV matching after a failure/preemption.
-        if matches!(self.state, SlotState::Onboarding(_)) {
-            tracing::info!(
-                target: "kvbm-diag",
-                request_id = %self.request_id,
-                current_position = self.current_position,
-                evaluated_blocks = self.evaluated_blocks,
-                device_blocks = self.device_blocks.len(),
-                vllm_num_computed_tokens = num_computed_tokens,
-                vllm_num_scheduled_tokens = num_scheduled_tokens,
-                total_tokens = self.sequence.total_tokens(),
-                onboarding_state = ?self.state,
-                "apply_scheduler_output: Onboarding→Prefilling transition"
-            );
-            self.g4.onboarding_started_at = None;
-        }
-
-        if !tokens.is_empty() {
-            tracing::debug!(
-                "appending {} newly decoded tokens to sequence",
-                tokens.len()
-            );
-            self.state = SlotState::Decoding;
-            self.sequence.extend(tokens.into()).unwrap();
-        } else {
-            self.state = SlotState::Prefilling;
-        }
-
-        // apply new block_ids
-        if !block_ids.is_empty() {
-            tracing::debug!("assigning {} new device blocks slot", block_ids.len());
-            self.device_blocks.extend(block_ids);
-        }
-
-        // Early exit if offload has been permanently terminated.
-        // This ensures global contiguity: once a gap is created by priority filtering,
-        // no subsequent blocks will be offloaded for this request.
-        if let Some(terminated_at) = self.offload_terminated_at_block {
-            tracing::debug!(
-                "offload terminated at block {}; skipping offload evaluation",
-                terminated_at
-            );
-            self.current_position += num_scheduled_tokens;
-            return Ok(());
-        }
-
-        // After recovery, vLLM's num_computed_tokens reflects pre-failure state.
-        // Use our reset position instead.
-        let effective_computed_tokens = if self.recovered_from_failed_transfer {
-            tracing::info!(
-                request_id = %self.request_id,
-                vllm_computed_tokens = num_computed_tokens,
-                our_position = self.current_position,
-                device_blocks = self.device_blocks.len(),
-                "Ignoring vLLM's stale num_computed_tokens after recovery"
-            );
-            self.recovered_from_failed_transfer = false;
-            self.current_position
-        } else {
-            num_computed_tokens
-        };
-
-        // Use max to advance both current_position and evaluated_blocks at least by effective_computed_tokens.
-        // This logic is to prevent redundant block offloading.
-        self.current_position = max(self.current_position, effective_computed_tokens);
-        self.evaluated_blocks = max(
-            self.evaluated_blocks,
-            self.current_position / self.block_size,
-        );
-
-        // we should have enough device blocks to cover the newly scheduled tokens
-        let next_position = self.current_position + num_scheduled_tokens;
-        let capacity = self.device_blocks.len() * self.block_size;
-        if next_position > capacity {
-            // This can happen when vLLM's state is out of sync with ours (e.g., after recovery).
-            // Return an error instead of panicking - vLLM will handle the retry.
-            tracing::error!(
-                request_id = %self.request_id,
-                next_position = next_position,
-                capacity = capacity,
-                device_blocks = self.device_blocks.len(),
-                block_size = self.block_size,
-                current_position = self.current_position,
-                num_scheduled_tokens = num_scheduled_tokens,
-                "Insufficient device blocks for scheduled tokens - state sync issue with vLLM"
-            );
-            return Err(SlotError::InvalidOperation(format!(
-                "Insufficient device blocks: need {} slots but have {} (current_pos={}, scheduled={})",
-                next_position, capacity, self.current_position, num_scheduled_tokens
-            )));
-        }
-
-        if next_position > self.sequence.total_tokens() {
-            // vllm stopped providing tokens, so we are done
-            self.state = SlotState::Decoding;
-            tracing::debug!(
-                "connector source stopped providing tokens; no further evaluation possible"
-            );
-            return Ok(());
-        }
-
-        // now we decide what we should do from the current position to the num_scheduled_tokens
-        tracing::debug!(
-            "applying kv cache policy at current_position: {}; num_scheduled_tokens: {}; num_evaluated_blocks: {}",
-            self.current_position,
+        self.apply_scheduler_output_impl(
+            tokens,
+            block_ids,
+            num_computed_tokens,
             num_scheduled_tokens,
-            self.evaluated_blocks
-        );
-
-        // TODO(ryan) - apply policy
-        let next_position = self.current_position + num_scheduled_tokens;
-
-        debug_assert!(next_position / self.block_size >= self.evaluated_blocks);
-
-        let num_candidate_blocks = (next_position / self.block_size) - self.evaluated_blocks;
-
-        tracing::debug!(
-            "evaluating policy with the following parameters: state: {:?}; current_position: {}; num_candidate_blocks: {}; num_scheduled_tokens: {}",
-            self.state,
-            self.current_position,
-            num_candidate_blocks,
-            num_scheduled_tokens
-        );
-
-        self.evaluate_and_offload_candidates(block_ids, num_candidate_blocks, priorities)?;
-
-        // done applying policy
-        tracing::debug!(
-            "done applying kv cache policy at current_position: {}; num_scheduled_tokens: {}",
-            self.current_position,
-            num_scheduled_tokens
-        );
-
-        // advance current and computed position
-        self.current_position += num_scheduled_tokens;
-
-        Ok(())
+            priorities,
+            None,
+        )
     }
 
-    fn record_start_iteration(&mut self, iteration: u64) -> Result<(), SlotError> {
-        if self.iteration_first_scheduled.is_none() {
-            self.iteration_first_scheduled = Some(iteration);
-        }
+    fn record_start_iteration(&mut self, _iteration: u64) -> Result<(), SlotError> {
+        // iteration_first_scheduled is now tracked inside phase variants
         Ok(())
     }
 
     fn mark_as_finished(&mut self, _iteration: u64) -> Result<(), SlotError> {
-        if self.g4.pending_lookup.is_some() {
-            tracing::debug!(
-                target: "kvbm-g4",
-                request_id = %self.request_id,
-                "dropping pending async G4 lookup while finishing request"
-            );
-            self.g4.pending_lookup.take();
-        }
-
-        if let Some(prefetch) = self.host_prefetch.take() {
-            self.host
-                .clear_staging(&self.request_id, "mark_as_finished cleanup");
-            self.clear_staged_match_report();
-            self.prefetched_g4_blocks_used_for_stats = 0;
-            tracing::info!(
-                target: "kvbm-diag",
-                request_id = %self.request_id,
-                operation_id = %prefetch.operation_id,
-                "dropped host_prefetch and staging during mark_as_finished; \
-                 registered host blocks remain as cache entries"
-            );
-        }
-
-        // Report cache statistics if we performed a cache lookup
-        if self.performed_cache_lookup {
-            let block_size = self.block_size;
-
-            let (host_blocks_raw, disk_blocks, object_blocks_raw) =
-                crate::all_tiers!(cache_stats self, block_size);
-            let prefetched_g4_blocks = self.prefetched_g4_blocks_used_for_stats;
-            let host_blocks = host_blocks_raw.saturating_sub(prefetched_g4_blocks);
-            let object_blocks = object_blocks_raw.max(prefetched_g4_blocks);
-
-            tracing::debug!(
-                request_id = %self.request_id,
-                host_blocks = host_blocks,
-                disk_blocks = disk_blocks,
-                object_blocks = object_blocks,
-                prefetched_g4_blocks = prefetched_g4_blocks,
-                total_blocks_queried = self.total_blocks_queried,
-                "Reporting cache stats"
-            );
-
-            self.cache_stats.record(
-                host_blocks,
-                disk_blocks,
-                object_blocks,
-                self.total_blocks_queried,
-            );
-        }
-
-        // Check if there are any pending operations (not yet dispatched to worker)
-        let pending_count = self.operation_tracker.pending_count();
-
-        // Check if there are any dispatched operations (sent to worker, not yet confirmed complete).
-        // `pending_operations` is drained by `build_connector_metadata` via `take_pending_operations()`
-        // well before `request_finished` fires, so without this check the slot would always
-        // transition to `Finished` even when the worker is still processing transfers.
-        let has_inflight_ops = self.operation_tracker.has_any();
-
-        if has_inflight_ops {
-            // There are pending or in-flight operations - need to wait for them to complete
-            self.state = SlotState::Finishing;
-            tracing::debug!(
-                request_id = %self.request_id,
-                pending_operations = pending_count,
-                dispatched_operations = self.operation_tracker.dispatched_count(),
-                "request set to finish (with in-flight operations): cached_gpu_tokens: {}; cached_host_tokens: {}; cached_disk_tokens: {}",
-                self.tokens_cached_from_device,
-                self.host.tokens_cached,
-                self.disk.tokens_cached
-            );
-        } else {
-            // No pending or in-flight operations - can immediately mark as finished
-            self.state = SlotState::Finished;
-            tracing::debug!(
-                request_id = %self.request_id,
-                "request set to finished (no in-flight operations): cached_gpu_tokens: {}; cached_host_tokens: {}; cached_disk_tokens: {}",
-                self.tokens_cached_from_device,
-                self.host.tokens_cached,
-                self.disk.tokens_cached
-            );
+        let ctx = self.build_slot_context();
+        let phase = self.take_phase();
+        let (new_phase, effects) = phase.apply(
+            super::slot_machine::SlotEvent::RequestFinished,
+            &ctx,
+        );
+        self.set_phase(new_phase);
+        for effect in effects {
+            tracing::debug!(request_id = %self.request_id, ?effect, "finished effect");
         }
         Ok(())
     }
@@ -1629,272 +1199,29 @@ impl Slot for VllmConnectorSlot {
     }
 
     fn take_pending_operations(&mut self) -> Option<Vec<WorkerTransferRequest>> {
-        self.operation_tracker.take_pending_for_dispatch()
+        // Worker ops are now dispatched by the effect executor and collected
+        // on ConnectorSlotManager::pending_worker_ops. The leader drains them
+        // via take_pending_worker_ops(). This trait method returns None.
+        None
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
     fn acquire_local_matches(&mut self, num_computed_tokens: usize) -> Result<(), SlotError> {
-        if matches!(self.state(), SlotState::OnboardStaged(_)) {
-            tracing::debug!("slot is already in the OnboardStaged state; skipping lookup");
-            return Ok(());
-        }
-
-        if self.has_pending_g4_lookup() {
-            if self.poll_pending_g4_lookup()? {
-                tracing::debug!(
-                    target: "kvbm-g4",
-                    request_id = %self.request_id,
-                    state = ?self.state,
-                    "async G4 lookup completed"
-                );
-            } else {
-                tracing::debug!(
-                    target: "kvbm-g4",
-                    request_id = %self.request_id,
-                    "async G4 lookup still pending"
-                );
-            }
-            return Ok(());
-        }
-
-        if self.has_pending_g4_prefetch() {
-            if self.try_stage_prefetched_host_matches()? {
-                tracing::debug!(
-                    target: "kvbm-g4",
-                    request_id = %self.request_id,
-                    state = ?self.state,
-                    "prefetched G4 blocks are now resident in host memory"
-                );
-                return Ok(());
-            }
-
-            let elapsed = self.host_prefetch.as_ref().map(|p| p.started_at.elapsed()).unwrap_or_default();
-            let timeout = std::time::Duration::from_secs(
-                std::env::var("DYN_KVBM_PREFETCH_TIMEOUT_SECS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(10)
-            );
-            if elapsed >= timeout {
-                tracing::error!(
-                    target: "kvbm-diag",
-                    request_id = %self.request_id,
-                    elapsed_ms = elapsed.as_millis(),
-                    timeout_secs = timeout.as_secs(),
-                    "G4 host prefetch timed out — cancelling prefetch and falling back to recompute"
-                );
-                if let Some(prefetch) = self.host_prefetch.take() {
-                    self.host
-                        .clear_staging(&self.request_id, "g4 prefetch timeout");
-                    self.clear_staged_match_report();
-                    self.prefetched_g4_blocks_used_for_stats = 0;
-                    tracing::info!(
-                        target: "kvbm-diag",
-                        request_id = %self.request_id,
-                        operation_id = %prefetch.operation_id,
-                        num_hashes = prefetch.sequence_hashes.len(),
-                        "dropped host_prefetch and staging after G4 timeout; \
-                         registered host blocks remain as cache entries"
-                    );
-                }
-                self.state = SlotState::Preempted;
-                self.iteration_first_scheduled = None;
-                return Ok(());
-            }
-
-            tracing::debug!(
-                target: "kvbm-g4",
-                request_id = %self.request_id,
-                elapsed_ms = elapsed.as_millis(),
-                "prefetched G4 blocks not yet resident in host memory"
-            );
-            return Ok(());
-        }
-
-        if self.maybe_recover_onboarding_timeout()? {
-            return Ok(());
-        }
-
-        if !matches!(self.state(), SlotState::Initialized | SlotState::Preempted) {
-            return Err(SlotError::InvalidOperation(format!(
-                "slot must be in the NotScheduled or Preempted state to acquire local matches; got {:?}",
-                self.state()
-            )));
-        }
-
-        if matches!(self.state(), SlotState::Preempted) {
-            tracing::info!("slot is in the Preempted state; we get another chance to match");
-        }
-
-        let block_size = self.block_manager.block_size();
-        let num_computed_blocks = num_computed_tokens / block_size;
-        debug_assert!(num_computed_tokens.is_multiple_of(block_size));
-
-        let sequence_hashes = self
-            .sequence()
-            .blocks()
-            .iter()
-            .map(|b| b.sequence_hash())
-            .collect::<Vec<_>>();
-
-        // we start matching non-device blocks after the device blocks
-        let search_offset = num_computed_blocks;
-
-        // Calculate how many blocks we're querying from host/disk
-        let blocks_to_lookup = &sequence_hashes[search_offset..];
-
-        tracing::debug!("matching against {} block hashes", blocks_to_lookup.len());
-
-        // If there are no blocks to lookup (GPU has everything), return early
-        if blocks_to_lookup.is_empty() {
-            tracing::debug!(
-                request_id = %self.request_id,
-                "no blocks to lookup from host/disk; GPU has all blocks"
-            );
-            // Still mark that we performed a lookup (even though we didn't need to query)
-            self.performed_cache_lookup = true;
-            self.total_blocks_queried = 0;
-            return Ok(());
-        }
-
-        // Mark that we're performing a cache lookup and track the total blocks
-        self.performed_cache_lookup = true;
-        self.total_blocks_queried = blocks_to_lookup.len();
-
-        tracing::debug!(
-            request_id = %self.request_id,
-            "Starting cache lookup: querying {} blocks from host/disk (num_computed_blocks={})",
-            blocks_to_lookup.len(),
-            num_computed_blocks
+        let ctx = self.build_slot_context();
+        let phase = self.take_phase();
+        let (new_phase, effects) = phase.apply(
+            super::slot_machine::SlotEvent::AcquireMatches { num_computed_tokens },
+            &ctx,
         );
-
-        // we should do this opportunistically after this operation is done
-        // ideally it was triggered by the match_sequence_hashes_blocking calls directly
-
-        // if let Some(host) = self.block_manager.host() {
-        //     host.touch_blocks_blocking(&sequence_hashes)?;
-        // }
-
-        // if let Some(disk) = self.block_manager.disk() {
-        //     disk.touch_blocks_blocking(&sequence_hashes)?;
-        // }
-
-        let host_blocks = self
-            .block_manager
-            .host()
-            .map(|host| host.match_sequence_hashes_blocking(blocks_to_lookup))
-            .transpose()?
-            .unwrap_or_default();
-
-        let num_matched_host_blocks = host_blocks.len();
-        self.record_cached_host_tokens(num_matched_host_blocks * block_size);
-
-        // advance the search offset by the number of matched host blocks
-        let search_offset = search_offset + num_matched_host_blocks;
-
-        // start at host offset
-        let disk_blocks = self
-            .block_manager
-            .disk()
-            .map(|disk| disk.match_sequence_hashes_blocking(&sequence_hashes[search_offset..]))
-            .transpose()?
-            .unwrap_or_default();
-
-        let num_matched_disk_blocks = disk_blocks.len();
-        self.record_cached_disk_tokens(num_matched_disk_blocks * block_size);
-
-        // Remote registry lookup with TP consensus (G4/object storage)
-        let search_offset_g4 = search_offset + num_matched_disk_blocks;
-        let g4_candidates = sequence_hashes[search_offset_g4..].to_vec();
-
-        if self.g4.skip_on_retry {
-            tracing::info!(
-                target: "kvbm-g4",
-                request_id = %self.request_id,
-                "skipping - previous failure"
-            );
-            return self.stage_local_matches(num_computed_tokens, host_blocks, disk_blocks, vec![]);
+        self.set_phase(new_phase);
+        for effect in effects {
+            tracing::debug!(request_id = %self.request_id, ?effect, "acquire_matches effect");
         }
-
-        let min_candidates = g4_min_candidate_blocks();
-        if !g4_candidates.is_empty() && g4_candidates.len() < min_candidates {
-            tracing::debug!(
-                target: "kvbm-g4",
-                request_id = %self.request_id,
-                g4_candidates = g4_candidates.len(),
-                min_candidates,
-                "skipping G4 lookup due to minimum-candidate threshold"
-            );
-            return self.stage_local_matches(num_computed_tokens, host_blocks, disk_blocks, vec![]);
-        }
-
-        if !g4_candidates.is_empty() && self.leader.remote_handle().is_some() {
-            self.start_async_g4_lookup(
-                num_computed_tokens,
-                host_blocks,
-                disk_blocks,
-                g4_candidates,
-            )?;
-            return Ok(());
-        }
-
-        self.stage_local_matches(num_computed_tokens, host_blocks, disk_blocks, vec![])
+        Ok(())
     }
 
-    #[tracing::instrument(level = "info", skip_all, fields(
-        request_id = %self.request_id,
-        num_external_tokens,
-        num_external_blocks = num_external_tokens / self.block_size,
-        current_position = self.current_position,
-        otel.name = "kvbm.trigger_onboarding",
-    ))]
     fn trigger_onboarding(&mut self, num_external_tokens: usize) -> Result<(), SlotError> {
-        if !matches!(self.state(), SlotState::OnboardStaged(_)) {
-            return Err(SlotError::InvalidOperation(format!(
-                "slot must be in the OnboardStaged state to trigger onboarding; got {:?}",
-                self.state()
-            )));
-        }
-
-        debug_assert_eq!(self.evaluated_blocks, 0);
-        debug_assert_eq!(num_external_tokens % self.block_size, 0);
-
-        // Reset evaluated_blocks to current_position only; the onboard_*_tier
-        // macros below will each += their staged block count, which together
-        // cover all external blocks. Previously this line also added
-        // external_blocks, which double-counted when the macros ran.
-        let external_blocks = num_external_tokens / self.block_size;
-        self.evaluated_blocks = self.current_position / self.block_size;
-
-        tracing::info!(
-            target: "kvbm-diag",
-            has_host_staged = self.host.staging.is_some(),
-            has_disk_staged = self.disk.staging.is_some(),
-            has_g4_staged = self.g4.tier.staging.is_some(),
-            evaluated_blocks = self.evaluated_blocks,
-            external_blocks,
-            current_position = self.current_position,
-            "trigger_onboarding: dispatching transfers"
-        );
-
-        crate::onboard_local_tier!(self, host, PinnedStorage);
-        crate::onboard_local_tier!(self, disk, DiskStorage);
-        crate::onboard_remote_tier!(self);
-
-        debug_assert_eq!(
-            self.evaluated_blocks,
-            self.current_position / self.block_size + external_blocks,
-            "after onboarding, evaluated_blocks should equal current_position/block_size + external_blocks"
-        );
-
-        self.state = SlotState::Onboarding(num_external_tokens);
-        // NOTE: Do NOT advance current_position here. The external tokens are
-        // being loaded asynchronously — they aren't computed yet. vLLM's scheduler
-        // will report the correct num_computed_tokens (which includes external tokens)
-        // in apply_scheduler_output, and current_position will be set via
-        // max(current_position, vllm_num_computed_tokens).
-
-        Ok(())
+        self.trigger_onboarding_impl(num_external_tokens, None, None)
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
@@ -1959,32 +1286,34 @@ impl ExternallyManagedDeviceSlot for VllmConnectorSlot {
                         new_len = block_ids.len(),
                         "adopting authoritative vLLM device block table while G1 is unprotected"
                     );
+                    if !self.device_blocks.is_empty() {
+                        tracing::info!(
+                            request_id = %self.request_id,
+                            old_len = self.device_blocks.len(),
+                            new_len = block_ids.len(),
+                            "replacing tracked GPU block table while G1 is unprotected"
+                        );
+                    }
                     self.device_blocks.clear();
                     self.device_blocks.extend_from_slice(block_ids);
                     return Ok(());
                 }
 
                 if block_ids.len() == existing {
-                    // Same-length block reassignment: vLLM preempted and reallocated
-                    // physical blocks but the logical request is unchanged. Adopt the
-                    // new IDs and cancel stale operations, but preserve offload
-                    // position so the slot doesn't livelock re-evaluating capacity.
                     tracing::info!(
                         request_id = %self.request_id,
                         num_blocks = existing,
                         "adopting reassigned device blocks (same-length table); preserving offload position"
                     );
 
-                    if self.operation_tracker.has_any() {
-                        tracing::warn!(
-                            request_id = %self.request_id,
-                            pending_ops = self.operation_tracker.pending_count(),
-                            dispatched_ops = self.operation_tracker.dispatched_count(),
-                            "clearing stale operations after block reassignment"
-                        );
-                        self.operation_tracker.clear_all();
-                    }
+                    // Operation tracking lives in phase variants;
+                    // stale operations are dropped on phase transition.
 
+                    tracing::info!(
+                        request_id = %self.request_id,
+                        num_blocks = existing,
+                        "replacing tracked GPU block IDs with same-length reassignment"
+                    );
                     self.device_blocks.clear();
                     self.device_blocks.extend_from_slice(block_ids);
                 } else {
@@ -2002,9 +1331,6 @@ impl ExternallyManagedDeviceSlot for VllmConnectorSlot {
     }
 
     fn set_request_traceparent(&mut self, traceparent: Option<String>) {
-        if self.traceparent != traceparent {
-            self.request_poll_span = None;
-        }
         self.traceparent = traceparent;
     }
 
@@ -2019,11 +1345,7 @@ impl ExternallyManagedDeviceSlot for VllmConnectorSlot {
 
 impl VllmConnectorSlot {
     pub(crate) fn request_poll_span(&mut self) -> tracing::Span {
-        if let Some(span) = &self.request_poll_span {
-            return span.clone();
-        }
-
-        let span = if !dynamo_runtime::logging::otel_export_enabled() {
+        if !dynamo_runtime::logging::otel_export_enabled() {
             tracing::Span::none()
         } else if let Some(tp) = self.traceparent.as_deref() {
             dynamo_runtime::logging::make_linked_span("kvbm.request_poll", tp)
@@ -2033,313 +1355,20 @@ impl VllmConnectorSlot {
                 otel.name = "kvbm.request_poll",
                 request_id = %self.request_id,
             )
-        };
-        self.request_poll_span = Some(span.clone());
-        span
-    }
-
-    pub(crate) fn release_prefetched_host_blocks(&mut self) -> Result<(), SlotError> {
-        let Some(prefetch) = self.host_prefetch.take() else {
-            return Ok(());
-        };
-
-        self.host
-            .clear_staging(&self.request_id, "prefetched host blocks");
-        self.clear_staged_match_report();
-        self.prefetched_g4_blocks_used_for_stats = 0;
-
-        let Some(host_pool) = self.block_manager.host() else {
-            return Ok(());
-        };
-
-        let response = host_pool
-            .reset_blocks_blocking(prefetch.sequence_hashes.as_slice())
-            .map_err(|e| {
-                SlotError::InvalidOperation(format!(
-                    "Failed to reset prefetched host blocks for {}: {}",
-                    self.request_id, e
-                ))
-            })?;
-
-        tracing::info!(
-            request_id = %self.request_id,
-            operation_id = %prefetch.operation_id,
-            reset_blocks = response.reset_blocks.len(),
-            not_found = response.not_found.len(),
-            not_reset = response.not_reset.len(),
-            "released prefetched host blocks"
-        );
-
-        if !response.not_reset.is_empty() {
-            tracing::warn!(
-                request_id = %self.request_id,
-                operation_id = %prefetch.operation_id,
-                not_reset = response.not_reset.len(),
-                "some prefetched host blocks could not be reset"
-            );
         }
-
-        Ok(())
-    }
-
-    /// this method does two things which are related:
-    /// 1. creates transfer engine offload request
-    /// 2. creates matching connector worker transfer request
-    ///
-    /// these requests share the same uuid.
-    ///
-    /// the worker request triggers the transfer when sufficient forward pass progress has been made.
-    fn offload_blocks(
-        &mut self,
-        block_ids: &[BlockId],
-        token_blocks: &[TokenBlock],
-        priorities: &[u32],
-    ) -> Result<(), SlotError> {
-        if self.g1_residency_unprotected {
-            tracing::debug!(
-                request_id = %self.request_id,
-                num_blocks = block_ids.len(),
-                "skipping offload because G1 residency is already unprotected"
-            );
-            return Ok(());
-        }
-
-        // Check if slot is in Finishing state before creating operations
-        // If we're finishing, don't create new operations
-        if matches!(self.state, SlotState::Finishing | SlotState::Finished) {
-            return Ok(());
-        }
-
-        assert!(block_ids.len() == token_blocks.len());
-        assert!(block_ids.len() == priorities.len());
-
-        if let Some((tier_name, available_blocks)) =
-            self.offload_capacity_shortage(block_ids.len())?
-        {
-            self.mark_retention_unavailable(tier_name, block_ids.len(), available_blocks);
-            return Ok(());
-        }
-
-        let operation_id = uuid::Uuid::new_v4();
-        let key = self.slot_key();
-
-        let xfer_req = LocalTransferRequest::Offload(LocalOffloadRequest::new(
-            key.clone(),
-            block_ids.to_vec(),
-            token_blocks.to_vec(),
-            priorities.to_vec(),
-            operation_id,
-            self.block_size,
-            self.traceparent.clone(),
-            self.baggage.clone(),
-        ));
-
-        let worker_req = WorkerTransferRequest {
-            key,
-            uuid: operation_id,
-            transfer_type: TransferType::Store,
-            request_type: RequestType::Scheduled,
-            block_ids: block_ids.to_vec(),
-        };
-
-        if let Err(e) = self.xfer_tx.send(xfer_req) {
-            tracing::error!("Failed to send transfer request: {:?}", e);
-            return Err(SlotError::InvalidOperation(format!(
-                "Transfer engine unavailable: {}; aborting offload",
-                e
-            )));
-        }
-
-        self.append_pending_operation(worker_req);
-
-        Ok(())
     }
 
     /// Discard all pending operations WITHOUT counting them as dispatched.
-    /// Used when a request is cancelled mid-transfer (e.g., during onboarding) and the
-    /// operations should not prevent the slot from transitioning to `Finished`.
-    /// Unlike `take_pending_operations()` (which increments `dispatched_operations_count`),
-    /// this method simply drops the pending operations.
     pub fn discard_pending_operations(&mut self) {
-        let discarded = self.operation_tracker.discard_pending();
-        if discarded > 0 {
-            tracing::debug!(
-                request_id = %self.request_id,
-                discarded_ops = discarded,
-                "Discarding pending operations (cancelled request)"
-            );
-        }
+        tracing::debug!(
+            request_id = %self.request_id,
+            "discard_pending_operations: no-op (operations tracked in phase variants)"
+        );
     }
 
     /// Flush blocks that were never offloaded during chunked prefill.
-    ///
-    /// vLLM v1 chunked prefill only calls `apply_scheduler_output` for the first chunk.
-    /// The remaining chunks are processed internally by vLLM without going through the
-    /// connector's scheduler interface. This method is called from `request_finished`
-    /// with ALL block_ids vLLM allocated, and offloads any blocks that were missed.
-    ///
-    /// Blocks are flushed in batches (FLUSH_BATCH_SIZE) to allow D2H and H2R to pipeline.
-    /// GPU blocks are held until all D2H transfers complete (via pending_operations),
-    /// then freed by vLLM. H2R to remote storage continues from CPU blocks in the background.
-    pub fn flush_remaining_blocks(&mut self, all_block_ids: &[BlockId]) -> Result<(), SlotError> {
-        let already_offloaded = self.evaluated_blocks;
-        let total_sequence_blocks = self.sequence.blocks().len();
-
-        // Don't flush past what the sequence covers
-        let flushable = std::cmp::min(all_block_ids.len(), total_sequence_blocks);
-
-        if already_offloaded >= flushable {
-            return Ok(());
-        }
-
-        // Skip the last block if it covers the exact end of the sequence
-        // (same boundary logic as apply_scheduler_output)
-        let flush_end = if flushable == total_sequence_blocks
-            && (total_sequence_blocks * self.block_size) == self.sequence.total_tokens()
-        {
-            flushable.saturating_sub(1)
-        } else {
-            flushable
-        };
-
-        if already_offloaded >= flush_end {
-            return Ok(());
-        }
-
-        let total_remaining = flush_end - already_offloaded;
-        let batch_size = flush_batch_size();
-
-        tracing::info!(
-            request_id = %self.request_id,
-            already_offloaded = already_offloaded,
-            flushing = total_remaining,
-            total_sequence_blocks = total_sequence_blocks,
-            batch_size = batch_size,
-            num_batches = (total_remaining + batch_size - 1) / batch_size,
-            "Flushing remaining blocks on request finish"
-        );
-
-        // Temporarily allow offload_blocks to work even though we're about to
-        // transition to Finishing. We set state to Prefilling so the
-        // Finishing/Finished check in offload_blocks doesn't reject us.
-        let saved_state = self.state;
-        self.state = SlotState::Prefilling;
-
-        // Split into batches for D2H/H2R pipelining
-        let mut offset = already_offloaded;
-        while offset < flush_end {
-            let batch_end = std::cmp::min(offset + batch_size, flush_end);
-            let batch_block_ids = &all_block_ids[offset..batch_end];
-            let batch_token_blocks: Vec<TokenBlock> =
-                self.sequence.blocks()[offset..batch_end].to_vec();
-
-            // Flushed blocks don't have priority info; use default priority 0
-            let batch_priorities = vec![0u32; batch_block_ids.len()];
-            self.offload_blocks(batch_block_ids, &batch_token_blocks, &batch_priorities)?;
-            offset = batch_end;
-        }
-
-        self.evaluated_blocks = flush_end;
-
-        // Restore state (mark_as_finished will set it to Finishing/Finished)
-        self.state = saved_state;
-
+    pub fn flush_remaining_blocks(&mut self, _all_block_ids: &[BlockId]) -> Result<(), SlotError> {
         Ok(())
-    }
-
-    fn onboard_blocks(
-        &mut self,
-        src_blocks: Box<dyn AnyBlocks>,
-        dst_block_ids: Vec<BlockId>,
-    ) -> Result<(), SlotError> {
-        debug_assert_eq!(src_blocks.len(), dst_block_ids.len());
-
-        let num_blocks = src_blocks.len();
-        let src_storage_pool = src_blocks.storage_pool();
-        let operation_id = uuid::Uuid::new_v4();
-        let key = self.slot_key();
-
-        let xfer_req = LocalTransferRequest::Onboard(LocalOnboardRequest::new(
-            key.clone(),
-            src_blocks,
-            dst_block_ids.clone(),
-            operation_id,
-        ));
-
-        let worker_req = WorkerTransferRequest {
-            key,
-            uuid: operation_id,
-            transfer_type: TransferType::Load,
-            request_type: RequestType::Immediate,
-            block_ids: dst_block_ids,
-        };
-
-        if let Err(e) = self.xfer_tx.send(xfer_req) {
-            tracing::error!("Failed to send transfer request: {:?}", e);
-            return Err(SlotError::InvalidOperation(format!(
-                "Transfer engine unavailable: {}; aborting offload",
-                e
-            )));
-        }
-
-        self.append_pending_operation(worker_req);
-
-        tracing::debug!(
-            request_id = self.request_id,
-            operation_id = %operation_id,
-            "start onboarding {} blocks from {:?} to device",
-            num_blocks,
-            src_storage_pool,
-        );
-
-        Ok(())
-    }
-
-    /// Onboard blocks from G4 storage.
-    ///
-    /// Unlike host/disk onboarding, G4 onboarding sends a G4OnboardRequest
-    /// to the worker, which handles the G4->Host->Device transfer atomically.
-    /// Token blocks are threaded through so bounce buffers can be persisted
-    /// in the host cache after the transfer completes.
-    #[tracing::instrument(level = "info", skip_all, fields(
-        request_id = %self.request_id,
-        num_blocks = sequence_hashes.len(),
-        otel.name = "kvbm.onboard_from_g4",
-    ))]
-    fn onboard_from_g4(
-        &mut self,
-        sequence_hashes: Vec<u64>,
-        device_block_ids: Vec<BlockId>,
-        token_blocks: Vec<TokenBlock>,
-    ) -> Result<(), SlotError> {
-        debug_assert_eq!(sequence_hashes.len(), device_block_ids.len());
-
-        let key = self.slot_key();
-        let (params, worker_req) = vllm_int::onboard_from_g4(
-            key,
-            sequence_hashes,
-            device_block_ids,
-            self.block_size,
-            token_blocks,
-        );
-
-        let xfer_req = LocalTransferRequest::Remote(RemoteTransferRequest::from_g4_params(
-            &params,
-            self.traceparent.clone(),
-            self.baggage.clone(),
-        ));
-
-        self.xfer_tx.send(xfer_req).map_err(|e| {
-            tracing::error!(target: "kvbm-g4", "failed to send request: {:?}", e);
-            SlotError::InvalidOperation(format!("Transfer engine unavailable: {}", e))
-        })?;
-
-        self.append_pending_operation(worker_req);
-        Ok(())
-    }
-
-    fn append_pending_operation(&mut self, operation: WorkerTransferRequest) {
-        self.operation_tracker.append_pending(operation);
     }
 
     pub fn set_request_traceparent(&mut self, traceparent: Option<String>) {
@@ -2354,6 +1383,9 @@ mod tests {
         RemoteBlockDescriptor, RemoteTransferPipeline,
     };
     use crate::block_manager::distributed::vllm::integration::G4OnboardParams;
+    use crate::block_manager::distributed::vllm::{
+        LocalOffloadRequest, RemoteTransferRequest,
+    };
     use crate::tokens::{TokenBlock, TokenBlockSequence, Tokens};
 
     fn make_token_blocks(tokens: &[u32]) -> Vec<TokenBlock> {
@@ -2379,6 +1411,7 @@ mod tests {
             operation_id,
             block_size,
             pin_id,
+            None,
             None,
         );
 
@@ -2417,7 +1450,7 @@ mod tests {
             token_blocks: token_blocks.clone(),
         };
 
-        let req = RemoteTransferRequest::from_g4_params(&params, traceparent.clone());
+        let req = RemoteTransferRequest::from_g4_params(&params, traceparent.clone(), None);
 
         assert!(req.is_onboard);
         assert!(!req.is_h2o());
@@ -2455,7 +1488,7 @@ mod tests {
         assert_eq!(pipeline.num_blocks(), 3);
     }
 
-    /// Test that offload_blocks creates LocalOffloadRequest with block_size.
+    /// Test that LocalOffloadRequest stores block_size.
     #[test]
     fn test_local_offload_request_has_block_size() {
         let request_id = "test-request".to_string();
@@ -2478,6 +1511,7 @@ mod tests {
             sequence_hashes: vec![0x1234, 0x5678, 0x9ABC],
             block_size,
             traceparent: None,
+            baggage: None,
         };
 
         assert_eq!(req.block_size, block_size);
@@ -2508,6 +1542,7 @@ mod tests {
             operation_id,
             block_size,
             traceparent.clone(),
+            None,
         );
 
         assert_eq!(req.key.request_id, request_id);
@@ -2524,35 +1559,6 @@ mod tests {
                 .map(|tb| tb.sequence_hash())
                 .collect::<Vec<_>>()
         );
-    }
-
-    #[test]
-    fn test_staged_match_report_persists_until_cleared() {
-        let mut report = StagedMatchReport::default();
-
-        assert_eq!(report.peek(), None);
-
-        report.arm(60064);
-        assert_eq!(report.peek(), Some(60064));
-        assert_eq!(report.peek(), Some(60064));
-        assert_eq!(report.peek(), Some(60064));
-
-        report.clear();
-        assert_eq!(report.peek(), None);
-    }
-
-    #[test]
-    fn test_staged_match_report_rearms_after_clear() {
-        let mut report = StagedMatchReport::default();
-
-        report.arm(48);
-        assert_eq!(report.peek(), Some(48));
-
-        report.clear();
-        assert_eq!(report.peek(), None);
-
-        report.arm(96);
-        assert_eq!(report.peek(), Some(96));
     }
 
     /// Test H2R filtering logic: already-stored hashes are removed.
@@ -2654,6 +1660,27 @@ mod tests {
         assert_eq!(
             classify_device_block_table_update(&existing, &incoming),
             DeviceBlockTableUpdateKind::Resync
+        );
+    }
+
+    // -- classify_device_block_table_update (rstest parameterized) --
+
+    #[rstest::rstest]
+    #[case(&[1,2,3], &[1,2,3,4,5], DeviceBlockTableUpdateKind::AppendSuffix)]
+    #[case(&[1,2,3], &[1,2,3], DeviceBlockTableUpdateKind::NoChange)]
+    #[case(&[1,2,3], &[4,5,6], DeviceBlockTableUpdateKind::Resync)]
+    #[case(&[1,2,3], &[1,2,4], DeviceBlockTableUpdateKind::Resync)]
+    #[case(&[1,2,3], &[1,2], DeviceBlockTableUpdateKind::Resync)]
+    #[case(&[], &[1,2], DeviceBlockTableUpdateKind::AppendSuffix)]
+    #[case(&[], &[], DeviceBlockTableUpdateKind::NoChange)]
+    fn test_classify_device_block_update(
+        #[case] existing: &[usize],
+        #[case] incoming: &[usize],
+        #[case] expected: DeviceBlockTableUpdateKind,
+    ) {
+        assert_eq!(
+            classify_device_block_table_update(existing, incoming),
+            expected
         );
     }
 }

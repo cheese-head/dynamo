@@ -37,15 +37,7 @@ use tokio_util::sync::CancellationToken;
 use dynamo_runtime::utils::task::CriticalTaskExecutionHandle;
 use tokio::sync::{Mutex, RwLock, oneshot};
 
-const DEFAULT_REMOTE_TRANSFER_CONTEXT_POOL_SIZE: usize = 64;
 const NIXL_POSIX_API_KEY: &str = "DYN_KVBM_NIXL_POSIX_API";
-
-fn remote_transfer_context_pool_size() -> usize {
-    std::env::var("DYN_KVBM_REMOTE_TRANSFER_CONTEXT_POOL_SIZE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_REMOTE_TRANSFER_CONTEXT_POOL_SIZE)
-}
 
 struct WorkerState {
     ready_for_ping: AtomicBool,
@@ -441,8 +433,8 @@ async fn perform_allocation_and_build_handler(
 
     // Create remote context if we have host blocks (for bounce buffers)
     // Supports both Object storage (S3/MinIO) and Disk storage (shared filesystem)
-    let remote_context_pool = if host_blocks.is_some() {
-        create_remote_context_pool(onboard_transfer_context.clone(), worker_id, leader_meta.world_size)?
+    let remote_ctx = if host_blocks.is_some() {
+        create_shared_remote_context(onboard_transfer_context.clone(), worker_id, leader_meta.world_size)?
     } else {
         None
     };
@@ -468,7 +460,7 @@ async fn perform_allocation_and_build_handler(
         onboard_transfer_context,
         offload_transfer_context,
         scheduler_client,
-        remote_context_pool,
+        remote_ctx,
         remote_cancel,
     )?;
     Ok(handler)
@@ -691,7 +683,7 @@ impl Handler for RemoteTransferDispatch {
 
         let linked_span = request.traceparent.as_deref().map(|tp| {
             dynamo_runtime::logging::make_linked_worker_span(
-                "kvbm.g4_worker_transfer",
+                "kvbm.remote_transfer.worker",
                 tp,
                 handler.worker_id,
             )
@@ -1363,41 +1355,32 @@ fn remote_storage_config(worker_id: usize) -> Option<RemoteStorageConfig> {
     }
 }
 
-fn create_remote_context_pool(
+fn create_shared_remote_context(
     transfer_context: Arc<crate::block_manager::block::transfer::TransferContext>,
     worker_id: usize,
     world_size: usize,
-) -> anyhow::Result<Option<Arc<RemoteTransferContextPool>>> {
+) -> anyhow::Result<Option<Arc<RemoteTransferContext>>> {
     let Some(storage_config) = remote_storage_config(worker_id) else {
         return Ok(None);
     };
 
-    let nixl_agent = transfer_context.nixl_agent();
-    let async_rt_handle = transfer_context.async_rt_handle().clone();
-    let cuda_context = transfer_context.stream().context().clone();
-    let pool_size = remote_transfer_context_pool_size();
+    let notification_tx = crate::block_manager::distributed::notifications::spawn_polling_handler(
+        transfer_context.async_rt_handle(),
+    );
 
-    let mut contexts = Vec::with_capacity(pool_size);
-    for _ in 0..pool_size {
-        let base = Arc::new(TransferContext::new(
-            nixl_agent.clone(),
-            cuda_context.new_stream()?,
-            async_rt_handle.clone(),
-            None,
-        )?);
-        contexts.push(Arc::new(
-            RemoteTransferContext::new(base, storage_config.clone())
-                .with_topology(worker_id as u64, world_size),
-        ));
-    }
+    let ctx = RemoteTransferContext::with_notification_sender(
+        transfer_context,
+        storage_config,
+        notification_tx,
+    )
+    .with_topology(worker_id as u64, world_size);
 
     tracing::info!(
         worker_id = worker_id,
-        pool_size = pool_size,
-        "Created remote transfer context pool"
+        "Created shared remote transfer context (no pool, polling notifications)"
     );
 
-    Ok(Some(Arc::new(RemoteTransferContextPool::new(contexts))))
+    Ok(Some(Arc::new(ctx)))
 }
 
 impl Drop for KvbmWorker {

@@ -219,6 +219,29 @@ macro_rules! record_remote_metrics {
 }
 
 /// Acquire a mutex-guarded slot from the slot manager.
+///
+/// # Lock ordering
+///
+/// This macro acquires the **inner slot mutex** only. The outer `slots` HashMap
+/// mutex is acquired and released inside `get_slot()` before the inner lock is
+/// taken. **Never call `remove_slot()`, `create_slot()`, `has_slot()`, or any
+/// other method that acquires `self.slots` while the guard returned by this
+/// macro is still alive.** Doing so inverts the lock order relative to code
+/// paths that hold `slots` first (e.g. `apply_event_to_slot`), causing a
+/// deadlock on the EngineCore's main thread.
+///
+/// Safe pattern: scope the guard in a block and extract any needed data before
+/// calling slot-manager methods that touch the outer lock.
+///
+/// ```ignore
+/// let state = {
+///     lock_slot!(self, &key => slot);
+///     slot.mark_as_finished(iteration)?;
+///     slot.state()
+///     // guard dropped here
+/// };
+/// self.slot_manager().remove_slot(&key)?; // safe — inner lock released
+/// ```
 #[macro_export]
 macro_rules! lock_slot {
     ($self:expr, $request_id:expr => $binding:ident) => {

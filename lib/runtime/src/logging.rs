@@ -443,9 +443,10 @@ pub fn make_handle_payload_span_from_tcp_headers(
     }
 }
 
-/// Create a tracing span linked to a parent via a W3C traceparent string.
-/// Use this to continue a trace across async boundaries (channels, ZMQ, etc.)
-/// where automatic span propagation doesn't work.
+/// Create a tracing span that continues a trace from a W3C traceparent string.
+/// The span shares the same trace ID as the parent, making it visible in the
+/// same trace in ClickHouse/Tempo/Jaeger. Use this across async boundaries
+/// (channels, ZMQ, etc.) where automatic span propagation doesn't work.
 pub fn make_linked_span(span_name: &'static str, traceparent: &str) -> Span {
     if !otel_export_enabled() {
         return Span::none();
@@ -455,6 +456,10 @@ pub fn make_linked_span(span_name: &'static str, traceparent: &str) -> Span {
     let mut headers = std::collections::HashMap::new();
     headers.insert("traceparent".to_string(), traceparent.to_string());
     let (otel_context, _, _) = extract_otel_context_from_tcp_headers(&headers);
+
+    // Attach the remote OTEL context BEFORE creating the span so that
+    // tracing-opentelemetry inherits the trace ID from the remote parent.
+    let _context_guard = otel_context.as_ref().map(|ctx| ctx.clone().attach());
 
     let span = if let (Some(tid), Some(pid)) = (trace_id.as_ref(), parent_id.as_ref()) {
         tracing::info_span!(
@@ -474,8 +479,9 @@ pub fn make_linked_span(span_name: &'static str, traceparent: &str) -> Span {
     span
 }
 
-/// Create a linked tracing span and annotate it with a worker identifier so
-/// multi-worker traces can be distinguished directly in Tempo.
+/// Create a tracing span (with worker annotation) that continues a trace from
+/// a W3C traceparent string. Same semantics as [`make_linked_span`] but adds
+/// `worker_id` for multi-TP disambiguation in Tempo.
 pub fn make_linked_worker_span(
     span_name: &'static str,
     traceparent: &str,
@@ -489,6 +495,8 @@ pub fn make_linked_worker_span(
     let mut headers = std::collections::HashMap::new();
     headers.insert("traceparent".to_string(), traceparent.to_string());
     let (otel_context, _, _) = extract_otel_context_from_tcp_headers(&headers);
+
+    let _context_guard = otel_context.as_ref().map(|ctx| ctx.clone().attach());
 
     let span = if let (Some(tid), Some(pid)) = (trace_id.as_ref(), parent_id.as_ref()) {
         tracing::info_span!(

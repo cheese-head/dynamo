@@ -54,8 +54,11 @@ pub struct SchedulerRequest<T> {
 //     }
 // }
 
-#[cfg(all(test, feature = "testing-cuda", feature = "testing-etcd"))]
-mod tests {
+/// Leader + worker + `KvBlockManager` NIXL integration tests (real CUDA device tensors, POSIX disk).
+///
+/// Run (example): `cargo test -p dynamo-llm e2e_harness --features testing-cuda -- --nocapture`
+#[cfg(all(test, feature = "testing-cuda"))]
+pub(crate) mod tests {
     use super::*;
 
     use crate::block_manager::KvBlockManager;
@@ -159,7 +162,7 @@ mod tests {
         });
     }
 
-    async fn build_leader_and_workers(
+    pub(crate) async fn build_leader_and_workers(
         num_workers: usize,
         num_device_blocks: usize,
         num_host_blocks: usize,
@@ -220,7 +223,7 @@ mod tests {
         Ok((leader, workers))
     }
 
-    async fn build_test_block_manager(
+    pub(crate) async fn build_test_block_manager(
         leader: Arc<KvbmLeader>,
         num_blocks: usize,
         block_size: usize,
@@ -542,6 +545,191 @@ mod tests {
             0,
             "disk persistence should not occur when host admission fails on the G1->G2->G3 path"
         );
+
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // End-to-end harness: N repeated “requests” (cycles) through full tier motion.
+    // Each cycle: device blocks (unique prefix) → background offload to host + disk,
+    // then onboard back to device (from host or from disk). Uses the same leader/worker
+    // and block manager as production-style distributed KVBM (not the vLLM connector slot).
+    // -------------------------------------------------------------------------
+
+    /// For each cycle: fill device → register → wait → assert host+disk hits → release device
+    /// reference → onboard from **host** → drop onboarded GPU blocks (returns capacity).
+    #[rstest]
+    #[case(1)]
+    #[case(3)]
+    #[tokio::test]
+    #[serial]
+    async fn e2e_harness_n_cycles_offload_host_disk_then_onboard_from_host(
+        #[case] num_cycles: usize,
+    ) -> Result<()> {
+        init_logging();
+
+        let num_blocks = 8usize;
+        let block_size = 4usize;
+        let wait_ms = 150u64;
+
+        let (leader, _workers) = build_leader_and_workers(
+            1,
+            num_blocks,
+            num_blocks,
+            num_blocks,
+            block_size,
+        )
+        .await?;
+        let leader = Arc::new(leader);
+        let block_manager =
+            build_test_block_manager(leader.clone(), num_blocks, block_size).await?;
+
+        let device_pool = block_manager.device().unwrap();
+        let host_pool = block_manager.host().unwrap();
+        let disk_pool = block_manager.disk().unwrap();
+
+        for cycle in 0..num_cycles {
+            let salt = 10_000u64 + cycle as u64;
+            let mut device_blocks = device_pool.allocate_blocks(num_blocks).await?;
+            let mut sequence_hashes = Vec::new();
+
+            for (idx, block) in device_blocks.iter_mut().enumerate() {
+                block.init_sequence(salt + idx as u64).unwrap();
+                for token in 0..block_size {
+                    let t = (cycle * 100_000 + idx * block_size + token) as u32;
+                    block.add_token(t).unwrap();
+                }
+                block.commit().unwrap();
+                sequence_hashes.push(block.sequence_hash().unwrap());
+            }
+
+            let immutable_device_blocks = device_pool.register_blocks(device_blocks).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+
+            let host_blocks = host_pool
+                .match_sequence_hashes(sequence_hashes.as_slice())
+                .await?;
+            assert_eq!(
+                host_blocks.len(),
+                num_blocks,
+                "cycle {cycle}: expected full host prefix"
+            );
+            let disk_blocks = disk_pool
+                .match_sequence_hashes(sequence_hashes.as_slice())
+                .await?;
+            assert_eq!(
+                disk_blocks.len(),
+                num_blocks,
+                "cycle {cycle}: expected full disk prefix"
+            );
+
+            drop(immutable_device_blocks);
+            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+            let _ = device_pool.allocate_blocks(num_blocks).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+
+            assert_eq!(
+                device_pool
+                    .match_sequence_hashes(sequence_hashes.as_slice())
+                    .await?
+                    .len(),
+                0,
+                "cycle {cycle}: device pool should not retain committed sequence"
+            );
+
+            let onboarded = block_manager.onboard_blocks(host_blocks, None).await??;
+            assert_eq!(
+                onboarded.len(),
+                num_blocks,
+                "cycle {cycle}: host→device onboard"
+            );
+            drop(onboarded);
+            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+        }
+
+        Ok(())
+    }
+
+    /// Same offload path; onboard from **disk** (priorities preserved like `test_leader_worker_disk_onboard_e2e`).
+    #[rstest]
+    #[case(1)]
+    #[case(2)]
+    #[tokio::test]
+    #[serial]
+    async fn e2e_harness_n_cycles_offload_host_disk_then_onboard_from_disk(
+        #[case] num_cycles: usize,
+    ) -> Result<()> {
+        init_logging();
+
+        let num_blocks = 8usize;
+        let block_size = 4usize;
+        let wait_ms = 150u64;
+
+        let (leader, _workers) = build_leader_and_workers(
+            1,
+            num_blocks,
+            num_blocks,
+            num_blocks,
+            block_size,
+        )
+        .await?;
+        let leader = Arc::new(leader);
+        let block_manager =
+            build_test_block_manager(leader.clone(), num_blocks, block_size).await?;
+
+        let device_pool = block_manager.device().unwrap();
+        let host_pool = block_manager.host().unwrap();
+        let disk_pool = block_manager.disk().unwrap();
+
+        for cycle in 0..num_cycles {
+            let salt = 50_000u64 + cycle as u64;
+            let mut device_blocks = device_pool.allocate_blocks(num_blocks).await?;
+            let mut sequence_hashes = Vec::new();
+
+            for (idx, block) in device_blocks.iter_mut().enumerate() {
+                block.init_sequence(salt + idx as u64).unwrap();
+                for token in 0..block_size {
+                    let t = (cycle * 10_000 + idx * block_size + token) as u32;
+                    block.add_token(t).unwrap();
+                }
+                let metadata = block.metadata().update_priority((idx as u32) + 1);
+                block.update_metadata(metadata);
+                block.commit().unwrap();
+                sequence_hashes.push(block.sequence_hash().unwrap());
+            }
+
+            let immutable_device_blocks = device_pool.register_blocks(device_blocks).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+
+            let host_blocks = host_pool
+                .match_sequence_hashes(sequence_hashes.as_slice())
+                .await?;
+            assert_eq!(host_blocks.len(), num_blocks, "cycle {cycle}: host");
+            let disk_blocks = disk_pool
+                .match_sequence_hashes(sequence_hashes.as_slice())
+                .await?;
+            assert_eq!(disk_blocks.len(), num_blocks, "cycle {cycle}: disk");
+
+            for (expected_idx, disk_block) in disk_blocks.iter().enumerate() {
+                assert_eq!(disk_block.metadata().priority(), (expected_idx as u32) + 1);
+            }
+
+            drop(immutable_device_blocks);
+            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+            let _ = device_pool.allocate_blocks(num_blocks).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+
+            let from_disk = block_manager.onboard_blocks(disk_blocks, None).await??;
+            assert_eq!(from_disk.len(), num_blocks, "cycle {cycle}: disk→device");
+            for (expected_idx, device_block) in from_disk.iter().enumerate() {
+                assert_eq!(
+                    device_block.metadata().priority(),
+                    (expected_idx as u32) + 1
+                );
+            }
+            drop(from_disk);
+            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+        }
 
         Ok(())
     }

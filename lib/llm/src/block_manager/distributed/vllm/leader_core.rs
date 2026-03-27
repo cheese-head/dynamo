@@ -8,13 +8,13 @@ use std::{
 
 use crate::block_manager::{
     block::BlockId,
-    connector::protocol::{SlotKey, WorkerTransferRequest},
-    distributed::vllm::is_dev_mode,
+    connector::protocol::{RequestType, SlotKey, TransferType, WorkerTransferRequest},
+    distributed::{KvbmLeader, vllm::is_dev_mode},
     metrics_kvbm::KvbmMetrics,
 };
 use serde::{Deserialize, Serialize};
 
-use super::{ConnectorSlotManager, SlotError, SlotManager, SlotState, VllmConnectorSlot};
+use super::{ConnectorSlotManager, SlotManager, SlotState, VllmConnectorSlot};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchedulerOutput {
@@ -42,9 +42,25 @@ pub struct CachedRequestData {
     pub priorities: Option<Vec<u32>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NewSlotKind {
+    /// Fresh vLLM slot for normal prefill/decode scheduling. These slots must
+    /// not carry any immediate onboarding load operations in the same metadata
+    /// batch.
+    Prefill,
+    /// Slot entering async remote-KV onboarding. The worker must derive a
+    /// strictly-positive number of immediate load ops for this slot from the
+    /// accompanying `operations` payload before creating the scheduler epoch.
+    Onboarding,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewSlotInfo {
     pub key: SlotKey,
+    pub kind: NewSlotKind,
+    /// Leader-provided checksum for onboarding cardinality. The worker must
+    /// derive the real immediate load-op count from `operations` and validate
+    /// it against this value before creating the scheduler epoch.
     pub expected_immediate_ops: u64,
 }
 
@@ -53,6 +69,12 @@ pub struct ConnectorMetadata {
     pub iteration: u64,
     pub new_slots: Vec<NewSlotInfo>,
     pub operations: Vec<WorkerTransferRequest>,
+    #[serde(default)]
+    pub loads_done: HashSet<String>,
+    #[serde(default)]
+    pub stores_done: HashSet<String>,
+    #[serde(default)]
+    pub failed: HashSet<String>,
 }
 
 impl ConnectorMetadata {
@@ -61,14 +83,39 @@ impl ConnectorMetadata {
             iteration,
             new_slots: Vec::new(),
             operations: Vec::new(),
+            loads_done: HashSet::new(),
+            stores_done: HashSet::new(),
+            failed: HashSet::new(),
         }
     }
 
-    pub fn create_slot_with_key(&mut self, key: SlotKey, expected_immediate_ops: u64) {
+    fn push_slot(
+        &mut self,
+        key: SlotKey,
+        kind: NewSlotKind,
+        expected_immediate_ops: u64,
+    ) {
         self.new_slots.push(NewSlotInfo {
             key,
+            kind,
             expected_immediate_ops,
         });
+    }
+
+    /// Create a fresh prefill/decode slot. Prefill slots must not require any
+    /// immediate onboarding load completions in the same metadata batch.
+    pub fn create_prefill_slot(&mut self, key: SlotKey) {
+        self.push_slot(key, NewSlotKind::Prefill, 0);
+    }
+
+    /// Create a slot that is entering worker-side onboarding. These slots
+    /// must carry at least one immediate load op in `operations`.
+    pub fn create_onboarding_slot(&mut self, key: SlotKey, expected_immediate_ops: u64) {
+        debug_assert!(
+            expected_immediate_ops > 0,
+            "onboarding slots must declare at least one immediate load op"
+        );
+        self.push_slot(key, NewSlotKind::Onboarding, expected_immediate_ops);
     }
 
     pub fn add_operations(&mut self, xfer_reqs: Vec<WorkerTransferRequest>) {
@@ -87,9 +134,9 @@ impl ConnectorMetadata {
     }
 }
 
-#[derive(Debug)]
 pub struct KvConnectorLeaderCore {
     slot_manager: Arc<OnceLock<ConnectorSlotManager<SlotKey>>>,
+    leader: Arc<KvbmLeader>,
     block_size: usize,
     inflight_requests: HashSet<String>,
     onboarding_slots: HashSet<String>,
@@ -104,14 +151,27 @@ pub struct KvConnectorLeaderCore {
     active_slot_keys: HashMap<String, SlotKey>,
 }
 
+impl std::fmt::Debug for KvConnectorLeaderCore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KvConnectorLeaderCore")
+            .field("block_size", &self.block_size)
+            .field("iteration_counter", &self.iteration_counter)
+            .field("inflight_requests", &self.inflight_requests.len())
+            .field("active_slot_keys", &self.active_slot_keys.len())
+            .finish()
+    }
+}
+
 impl KvConnectorLeaderCore {
     pub fn new(
         slot_manager: Arc<OnceLock<ConnectorSlotManager<SlotKey>>>,
+        leader: Arc<KvbmLeader>,
         block_size: usize,
         kvbm_metrics: KvbmMetrics,
     ) -> Self {
         Self {
             slot_manager,
+            leader,
             block_size,
             inflight_requests: HashSet::new(),
             onboarding_slots: HashSet::new(),
@@ -247,95 +307,268 @@ impl KvConnectorLeaderCore {
             .unwrap_or_else(|| self.enter_request_span(&request_id, "kvbm.request_poll"));
         debug_assert!(num_computed_tokens.is_multiple_of(self.block_size));
 
-        debug_assert!(
-            slot.state() != SlotState::Prefilling && slot.state() != SlotState::Decoding,
-            "slot is in the Prefilled state or Decoding; shouldn't happen"
-        );
-
-        if slot.state() == SlotState::SkippedPrefill || slot.state() == SlotState::SkippedDecode {
-            match slot.state() {
-                SlotState::SkippedPrefill => {
-                    slot.mark_as_prefilling(self.iteration_counter)?;
-                    return Ok((Some(0), false));
-                }
-                SlotState::SkippedDecode => {
-                    slot.mark_as_decoding(self.iteration_counter)?;
-                    return Ok((Some(0), false));
-                }
-                _ => unreachable!("slot is not in the SkippedPrefill or SkippedDecode state"),
-            }
+        let current_state = slot.state();
+        if current_state == SlotState::SkippedPrefill {
+            slot.mark_as_prefilling(self.iteration_counter)?;
+            return Ok((Some(0), false));
+        }
+        if current_state == SlotState::SkippedDecode {
+            slot.mark_as_decoding(self.iteration_counter)?;
+            return Ok((Some(0), false));
         }
 
         if (slot.sequence().total_tokens() - num_computed_tokens) < self.block_size {
             return Ok((Some(0), false));
         }
 
-        slot.acquire_local_matches(num_computed_tokens)?;
-
-        if slot
+        let vllm_slot = slot
             .as_any_mut()
             .downcast_mut::<VllmConnectorSlot>()
-            .map(|s| s.has_pending_g4_lookup())
-            .unwrap_or(false)
-        {
-            return Ok((None, false));
-        }
+            .ok_or_else(|| {
+                anyhow::anyhow!("expected VllmConnectorSlot for request {}", request_id)
+            })?;
 
-        if slot
-            .as_any_mut()
-            .downcast_mut::<VllmConnectorSlot>()
-            .map(|s| s.has_pending_g4_prefetch())
-            .unwrap_or(false)
-        {
-            tracing::debug!(
-                target: "kvbm-g4",
+        let slot_ctx = super::slot_machine::SlotContext {
+            block_size: self.block_size,
+            remote_enabled: self.leader.remote_handle().is_some(),
+            g4_xfer_fail_policy: super::slot_machine::G4FailPolicy::default(),
+        };
+
+        // Phase gate 1: If Initialized or Preempted, fire AcquireMatches.
+        // The reducer transitions to AwaitingLookup and emits RunLocalLookup.
+        // Effects must run through `apply_and_execute` so `RunLocalLookup` completes and
+        // recursive follow-ups (`LocalLookupCompleted`, remote lookup, prefetch, …) apply;
+        // otherwise the slot never leaves AwaitingLookup / early lookup phases.
+        // Prefetch failed with no local staging → don't retry the lookup
+        // (it would spin forever if the host pool is exhausted). Report a
+        // cold miss so vLLM does a full prefill instead.
+        if matches!(
+            vllm_slot.phase(),
+            super::RequestPhase::Preempted { recovered_from_failure: true }
+        ) {
+            tracing::warn!(
                 request_id = %request_id,
-                "host prefetch still pending; deferring matched-token return"
+                "get_num_new_matched_tokens: prefetch failed (pool exhaustion?); \
+                 reporting cold miss for full prefill"
             );
-            return Ok((None, false));
+            return Ok((Some(0), false));
         }
 
-        if let SlotState::OnboardStaged(num_external_tokens) = slot.state() {
-            let vllm_slot = slot
-                .as_any_mut()
-                .downcast_mut::<VllmConnectorSlot>()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("expected VllmConnectorSlot for request {}", request_id)
-                })?;
-            let Some(num_external_tokens) = vllm_slot.disclose_staged_match_to_scheduler() else {
-                if vllm_slot.staged_match_report().is_none() {
-                    tracing::debug!(
+        if matches!(
+            vllm_slot.phase(),
+            super::RequestPhase::Initialized | super::RequestPhase::Preempted { .. }
+        ) {
+            let effect_ctx = self.slot_manager().effect_context();
+            let acquire_results = super::effect_executor::apply_and_execute(
+                vllm_slot,
+                super::SlotEvent::AcquireMatches { num_computed_tokens },
+                &slot_ctx,
+                &effect_ctx,
+            )?;
+
+            tracing::info!(
+                request_id = %request_id,
+                phase = ?vllm_slot.phase().as_slot_state(),
+                "get_num_new_matched_tokens: AcquireMatches transition"
+            );
+
+            if acquire_results.iter().any(|r| {
+                matches!(
+                    r,
+                    super::effect_executor::EffectResult::MatchNone
+                )
+            }) {
+                return Ok((Some(0), false));
+            }
+        }
+
+        // Phase gate 2: inspect the phase after the potential AcquireMatches transition.
+        match vllm_slot.phase() {
+            // Async lookup or prefetch still in flight -- defer to next poll
+            super::RequestPhase::LookingUp { .. } => Ok((None, false)),
+
+            super::RequestPhase::Prefetching { prefetch, .. } => {
+                let op_id = prefetch.operation_id;
+                let prefetch_hashes = prefetch.sequence_hashes.clone();
+                match self.slot_manager().check_prefetch_outcome(&op_id) {
+                    Some(true) => {
+                        let resolved_host_blocks = self
+                            .slot_manager()
+                            .resolve_host_blocks_by_hash(&prefetch_hashes);
+                        let resolved_count = resolved_host_blocks.len();
+                        let expected = prefetch_hashes.len();
+                        tracing::info!(
+                            request_id = %request_id,
+                            operation_id = %op_id,
+                            resolved_host_blocks = resolved_count,
+                            expected_blocks = expected,
+                            "prefetch completed; resolved {}/{} blocks from host pool → OnboardReady",
+                            resolved_count, expected,
+                        );
+                        let effect_ctx = self.slot_manager().effect_context();
+                        if resolved_count > 0 {
+                            super::effect_executor::apply_and_execute(
+                                vllm_slot,
+                                super::SlotEvent::PrefetchReady {
+                                    blocks: resolved_host_blocks.into_iter().map(|b| vec![b]).collect(),
+                                },
+                                &slot_ctx,
+                                &effect_ctx,
+                            )?;
+                        } else {
+                            // Host blocks not yet visible — register_blocks
+                            // is async and may still be in flight. Re-insert
+                            // the operation_id so the next poll retries
+                            // resolution instead of falling back to a
+                            // redundant remote re-read.
+                            if let Ok(mut set) = self.slot_manager().prefetch_completed.lock() {
+                                set.insert(op_id);
+                            }
+                            tracing::debug!(
+                                request_id = %request_id,
+                                operation_id = %op_id,
+                                "prefetch completed but host blocks not yet registered; \
+                                 deferring resolution to next poll"
+                            );
+                        }
+                        Ok((None, false))
+                    }
+                    Some(false) => {
+                        tracing::warn!(
+                            request_id = %request_id,
+                            operation_id = %op_id,
+                            "prefetch failed; falling back"
+                        );
+                        let effect_ctx = self.slot_manager().effect_context();
+                        super::effect_executor::apply_and_execute(
+                            vllm_slot,
+                            super::SlotEvent::PrefetchFailed,
+                            &slot_ctx,
+                            &effect_ctx,
+                        )?;
+                        Ok((None, false))
+                    }
+                    None => {
+                        let timeout = super::slot_config::prefetch_timeout();
+                        if prefetch.started_at.elapsed() > timeout {
+                            tracing::warn!(
+                                request_id = %request_id,
+                                operation_id = %op_id,
+                                elapsed_secs = prefetch.started_at.elapsed().as_secs(),
+                                timeout_secs = timeout.as_secs(),
+                                "prefetch timed out"
+                            );
+                            let effect_ctx = self.slot_manager().effect_context();
+                            super::effect_executor::apply_and_execute(
+                                vllm_slot,
+                                super::SlotEvent::PrefetchTimeout,
+                                &slot_ctx,
+                                &effect_ctx,
+                            )?;
+                            Ok((None, false))
+                        } else {
+                            tracing::debug!(
+                                target: "kvbm-g4",
+                                request_id = %request_id,
+                                "host prefetch pending; deferring"
+                            );
+                            Ok((None, false))
+                        }
+                    }
+                }
+            }
+
+            super::RequestPhase::AwaitingLookup => Ok((None, false)),
+
+            // External blocks staged -- fire PollMatchReport to disclose/defer
+            super::RequestPhase::OnboardReady { .. } => {
+                let phase = vllm_slot.take_phase();
+                let (new_phase, effects) =
+                    phase.apply(super::SlotEvent::PollMatchReport, &slot_ctx);
+                vllm_slot.set_phase(new_phase);
+
+                for effect in effects {
+                    match effect {
+                        super::SlotEffect::MatchReady { num_external_tokens } => {
+                            debug_assert!(
+                                (num_computed_tokens + num_external_tokens)
+                                    .is_multiple_of(self.block_size)
+                            );
+                            self.kvbm_metrics
+                                .matched_tokens
+                                .inc_by(num_external_tokens as u64);
+                            tracing::info!(
+                                target: "kvbm-diag",
+                                request_id = %request_id,
+                                num_external_tokens,
+                                num_computed_tokens,
+                                "get_num_new_matched_tokens → OnboardReady (returning async match)"
+                            );
+                            return Ok((Some(num_external_tokens), true));
+                        }
+                        super::SlotEffect::MatchDeferred => {
+                            return Ok((None, false));
+                        }
+                        super::SlotEffect::MatchNone => {
+                            return Ok((Some(0), false));
+                        }
+                        _ => {}
+                    }
+                }
+                Ok((None, false))
+            }
+
+            super::RequestPhase::Onboarding { num_external_tokens, started_at, .. } => {
+                if self.slot_manager().transfer_signal.is_loads_done(&request_id) == Some(true) {
+                    tracing::info!(
                         target: "kvbm-diag",
                         request_id = %request_id,
                         num_external_tokens,
-                        "get_num_new_matched_tokens → OnboardStaged without a pending report; waiting for allocation"
+                        "get_num_new_matched_tokens: H2D complete (signal), advancing Onboarding"
                     );
-                } else {
-                    tracing::trace!(
-                        target: "kvbm-diag",
-                        request_id = %request_id,
-                        "get_num_new_matched_tokens → OnboardStaged (match already returned; defer poll)"
+                    let phase = vllm_slot.take_phase();
+                    let (new_phase, _effects) = phase.apply(
+                        super::SlotEvent::TransferCompleted {
+                            operation_id: uuid::Uuid::nil(),
+                        },
+                        &slot_ctx,
                     );
+                    vllm_slot.set_phase(new_phase);
+                    return Ok((Some(0), false));
                 }
-                return Ok((None, false));
-            };
-            debug_assert!(
-                (num_computed_tokens + num_external_tokens).is_multiple_of(self.block_size)
-            );
-            self.kvbm_metrics
-                .matched_tokens
-                .inc_by(num_external_tokens as u64);
-            tracing::info!(
-                target: "kvbm-diag",
-                request_id = %request_id,
-                num_external_tokens,
-                num_computed_tokens,
-                total_tokens = slot.sequence().total_tokens(),
-                "get_num_new_matched_tokens → OnboardStaged (returning match)"
-            );
-            Ok((Some(num_external_tokens), true))
-        } else {
-            Ok((Some(0), false))
+
+                let elapsed = started_at.elapsed();
+                let timeout = super::slot_config::prefetch_timeout();
+                if elapsed > timeout {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        elapsed_secs = elapsed.as_secs(),
+                        timeout_secs = timeout.as_secs(),
+                        num_external_tokens,
+                        "onboarding timed out (H2D completion lost?); \
+                         aborting cache onboard → full prefill"
+                    );
+                    let effect_ctx = self.slot_manager().effect_context();
+                    super::effect_executor::apply_and_execute(
+                        vllm_slot,
+                        super::SlotEvent::Preempt,
+                        &slot_ctx,
+                        &effect_ctx,
+                    )?;
+                    return Ok((Some(0), false));
+                }
+                tracing::debug!(
+                    target: "kvbm-diag",
+                    request_id = %request_id,
+                    num_external_tokens,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "get_num_new_matched_tokens: request in Onboarding phase \
+                     (WAITING_FOR_REMOTE_KVS, worker H2D in progress)"
+                );
+                Ok((Some(0), false))
+            }
+
+            _ => Ok((Some(0), false)),
         }
     }
 
@@ -355,50 +588,102 @@ impl KvConnectorLeaderCore {
         slot.append_mutable_device_blocks(&block_ids)?;
 
         if num_external_tokens > 0 {
-            let prefetched_host_ready = slot
-                .as_any_mut()
-                .downcast_mut::<VllmConnectorSlot>()
-                .map(|s| -> Result<bool, SlotError> {
-                    if s.try_stage_prefetched_host_matches()? {
-                        return Ok(true);
+            let (phase_before_alloc, staged_external_tokens) = {
+                let vllm_slot = slot
+                    .as_any_mut()
+                    .downcast_mut::<VllmConnectorSlot>()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("expected VllmConnectorSlot for request {}", request_id)
+                    })?;
+
+                if !matches!(
+                    vllm_slot.phase(),
+                    super::RequestPhase::OnboardReady { .. }
+                ) {
+                    anyhow::bail!(
+                        "update_state_after_alloc: external tokens but slot not in OnboardReady \
+                         phase (phase={:?}) for request {}",
+                        vllm_slot.phase().as_slot_state(),
+                        request_id
+                    );
+                }
+                let staged_external_tokens = match vllm_slot.phase() {
+                    super::RequestPhase::OnboardReady { num_external_tokens, .. } => {
+                        *num_external_tokens
                     }
-                    Ok(s.has_staged_host_blocks())
-                })
-                .transpose()?
-                .unwrap_or(false);
-            if !prefetched_host_ready {
-                anyhow::bail!(
-                    "external tokens were reported before host-prefetch became CPU-ready for request {}",
-                    request_id
+                    _ => unreachable!("validated OnboardReady phase above"),
+                };
+                (vllm_slot.phase().as_slot_state(), staged_external_tokens)
+            };
+
+            let expected_blocks = staged_external_tokens.div_ceil(self.block_size);
+            if block_ids.len() < expected_blocks {
+                tracing::warn!(
+                    target: "kvbm-diag",
+                    request_id = %request_id,
+                    num_external_tokens_arg = num_external_tokens,
+                    staged_external_tokens,
+                    expected_blocks,
+                    granted_blocks = block_ids.len(),
+                    phase = ?phase_before_alloc,
+                    "update_state_after_alloc: undersized GPU allocation for onboard; falling back to full prefill"
                 );
+                let slot_ctx = super::slot_machine::SlotContext {
+                    block_size: self.block_size,
+                    remote_enabled: self.leader.remote_handle().is_some(),
+                    g4_xfer_fail_policy: super::slot_machine::G4FailPolicy::default(),
+                };
+                let effect_ctx = self.slot_manager().effect_context();
+                let vllm_slot = slot
+                    .as_any_mut()
+                    .downcast_mut::<VllmConnectorSlot>()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("expected VllmConnectorSlot for request {}", request_id)
+                    })?;
+                super::effect_executor::apply_and_execute(
+                    vllm_slot,
+                    super::SlotEvent::Preempt,
+                    &slot_ctx,
+                    &effect_ctx,
+                )?;
+                self.onboarding_slots.remove(&request_id);
+                return Ok(());
             }
-            if let Some(slot) = slot.as_any_mut().downcast_mut::<VllmConnectorSlot>() {
-                slot.clear_staged_match_report();
-            }
+
+            let num_computed_tokens = block_ids.len() * self.block_size - staged_external_tokens;
+            slot.record_cached_device_tokens(num_computed_tokens);
+
+            let slot_ctx = super::slot_machine::SlotContext {
+                block_size: self.block_size,
+                remote_enabled: self.leader.remote_handle().is_some(),
+                g4_xfer_fail_policy: super::slot_machine::G4FailPolicy::default(),
+            };
+
             tracing::info!(
                 target: "kvbm-diag",
                 request_id = %request_id,
-                num_external_tokens,
-                "update_state_after_alloc → using prefetched host blocks"
-            );
-            let num_computed_tokens = block_ids.len() * self.block_size - num_external_tokens;
-            tracing::info!(
-                target: "kvbm-diag",
-                request_id = %request_id,
-                num_external_tokens,
+                num_external_tokens_arg = num_external_tokens,
+                staged_external_tokens,
                 num_device_blocks = block_ids.len(),
                 num_computed_tokens,
-                block_size = self.block_size,
-                "update_state_after_alloc → triggering onboarding"
+                phase = ?phase_before_alloc,
+                "update_state_after_alloc → onboarding via state machine (AllocCompleted + effects)"
             );
-            slot.record_cached_device_tokens(num_computed_tokens);
-            // NOTE: Do NOT advance_computed_position here.
-            // vLLM's scheduler will report these tokens via num_computed_tokens
-            // in apply_scheduler_output, which uses max(current_position, vllm_computed)
-            // to advance. Advancing here would double-count: once from this call,
-            // and again when vLLM's num_scheduled_tokens covers the remaining tokens
-            // for the forward pass.
-            slot.trigger_onboarding(num_external_tokens)?;
+
+            let effect_ctx = self.slot_manager().effect_context();
+            let vllm_slot = slot
+                .as_any_mut()
+                .downcast_mut::<VllmConnectorSlot>()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("expected VllmConnectorSlot for request {}", request_id)
+                })?;
+            vllm_slot.trigger_onboarding_execute_effects(
+                staged_external_tokens,
+                Some(block_ids.as_slice()),
+                &slot_ctx,
+                &effect_ctx,
+            )?;
+
             self.onboarding_slots.insert(request_id);
         }
 
@@ -431,17 +716,10 @@ impl KvConnectorLeaderCore {
                 if let Some(key) = self.active_slot_key(request_id)
                     && self.slot_manager().has_slot(&key)
                 {
-                    {
-                        crate::lock_slot!(self, &key => slot);
-                        if let Some(vllm_slot) =
-                            slot.as_any_mut().downcast_mut::<VllmConnectorSlot>()
-                        {
-                            let _ = vllm_slot.release_prefetched_host_blocks();
-                        }
-                    }
                     let _ = self.slot_manager().remove_slot(&key);
                 }
                 self.active_slot_keys.remove(request_id);
+                self.slot_manager().remove_signal(request_id);
             }
         }
 
@@ -461,6 +739,7 @@ impl KvConnectorLeaderCore {
             );
         }
 
+        // --- Onboarding slots: drain worker ops produced by effect executor ---
         for request_id in &onboarding_slots {
             let _req_span = self.enter_request_span(request_id, "kvbm.flush_onboarding");
             let key = self.active_slot_key(request_id).ok_or_else(|| {
@@ -469,13 +748,37 @@ impl KvConnectorLeaderCore {
                     request_id
                 )
             })?;
-            crate::lock_slot!(self, &key => slot);
-            crate::flush_slot_to_metadata!(slot, md, key);
+            {
+                crate::lock_slot!(self, &key => _slot);
+            }
+            if let Some(pending_ops) = self.slot_manager().take_pending_worker_ops(&key) {
+                let num_immediate = pending_ops
+                    .iter()
+                    .filter(|op| {
+                        op.transfer_type == TransferType::Load
+                            && op.request_type == RequestType::Immediate
+                    })
+                    .count() as u64;
+                if num_immediate == 0 {
+                    anyhow::bail!(
+                        "onboarding metadata contract violated for request {}: slot is marked for onboarding but emitted zero immediate load ops",
+                        request_id
+                    );
+                }
+                md.create_onboarding_slot(key.clone(), num_immediate);
+                md.add_operations_for_key(&key, pending_ops);
+            } else {
+                anyhow::bail!(
+                    "onboarding metadata contract violated for request {}: onboarding slot has no pending worker ops",
+                    request_id
+                );
+            }
             if !inflight_requests.remove(request_id) {
                 tracing::warn!("request {request_id} not in inflight set (may have been cleared by clear_pool)");
             }
         }
 
+        // --- New requests ---
         for new_req in &scheduler_output.new_requests {
             let request_id = &new_req.request_id;
             let already_created = md.new_slots.iter().any(|s| s.key.request_id == *request_id);
@@ -489,35 +792,74 @@ impl KvConnectorLeaderCore {
             let key = self.active_slot_key(request_id).ok_or_else(|| {
                 anyhow::anyhow!("missing active SlotKey for new request {}", request_id)
             })?;
-            crate::lock_slot!(self, &key => slot);
-            slot.record_start_iteration(iteration)?;
 
-            let scheduled_tokens = *scheduler_output
-                .num_scheduled_tokens
-                .get(request_id)
-                .unwrap_or(&0);
+            {
+                crate::lock_slot!(self, &key => slot);
+                slot.record_start_iteration(iteration)?;
 
-            tracing::info!(
-                target: "kvbm-diag",
-                request_id = %request_id,
-                iteration,
-                vllm_num_computed_tokens = new_req.num_computed_tokens,
-                vllm_num_scheduled_tokens = scheduled_tokens,
-                slot_state = ?slot.state(),
-                slot_computed_tokens = slot.computed_tokens(),
-                "build_connector_metadata: new request from vLLM scheduler"
-            );
+                let scheduled_tokens = *scheduler_output
+                    .num_scheduled_tokens
+                    .get(request_id)
+                    .unwrap_or(&0);
 
-            slot.apply_scheduler_output(
-                &[],
-                &[],
-                new_req.num_computed_tokens,
-                scheduled_tokens,
-                None,
-            )?;
-            crate::flush_slot_to_metadata!(slot, md, key);
+                tracing::info!(
+                    target: "kvbm-diag",
+                    request_id = %request_id,
+                    iteration,
+                    vllm_num_computed_tokens = new_req.num_computed_tokens,
+                    vllm_num_scheduled_tokens = scheduled_tokens,
+                    slot_state = ?slot.state(),
+                    slot_computed_tokens = slot.computed_tokens(),
+                    "build_connector_metadata: new request from vLLM scheduler"
+                );
+
+                let slot_ctx = super::slot_machine::SlotContext {
+                    block_size: self.block_size,
+                    remote_enabled: self.leader.remote_handle().is_some(),
+                    g4_xfer_fail_policy: super::slot_machine::G4FailPolicy::default(),
+                };
+                let effect_ctx = self.slot_manager().effect_context();
+                let vllm_slot = slot.as_any_mut().downcast_mut::<VllmConnectorSlot>().ok_or_else(
+                    || {
+                        anyhow::anyhow!(
+                            "expected VllmConnectorSlot for new request {}",
+                            request_id
+                        )
+                    },
+                )?;
+                vllm_slot.apply_scheduler_output_execute_effects(
+                    &[],
+                    &new_req.block_ids,
+                    new_req.num_computed_tokens,
+                    scheduled_tokens,
+                    new_req.priorities.as_deref(),
+                    &slot_ctx,
+                    &effect_ctx,
+                )?;
+            }
+            if let Some(pending_ops) = self.slot_manager().take_pending_worker_ops(&key) {
+                let num_immediate_loads = pending_ops
+                    .iter()
+                    .filter(|op| {
+                        op.transfer_type == TransferType::Load
+                            && op.request_type == RequestType::Immediate
+                    })
+                    .count() as u64;
+                if num_immediate_loads > 0 {
+                    anyhow::bail!(
+                        "prefill metadata contract violated for request {}: prefill slot emitted {} immediate load ops",
+                        request_id,
+                        num_immediate_loads
+                    );
+                }
+                md.create_prefill_slot(key.clone());
+                md.add_operations_for_key(&key, pending_ops);
+            } else {
+                md.create_prefill_slot(key.clone());
+            }
         }
 
+        // --- Cached requests ---
         for cached_req in &scheduler_output.cached_requests {
             let request_id = &cached_req.request_id;
 
@@ -536,26 +878,52 @@ impl KvConnectorLeaderCore {
             let key = self.active_slot_key(request_id).ok_or_else(|| {
                 anyhow::anyhow!("missing active SlotKey for cached request {}", request_id)
             })?;
-            crate::lock_slot!(self, &key => slot);
 
-            let scheduled_tokens = *scheduler_output
-                .num_scheduled_tokens
-                .get(request_id)
-                .unwrap_or(&0);
+            {
+                crate::lock_slot!(self, &key => slot);
 
-            slot.apply_scheduler_output(
-                &cached_req.new_token_ids,
-                &cached_req.new_block_ids,
-                cached_req.num_computed_tokens,
-                scheduled_tokens,
-                None,
-            )?;
+                let scheduled_tokens = *scheduler_output
+                    .num_scheduled_tokens
+                    .get(request_id)
+                    .unwrap_or(&0);
 
-            if let Some(pending_ops) = slot.take_pending_operations() {
+                let slot_ctx = super::slot_machine::SlotContext {
+                    block_size: self.block_size,
+                    remote_enabled: self.leader.remote_handle().is_some(),
+                    g4_xfer_fail_policy: super::slot_machine::G4FailPolicy::default(),
+                };
+                let effect_ctx = self.slot_manager().effect_context();
+                let vllm_slot = slot.as_any_mut().downcast_mut::<VllmConnectorSlot>().ok_or_else(
+                    || {
+                        anyhow::anyhow!(
+                            "expected VllmConnectorSlot for cached request {}",
+                            request_id
+                        )
+                    },
+                )?;
+
+                vllm_slot.apply_scheduler_output_execute_effects(
+                    &cached_req.new_token_ids,
+                    &cached_req.new_block_ids,
+                    cached_req.num_computed_tokens,
+                    scheduled_tokens,
+                    cached_req.priorities.as_deref(),
+                    &slot_ctx,
+                    &effect_ctx,
+                )?;
+
+                tracing::debug!(
+                    request_id = %key.request_id,
+                    phase = ?vllm_slot.phase().as_slot_state(),
+                    "build_connector_metadata: cached request phase after scheduler output"
+                );
+            }
+            if let Some(pending_ops) = self.slot_manager().take_pending_worker_ops(&key) {
                 md.add_operations_for_key(&key, pending_ops);
             }
         }
 
+        // --- Unscheduled requests: mark as skipped ---
         for unscheduled_req in &inflight_requests {
             let key = self.active_slot_key(unscheduled_req).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -571,6 +939,19 @@ impl KvConnectorLeaderCore {
             slot.mark_as_skipped()?;
         }
 
+        let signal = &self.slot_manager().transfer_signal;
+        for request_id in self.active_slot_keys.keys() {
+            if signal.is_loads_done(request_id) == Some(true) {
+                md.loads_done.insert(request_id.clone());
+            }
+            if signal.is_stores_done(request_id) == Some(true) {
+                md.stores_done.insert(request_id.clone());
+            }
+            if signal.has_failed(request_id) {
+                md.failed.insert(request_id.clone());
+            }
+        }
+
         serde_json::to_vec(&md)
             .map_err(|e| anyhow::anyhow!("Failed to serialize connector metadata: {}", e))
     }
@@ -578,10 +959,11 @@ impl KvConnectorLeaderCore {
     pub fn request_finished(
         &mut self,
         request_id: String,
-        _block_ids: Vec<BlockId>,
+        block_ids: Vec<BlockId>,
     ) -> anyhow::Result<bool> {
         self.onboarding_slots.remove(&request_id);
         self.request_traces.remove(&request_id);
+        self.request_baggage.remove(&request_id);
 
         let Some(key) = self.active_slot_key(&request_id) else {
             tracing::warn!(
@@ -589,6 +971,7 @@ impl KvConnectorLeaderCore {
             );
             self.inflight_requests.remove(&request_id);
             self.active_slot_keys.remove(&request_id);
+            self.slot_manager().remove_signal(&request_id);
             return Ok(false);
         };
         if !self.slot_manager().has_slot(&key) {
@@ -597,40 +980,54 @@ impl KvConnectorLeaderCore {
             );
             self.inflight_requests.remove(&request_id);
             self.active_slot_keys.remove(&request_id);
+            self.slot_manager().remove_signal(&request_id);
             return Ok(false);
         }
 
-        crate::lock_slot!(self, &key => slot);
-        if matches!(slot.state(), SlotState::Onboarding(_))
-            && let Some(vllm_slot) = slot.as_any_mut().downcast_mut::<VllmConnectorSlot>()
-        {
-            vllm_slot.discard_pending_operations();
-        }
+        let stores_done = self.slot_manager().transfer_signal
+            .is_stores_done(&request_id)
+            .unwrap_or(true);
 
-        slot.mark_as_finished(self.iteration_counter)?;
-        self.inflight_requests.remove(&request_id);
+        let final_state = {
+            crate::lock_slot!(self, &key => slot);
+            if matches!(slot.state(), SlotState::Onboarding(_))
+                && let Some(vllm_slot) = slot.as_any_mut().downcast_mut::<VllmConnectorSlot>()
+            {
+                vllm_slot.discard_pending_operations();
+            }
 
-        match slot.state() {
+            slot.mark_as_finished(self.iteration_counter)?;
+            self.inflight_requests.remove(&request_id);
+
+            let state = slot.state();
+            tracing::info!(
+                request_id = %request_id,
+                num_block_ids = block_ids.len(),
+                block_ids = ?block_ids,
+                phase = ?state,
+                stores_done,
+                "request_finished: vLLM signaled request completion"
+            );
+            state
+        };
+
+        match final_state {
             SlotState::Finished => {
-                if let Some(vllm_slot) = slot.as_any_mut().downcast_mut::<VllmConnectorSlot>() {
-                    vllm_slot.release_prefetched_host_blocks()?;
-                }
                 self.active_slot_keys.remove(&request_id);
                 self.slot_manager().remove_slot(&key)?;
+                self.slot_manager().remove_signal(&request_id);
             }
             SlotState::Finishing => {
                 self.finishing_requests.insert(request_id);
             }
             _ => {
-                if let Some(vllm_slot) = slot.as_any_mut().downcast_mut::<VllmConnectorSlot>() {
-                    vllm_slot.release_prefetched_host_blocks()?;
-                }
                 self.active_slot_keys.remove(&request_id);
                 self.slot_manager().remove_slot(&key)?;
+                self.slot_manager().remove_signal(&request_id);
             }
         }
 
-        Ok(true)
+        Ok(!stores_done)
     }
 
     pub fn has_slot(&self, request_id: &str) -> bool {
@@ -679,6 +1076,7 @@ impl KvConnectorLeaderCore {
         self.finishing_requests.clear();
         self.request_generations.clear();
         self.active_slot_keys.clear();
+        self.slot_manager().clear_signal();
         self.slot_manager().clear_pool(&pool)?;
         Ok(())
     }
@@ -686,4 +1084,61 @@ impl KvConnectorLeaderCore {
     pub fn get_pool_status(&self) -> std::collections::HashMap<String, std::collections::HashMap<String, u64>> {
         self.slot_manager().get_pool_status()
     }
+}
+
+impl KvConnectorLeaderCore {
+    /// Adapter: handle preemptions via the state machine.
+    /// Called by vLLM v0.18.0 `handle_preemptions` hook.
+    pub fn handle_preemptions_via_machine(&self, preempted_req_ids: &[String]) {
+        let slot_ctx = super::slot_machine::SlotContext {
+            block_size: self.block_size,
+            remote_enabled: self.leader.remote_handle().is_some(),
+            g4_xfer_fail_policy: super::slot_machine::G4FailPolicy::default(),
+        };
+        for req_id in preempted_req_ids {
+            let slot_key = match self.active_slot_keys.get(req_id) {
+                Some(key) => key.clone(),
+                None => continue,
+            };
+            let slot_arc = match self.slot_manager().get_slot(&slot_key) {
+                Ok(arc) => arc,
+                Err(_) => continue,
+            };
+            let mut slot = match slot_arc.lock() {
+                Ok(guard) => guard,
+                Err(e) => {
+                    tracing::error!(
+                        request_id = %req_id,
+                        error = %e,
+                        "slot mutex poisoned in handle_preemptions_via_machine"
+                    );
+                    continue;
+                }
+            };
+            if let Some(vllm_slot) =
+                slot.as_any_mut().downcast_mut::<VllmConnectorSlot>()
+            {
+                let phase = vllm_slot.take_phase();
+                let (new_phase, effects) =
+                    phase.apply(super::SlotEvent::Preempt, &slot_ctx);
+                vllm_slot.set_phase(new_phase);
+
+                tracing::info!(
+                    request_id = %req_id,
+                    phase = ?vllm_slot.phase().as_slot_state(),
+                    "handle_preemptions_via_machine: state machine transition"
+                );
+
+                for effect in effects {
+                    tracing::debug!(
+                        request_id = %req_id,
+                        ?effect,
+                        "preemption effect"
+                    );
+                }
+            }
+            self.slot_manager().remove_signal(req_id);
+        }
+    }
+
 }

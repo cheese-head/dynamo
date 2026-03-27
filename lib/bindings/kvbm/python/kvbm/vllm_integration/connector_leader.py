@@ -85,6 +85,30 @@ class KvConnectorLeader:
         leader = KvbmLeader(world_size, drt=self.drt)
 
         print(f"KvConnectorLeader initialized with engine_id: {engine_id}")
+
+        # Log capacity analysis
+        try:
+            cache_config = vllm_config.cache_config
+            scheduler_config = vllm_config.scheduler_config
+            num_gpu_blocks = cache_config.num_gpu_blocks
+            block_size = cache_config.block_size
+            max_model_len = vllm_config.model_config.max_model_len
+            max_num_seqs = scheduler_config.max_num_seqs
+            max_num_batched_tokens = scheduler_config.max_num_batched_tokens
+
+            gpu_token_capacity = num_gpu_blocks * block_size
+            blocks_per_max_request = (max_model_len + block_size - 1) // block_size
+            max_concurrent_at_full_context = num_gpu_blocks // blocks_per_max_request if blocks_per_max_request > 0 else 0
+
+            print(f"[KVBM] Capacity analysis:")
+            print(f"[KVBM]   GPU blocks: {num_gpu_blocks} x {block_size} = {gpu_token_capacity:,} token slots")
+            print(f"[KVBM]   Max model length: {max_model_len:,} tokens ({blocks_per_max_request} blocks)")
+            print(f"[KVBM]   Max concurrent at full context: {max_concurrent_at_full_context} (GPU-limited)")
+            print(f"[KVBM]   Max admitted sequences: {max_num_seqs} (scheduler-limited)")
+            print(f"[KVBM]   Max batched tokens/step: {max_num_batched_tokens}")
+            print(f"[KVBM]   TP world size: {world_size}")
+        except Exception as e:
+            print(f"[KVBM] Could not compute capacity analysis: {e}")
         # Get kv event consolidator endpoints from vllm_config (pre-computed in main.py)
         consolidator_vllm_endpoint = None
         consolidator_output_endpoint = None

@@ -106,6 +106,7 @@ impl KvConnectorLeaderRecorder {
         );
 
         let leader = leader_py.get_inner().clone();
+        let leader_for_core = leader.clone();
         let handle: Handle = get_current_tokio_handle();
 
         let kvbm_metrics = KvbmMetrics::new(
@@ -201,7 +202,7 @@ impl KvConnectorLeaderRecorder {
         });
 
         let connector_leader =
-            KvConnectorLeader::from_parts(slot_manager_cell, page_size, kvbm_metrics);
+            KvConnectorLeader::from_parts(slot_manager_cell, leader_for_core, page_size, kvbm_metrics);
 
         Self {
             _recorder: recorder,

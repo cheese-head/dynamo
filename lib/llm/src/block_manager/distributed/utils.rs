@@ -72,6 +72,8 @@ pub struct BlockTransferRequest {
     pub connector_req: Option<LeaderTransferRequest>,
     #[serde(default)]
     pub sequence_hashes: Option<Vec<u64>>,
+    #[serde(default)]
+    pub traceparent: Option<String>,
 }
 
 impl BlockTransferRequest {
@@ -87,6 +89,7 @@ impl BlockTransferRequest {
             blocks,
             connector_req: None,
             sequence_hashes: None,
+            traceparent: None,
         }
     }
 
@@ -102,6 +105,7 @@ impl BlockTransferRequest {
             blocks,
             connector_req: Some(connector_req),
             sequence_hashes: None,
+            traceparent: None,
         }
     }
 }
