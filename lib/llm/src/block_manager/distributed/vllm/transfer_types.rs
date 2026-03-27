@@ -83,6 +83,7 @@ pub struct LocalOffloadRequest {
     pub sequence_hashes: Vec<u64>,
     pub block_size: usize,
     pub traceparent: Option<String>,
+    pub baggage: Option<String>,
 }
 
 impl LocalOffloadRequest {
@@ -94,6 +95,7 @@ impl LocalOffloadRequest {
         operation_id: uuid::Uuid,
         block_size: usize,
         traceparent: Option<String>,
+        baggage: Option<String>,
     ) -> Self {
         debug_assert!(block_ids.len() == token_blocks.len());
         debug_assert!(block_ids.len() == priorities.len());
@@ -108,6 +110,7 @@ impl LocalOffloadRequest {
             sequence_hashes,
             block_size,
             traceparent,
+            baggage,
         }
     }
 }
@@ -118,6 +121,7 @@ pub struct LocalOnboardRequest {
     pub src_blocks: Box<dyn AnyBlocks>,
     pub dst_block_ids: Vec<BlockId>,
     pub operation_id: uuid::Uuid,
+    pub traceparent: Option<String>,
 }
 
 impl LocalOnboardRequest {
@@ -126,6 +130,7 @@ impl LocalOnboardRequest {
         src_blocks: Box<dyn AnyBlocks>,
         dst_block_ids: Vec<BlockId>,
         operation_id: uuid::Uuid,
+        traceparent: Option<String>,
     ) -> Self {
         debug_assert!(src_blocks.len() == dst_block_ids.len());
         Self {
@@ -134,6 +139,7 @@ impl LocalOnboardRequest {
             src_blocks,
             dst_block_ids,
             operation_id,
+            traceparent,
         }
     }
 }
@@ -151,12 +157,14 @@ pub struct RemoteTransferRequest {
     pub token_blocks: Option<Vec<TokenBlock>>,
     /// W3C traceparent for propagating trace context across async boundaries
     pub traceparent: Option<String>,
+    pub baggage: Option<String>,
 }
 
 impl RemoteTransferRequest {
     pub fn from_g4_params(
         params: &super::integration::G4OnboardParams,
         traceparent: Option<String>,
+        baggage: Option<String>,
     ) -> Self {
         Self {
             key: params.key.clone(),
@@ -170,6 +178,7 @@ impl RemoteTransferRequest {
             pin_id: None,
             token_blocks: Some(params.token_blocks.clone()),
             traceparent,
+            baggage,
         }
     }
 
@@ -181,6 +190,7 @@ impl RemoteTransferRequest {
         block_size: usize,
         pin_id: uuid::Uuid,
         traceparent: Option<String>,
+        baggage: Option<String>,
     ) -> Self {
         debug_assert!(sequence_hashes.len() == host_block_ids.len());
         Self {
@@ -195,6 +205,7 @@ impl RemoteTransferRequest {
             pin_id: Some(pin_id),
             token_blocks: None,
             traceparent,
+            baggage,
         }
     }
 
@@ -213,4 +224,5 @@ pub struct DrainItem {
     pub pin_guard: PinGuard,
     pub block_size: usize,
     pub traceparent: Option<String>,
+    pub baggage: Option<String>,
 }

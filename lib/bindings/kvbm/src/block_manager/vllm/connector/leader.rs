@@ -9,6 +9,7 @@ use anyhow;
 use dynamo_llm::block_manager::config::{
     cpu_cache_lookup_dirty, cpu_cache_lookup_disabled, set_cpu_cache_lookup_disabled,
 };
+use dynamo_llm::block_manager::distributed::KvbmLeader;
 use dynamo_llm::block_manager::connector::protocol::SlotKey;
 use dynamo_llm::block_manager::distributed::vllm::{
     ConnectorSlotManager, KvConnectorLeaderCore, create_distributed_registry_client, is_dev_mode,
@@ -61,9 +62,21 @@ pub trait Leader: Send + Sync + std::fmt::Debug {
         traceparent: String,
     ) -> anyhow::Result<()>;
 
+    fn set_request_baggage(
+        &mut self,
+        request_id: String,
+        baggage: String,
+    ) -> anyhow::Result<()>;
+
     fn slot_manager(&self) -> &ConnectorSlotManager<SlotKey>;
 
     fn clear_pool(&mut self, pool: String) -> anyhow::Result<()>;
+
+    fn get_pool_status(&self) -> std::collections::HashMap<String, std::collections::HashMap<String, u64>>;
+
+    /// Handle preemptions via the state machine (v0.18.0 adapter).
+    fn handle_preemptions_via_machine(&self, _request_ids: &[String]) {}
+
 }
 
 #[derive(Debug)]
@@ -74,11 +87,12 @@ pub struct KvConnectorLeader {
 impl KvConnectorLeader {
     pub(crate) fn from_parts(
         slot_manager: Arc<OnceLock<ConnectorSlotManager<SlotKey>>>,
-        page_size: usize,
+        leader: Arc<KvbmLeader>,
+        block_size: usize,
         kvbm_metrics: KvbmMetrics,
     ) -> Self {
         Self {
-            core: KvConnectorLeaderCore::new(slot_manager, page_size, kvbm_metrics),
+            core: KvConnectorLeaderCore::new(slot_manager, leader, block_size, kvbm_metrics),
         }
     }
 
@@ -95,6 +109,7 @@ impl KvConnectorLeader {
         );
 
         let leader = leader_py.get_inner().clone();
+        let leader_for_core = leader.clone();
         let handle: Handle = get_current_tokio_handle();
 
         let kvbm_metrics = KvbmMetrics::new(
@@ -102,6 +117,7 @@ impl KvConnectorLeader {
             kvbm_metrics_endpoint_enabled(),
             parse_kvbm_metrics_port(),
         );
+        crate::block_manager::register_global_metrics(kvbm_metrics.clone());
         let kvbm_metrics_clone = kvbm_metrics.clone();
 
         let slot_manager_cell = Arc::new(OnceLock::new());
@@ -177,7 +193,7 @@ impl KvConnectorLeader {
             });
         });
 
-        Self::from_parts(slot_manager_cell, page_size, kvbm_metrics)
+        Self::from_parts(slot_manager_cell, leader_for_core, page_size, kvbm_metrics)
     }
 }
 
@@ -240,9 +256,27 @@ impl Leader for KvConnectorLeader {
         Ok(())
     }
 
+    fn set_request_baggage(
+        &mut self,
+        request_id: String,
+        baggage: String,
+    ) -> anyhow::Result<()> {
+        self.core.set_request_baggage(request_id, baggage);
+        Ok(())
+    }
+
     fn clear_pool(&mut self, pool: String) -> anyhow::Result<()> {
         self.core.clear_pool(pool)
     }
+
+    fn get_pool_status(&self) -> std::collections::HashMap<String, std::collections::HashMap<String, u64>> {
+        self.core.get_pool_status()
+    }
+
+    fn handle_preemptions_via_machine(&self, request_ids: &[String]) {
+        self.core.handle_preemptions_via_machine(request_ids);
+    }
+
 }
 
 #[pyclass]
@@ -340,8 +374,18 @@ impl PyKvConnectorLeader {
             .map_err(to_pyerr)
     }
 
+    fn set_request_baggage(&mut self, request_id: String, baggage: String) -> PyResult<()> {
+        self.connector_leader
+            .set_request_baggage(request_id, baggage)
+            .map_err(to_pyerr)
+    }
+
     fn clear_pool(&mut self, pool: String) -> PyResult<()> {
         self.connector_leader.clear_pool(pool).map_err(to_pyerr)
+    }
+
+    fn get_pool_status(&self) -> PyResult<std::collections::HashMap<String, std::collections::HashMap<String, u64>>> {
+        Ok(self.connector_leader.get_pool_status())
     }
 
     fn set_cpu_cache_lookup_disabled(&self, disabled: bool) -> PyResult<()> {
@@ -362,4 +406,26 @@ impl PyKvConnectorLeader {
     fn cpu_cache_lookup_dirty(&self) -> bool {
         cpu_cache_lookup_dirty()
     }
+
+    /// Handle preemptions via the state machine (v0.18.0).
+    fn handle_preemptions(&self, request_ids: Vec<String>) -> PyResult<()> {
+        self.connector_leader
+            .handle_preemptions_via_machine(&request_ids);
+        Ok(())
+    }
+
+    /// Apply worker feedback — no-op, completion handled by TransferSignal.
+    fn apply_worker_feedback(
+        &self,
+        _completed_json: &str,
+        _failed_json: &str,
+    ) -> PyResult<()> {
+        Ok(())
+    }
+
+    /// Drain completed onboard operations — no-op, handled by TransferSignal.
+    fn drain_onboard_completions(&self) -> Vec<String> {
+        Vec::new()
+    }
+
 }

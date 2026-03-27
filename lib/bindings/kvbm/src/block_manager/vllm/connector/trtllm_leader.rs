@@ -10,9 +10,10 @@ use crate::block_manager::vllm::connector::leader::slot::{
 use crate::block_manager::{distributed::KvbmLeader as PyKvbmLeader, vllm::KvbmRequest};
 use crate::get_current_tokio_handle;
 use anyhow;
-use dynamo_llm::block_manager::connector::protocol::{RequestType, SlotKey};
+use dynamo_llm::block_manager::connector::protocol::{RequestType, SlotKey, TransferType};
 use dynamo_llm::block_manager::distributed::vllm::{
-    kvbm_metrics_endpoint_enabled, parse_kvbm_metrics_port,
+    kvbm_metrics_endpoint_enabled, parse_kvbm_metrics_port, G4FailPolicy, SlotContext,
+    VllmConnectorSlot,
 };
 use dynamo_llm::block_manager::kv_consolidator::EventSource;
 use dynamo_llm::block_manager::metrics_kvbm::{KvbmMetrics, KvbmMetricsRegistry};
@@ -51,6 +52,8 @@ pub trait Leader: Send + Sync + std::fmt::Debug {
     fn create_slot(&mut self, request: KvbmRequest, tokens: Vec<u32>) -> anyhow::Result<()>;
 
     fn slot_manager(&self) -> &ConnectorSlotManager<SlotKey>;
+
+    fn get_pool_status(&self) -> std::collections::HashMap<String, std::collections::HashMap<String, u64>>;
 }
 
 #[derive(Debug)]
@@ -87,6 +90,7 @@ impl KvConnectorLeader {
             kvbm_metrics_endpoint_enabled(),
             parse_kvbm_metrics_port(),
         );
+        crate::block_manager::register_global_metrics(kvbm_metrics.clone());
 
         let kvbm_metrics_clone = kvbm_metrics.clone();
 
@@ -309,7 +313,24 @@ impl Leader for KvConnectorLeader {
                     "triggering onboarding for {} external tokens",
                     num_external_tokens
                 );
-                slot.trigger_onboarding(num_external_tokens)?;
+                let effect_ctx = self.slot_manager().effect_context();
+                let slot_ctx = SlotContext {
+                    block_size: self.block_size,
+                    remote_enabled: effect_ctx.leader.remote_handle().is_some(),
+                    g4_xfer_fail_policy: G4FailPolicy::default(),
+                };
+                let vllm_slot = slot
+                    .as_any_mut()
+                    .downcast_mut::<VllmConnectorSlot>()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("expected VllmConnectorSlot for request {}", request_id)
+                    })?;
+                vllm_slot.trigger_onboarding_execute_effects(
+                    num_external_tokens,
+                    None,
+                    &slot_ctx,
+                    &effect_ctx,
+                )?;
                 self.onboarding_slots.insert(request_id.clone());
             }
 
@@ -359,24 +380,33 @@ impl Leader for KvConnectorLeader {
                 )
             })?;
             let shared_slot = self.slot_manager().get_slot(&key)?;
-            let mut slot = shared_slot
+            let _slot = shared_slot
                 .lock()
                 .map_err(|e| anyhow::anyhow!("Failed to lock slot: {}", e))?;
 
-            let pending_ops_opt = slot.take_pending_operations();
+            let pending_ops_opt = self.slot_manager().take_pending_worker_ops(&key);
 
             if let Some(pending_ops) = pending_ops_opt {
-                // Count immediate (onboard) operations for this slot
                 let num_immediate = pending_ops
                     .iter()
-                    .filter(|op| op.request_type == RequestType::Immediate)
+                    .filter(|op| {
+                        op.transfer_type == TransferType::Load
+                            && op.request_type == RequestType::Immediate
+                    })
                     .count() as u64;
-
-                // Create slot with expected immediate ops BEFORE adding operations
-                md.create_slot_with_key(key.clone(), num_immediate);
+                if num_immediate == 0 {
+                    anyhow::bail!(
+                        "onboarding metadata contract violated for request {}: slot is marked for onboarding but emitted zero immediate load ops",
+                        request_id
+                    );
+                }
+                md.create_onboarding_slot(key.clone(), num_immediate);
                 md.add_operations_for_key(&key, pending_ops);
             } else {
-                md.create_slot_with_key(key, 0);
+                anyhow::bail!(
+                    "onboarding metadata contract violated for request {}: onboarding slot has no pending worker ops",
+                    request_id
+                );
             }
         }
 
@@ -428,25 +458,46 @@ impl Leader for KvConnectorLeader {
                 .get(&new_req.request_id)
                 .unwrap_or(&0);
 
-            slot.apply_scheduler_output(
+            let effect_ctx = self.slot_manager().effect_context();
+            let slot_ctx = SlotContext {
+                block_size: self.block_size,
+                remote_enabled: effect_ctx.leader.remote_handle().is_some(),
+                g4_xfer_fail_policy: G4FailPolicy::default(),
+            };
+            let vllm_slot = slot
+                .as_any_mut()
+                .downcast_mut::<VllmConnectorSlot>()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("expected VllmConnectorSlot for request {}", new_req.request_id)
+                })?;
+            vllm_slot.apply_scheduler_output_execute_effects(
                 &[],
                 &new_req.block_ids,
                 new_req.num_computed_tokens,
                 scheduled_tokens,
                 new_req.priorities.as_deref(),
+                &slot_ctx,
+                &effect_ctx,
             )?;
 
-            let pending_ops_opt = slot.take_pending_operations();
+            let pending_ops_opt = self.slot_manager().take_pending_worker_ops(&key);
 
             if let Some(pending_ops) = pending_ops_opt {
-                // Count immediate (onboard) operations for this slot
                 let num_immediate = pending_ops
                     .iter()
-                    .filter(|op| op.request_type == RequestType::Immediate)
+                    .filter(|op| {
+                        op.transfer_type == TransferType::Load
+                            && op.request_type == RequestType::Immediate
+                    })
                     .count() as u64;
-
-                // Create slot with expected immediate ops BEFORE adding operations
-                md.create_slot_with_key(key.clone(), num_immediate);
+                if num_immediate > 0 {
+                    anyhow::bail!(
+                        "prefill metadata contract violated for request {}: prefill slot emitted {} immediate load ops",
+                        request_id,
+                        num_immediate
+                    );
+                }
+                md.create_prefill_slot(key.clone());
 
                 tracing::debug!(
                     "adding {} pending operations for slot {} ({} immediate)",
@@ -456,7 +507,7 @@ impl Leader for KvConnectorLeader {
                 );
                 md.add_operations_for_key(&key, pending_ops);
             } else {
-                md.create_slot_with_key(key, 0);
+                md.create_prefill_slot(key);
             }
         }
 
@@ -482,15 +533,29 @@ impl Leader for KvConnectorLeader {
                 .get(&cached_req.request_id)
                 .unwrap_or(&0);
 
-            slot.apply_scheduler_output(
+            let effect_ctx = self.slot_manager().effect_context();
+            let slot_ctx = SlotContext {
+                block_size: self.block_size,
+                remote_enabled: effect_ctx.leader.remote_handle().is_some(),
+                g4_xfer_fail_policy: G4FailPolicy::default(),
+            };
+            let vllm_slot = slot
+                .as_any_mut()
+                .downcast_mut::<VllmConnectorSlot>()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("expected VllmConnectorSlot for request {}", request_id)
+                })?;
+            vllm_slot.apply_scheduler_output_execute_effects(
                 &cached_req.new_token_ids,
                 &cached_req.new_block_ids,
                 cached_req.num_computed_tokens,
                 scheduled_tokens,
                 cached_req.priorities.as_deref(),
+                &slot_ctx,
+                &effect_ctx,
             )?;
 
-            if let Some(pending_ops) = slot.take_pending_operations() {
+            if let Some(pending_ops) = self.slot_manager().take_pending_worker_ops(&key) {
                 tracing::debug!(
                     "adding {} pending operations for slot {}",
                     pending_ops.len(),
@@ -563,6 +628,10 @@ impl Leader for KvConnectorLeader {
         self.inflight_requests.insert(request.request_id);
 
         Ok(())
+    }
+
+    fn get_pool_status(&self) -> std::collections::HashMap<String, std::collections::HashMap<String, u64>> {
+        self.slot_manager().get_pool_status()
     }
 }
 

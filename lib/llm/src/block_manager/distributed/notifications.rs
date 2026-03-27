@@ -255,14 +255,42 @@ pub async fn process_transfer_notifications<C: CompletionChecker>(
     }
 }
 
-/// Sender type for registering NIXL transfer notifications.
-pub type NixlNotificationSender = mpsc::Sender<RegisterTransferNotification<NixlStatusChecker>>;
+/// Sender for registering NIXL transfer notifications.
+///
+/// Supports two backends:
+/// - `Polling`: v1 per-transfer `get_xfer_status` polling (legacy)
+/// - `Events`: v2 batch `get_notifications` via the NIXL notification API (preferred)
+#[derive(Clone)]
+pub enum NixlNotificationSender {
+    Polling(mpsc::Sender<RegisterTransferNotification<NixlStatusChecker>>),
+    Events(mpsc::Sender<crate::block_manager::v2::physical::transfer::notifications::nixl_events::RegisterNixlNotification>),
+}
 
-/// Spawn the notification handler task and return the sender.
+/// Spawn the legacy polling notification handler and return the sender.
 pub fn spawn_notification_handler(handle: &tokio::runtime::Handle) -> NixlNotificationSender {
     let (tx, rx) = mpsc::channel(256);
     handle.spawn(process_transfer_notifications(rx));
-    tx
+    NixlNotificationSender::Polling(tx)
+}
+
+/// Spawn a polling notification handler with high capacity for shared (non-pooled) use.
+/// Uses get_xfer_status per transfer — works with all NIXL backends including POSIX.
+pub fn spawn_polling_handler(handle: &tokio::runtime::Handle) -> NixlNotificationSender {
+    let (tx, rx) = mpsc::channel(32768);
+    handle.spawn(process_transfer_notifications(rx));
+    NixlNotificationSender::Polling(tx)
+}
+
+/// Spawn the v2 batch notification handler using NIXL's native notification API.
+pub fn spawn_nixl_event_handler(
+    handle: &tokio::runtime::Handle,
+    agent: nixl_sys::Agent,
+) -> NixlNotificationSender {
+    let (tx, rx) = mpsc::channel(32768);
+    handle.spawn(
+        crate::block_manager::v2::physical::transfer::notifications::nixl_events::process_nixl_notification_events(agent, rx),
+    );
+    NixlNotificationSender::Events(tx)
 }
 
 #[cfg(test)]

@@ -28,10 +28,20 @@ if TYPE_CHECKING:
 # )
 # from kvbm.vllm_integration.rust import SchedulerOutput as RustSchedulerOutput
 
+# Ensure vLLM forwards the W3C baggage header alongside traceparent/tracestate.
+try:
+    import vllm.tracing as _vllm_tracing
+    if "baggage" not in _vllm_tracing.TRACE_HEADERS:
+        _vllm_tracing.TRACE_HEADERS.append("baggage")
+except (ImportError, AttributeError):
+    pass
+
 from kvbm import KvbmLeader
 from kvbm.management import (
     register_clear_pool,
     register_get_cpu_lookup_status,
+    register_get_status,
+    register_reset_metrics,
     register_set_cpu_lookup_disabled,
     start_management_server,
 )
@@ -75,6 +85,30 @@ class KvConnectorLeader:
         leader = KvbmLeader(world_size, drt=self.drt)
 
         print(f"KvConnectorLeader initialized with engine_id: {engine_id}")
+
+        # Log capacity analysis
+        try:
+            cache_config = vllm_config.cache_config
+            scheduler_config = vllm_config.scheduler_config
+            num_gpu_blocks = cache_config.num_gpu_blocks
+            block_size = cache_config.block_size
+            max_model_len = vllm_config.model_config.max_model_len
+            max_num_seqs = scheduler_config.max_num_seqs
+            max_num_batched_tokens = scheduler_config.max_num_batched_tokens
+
+            gpu_token_capacity = num_gpu_blocks * block_size
+            blocks_per_max_request = (max_model_len + block_size - 1) // block_size
+            max_concurrent_at_full_context = num_gpu_blocks // blocks_per_max_request if blocks_per_max_request > 0 else 0
+
+            print(f"[KVBM] Capacity analysis:")
+            print(f"[KVBM]   GPU blocks: {num_gpu_blocks} x {block_size} = {gpu_token_capacity:,} token slots")
+            print(f"[KVBM]   Max model length: {max_model_len:,} tokens ({blocks_per_max_request} blocks)")
+            print(f"[KVBM]   Max concurrent at full context: {max_concurrent_at_full_context} (GPU-limited)")
+            print(f"[KVBM]   Max admitted sequences: {max_num_seqs} (scheduler-limited)")
+            print(f"[KVBM]   Max batched tokens/step: {max_num_batched_tokens}")
+            print(f"[KVBM]   TP world size: {world_size}")
+        except Exception as e:
+            print(f"[KVBM] Could not compute capacity analysis: {e}")
         # Get kv event consolidator endpoints from vllm_config (pre-computed in main.py)
         consolidator_vllm_endpoint = None
         consolidator_output_endpoint = None
@@ -120,8 +154,14 @@ class KvConnectorLeader:
         # Register the clear_pool callable and start the management HTTP
         # server when KVBM_DEV_MODE is enabled.
         register_clear_pool(self.clear_pool)
+        register_get_status(self.get_pool_status)
         register_set_cpu_lookup_disabled(self.set_cpu_cache_lookup_disabled)
         register_get_cpu_lookup_status(self.get_cpu_cache_lookup_status)
+        try:
+            from kvbm._core import reset_metrics
+            register_reset_metrics(reset_metrics)
+        except ImportError:
+            pass
         mgmt_port = start_management_server()
         if mgmt_port is not None:
             print(
@@ -283,6 +323,10 @@ class KvConnectorLeader:
         """
         self._connector.clear_pool(pool)
 
+    def get_pool_status(self) -> dict:
+        """Return pool block counts for the management API status endpoint."""
+        return self._connector.get_pool_status()
+
     def set_cpu_cache_lookup_disabled(self, disabled: bool) -> None:
         """Enable/disable CPU cache lookup for cache hits (dev-only)."""
         self._connector.set_cpu_cache_lookup_disabled(bool(disabled))
@@ -329,6 +373,10 @@ class KvConnectorLeader:
         # (OTEL not enabled), we create a fallback root span.
         try:
             trace_headers = getattr(request, "trace_headers", None)
+            print(
+                f"[kvbm-debug] request_id={request_id} "
+                f"trace_headers={dict(trace_headers) if trace_headers else None}"
+            )
             tp = trace_headers.get("traceparent") if trace_headers else None
 
             if not tp:
@@ -350,5 +398,26 @@ class KvConnectorLeader:
                     request.trace_headers = {"traceparent": tp}
                 elif "traceparent" not in request.trace_headers:
                     request.trace_headers["traceparent"] = tp
-        except Exception:
+
+            baggage = trace_headers.get("baggage") if trace_headers else None
+            if not baggage:
+                ts = trace_headers.get("tracestate") if trace_headers else None
+                if ts:
+                    for entry in ts.split(","):
+                        entry = entry.strip()
+                        if entry.startswith("kvbm="):
+                            from urllib.parse import unquote
+                            baggage = unquote(entry[5:])
+                            break
+            print(
+                f"[kvbm-debug] request_id={request_id} "
+                f"baggage={baggage!r} "
+                f"traceparent={tp!r}"
+            )
+            if baggage:
+                self._connector.set_request_baggage(request_id, baggage)
+            else:
+                print(f"[kvbm-debug] WARNING: no baggage found in trace_headers for {request_id}")
+        except Exception as e:
+            print(f"[kvbm-debug] ERROR in trace propagation: {e}")
             pass

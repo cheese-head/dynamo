@@ -106,6 +106,7 @@ impl KvConnectorLeaderRecorder {
         );
 
         let leader = leader_py.get_inner().clone();
+        let leader_for_core = leader.clone();
         let handle: Handle = get_current_tokio_handle();
 
         let kvbm_metrics = KvbmMetrics::new(
@@ -113,6 +114,7 @@ impl KvConnectorLeaderRecorder {
             kvbm_metrics_endpoint_enabled(),
             parse_kvbm_metrics_port(),
         );
+        crate::block_manager::register_global_metrics(kvbm_metrics.clone());
         let kvbm_metrics_clone = kvbm_metrics.clone();
 
         let token = CancellationToken::new();
@@ -200,7 +202,7 @@ impl KvConnectorLeaderRecorder {
         });
 
         let connector_leader =
-            KvConnectorLeader::from_parts(slot_manager_cell, page_size, kvbm_metrics);
+            KvConnectorLeader::from_parts(slot_manager_cell, leader_for_core, page_size, kvbm_metrics);
 
         Self {
             _recorder: recorder,
@@ -361,8 +363,20 @@ impl Leader for KvConnectorLeaderRecorder {
             .set_request_traceparent(request_id, traceparent)
     }
 
+    fn set_request_baggage(
+        &mut self,
+        request_id: String,
+        baggage: String,
+    ) -> anyhow::Result<()> {
+        self.connector_leader
+            .set_request_baggage(request_id, baggage)
+    }
+
     fn clear_pool(&mut self, pool: String) -> anyhow::Result<()> {
-        // Delegate directly to the inner leader; recording this action is not critical.
         self.connector_leader.clear_pool(pool)
+    }
+
+    fn get_pool_status(&self) -> std::collections::HashMap<String, std::collections::HashMap<String, u64>> {
+        self.connector_leader.get_pool_status()
     }
 }

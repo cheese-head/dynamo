@@ -14,7 +14,7 @@ pub mod worker;
 
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::to_pyerr;
 
@@ -148,12 +148,28 @@ impl std::fmt::Debug for CachedRequestData {
 }
 
 /// Information about a new slot to be created on the worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NewSlotKind {
+    /// Fresh prefill/decode slot. These slots must not carry immediate load
+    /// operations in the same metadata batch.
+    Prefill,
+    /// Async onboarding slot. The worker must derive a strictly-positive
+    /// number of immediate load ops from `operations` before creating the
+    /// scheduler epoch.
+    Onboarding,
+}
+
+/// Information about a new slot to be created on the worker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewSlotInfo {
     /// The request ID for the new slot.
     pub key: SlotKey,
+    /// Slot purpose. Workers validate this against the actual immediate load
+    /// ops carried in the accompanying metadata batch.
+    pub kind: NewSlotKind,
     /// Expected number of immediate (onboard) operations for this slot.
-    /// This enables proper completion tracking and avoids race conditions in TP>1.
+    /// This is a checksum; the worker derives the authoritative count from the
+    /// concrete `operations` payload before creating the scheduler slot.
     pub expected_immediate_ops: u64,
 }
 
@@ -167,6 +183,18 @@ pub struct ConnectorMetadata {
 
     /// The operations that were initialized in this iteration.
     pub operations: Vec<WorkerTransferRequest>,
+
+    /// Request IDs where all Load ops are done (from leader's TransferSignal).
+    #[serde(default)]
+    pub loads_done: HashSet<String>,
+
+    /// Request IDs where all Store ops are done (from leader's TransferSignal).
+    #[serde(default)]
+    pub stores_done: HashSet<String>,
+
+    /// Request IDs that have at least one failed op (from leader's TransferSignal).
+    #[serde(default)]
+    pub failed: HashSet<String>,
 }
 
 impl ConnectorMetadata {
@@ -175,15 +203,38 @@ impl ConnectorMetadata {
             iteration,
             new_slots: Vec::new(),
             operations: Vec::new(),
+            loads_done: HashSet::new(),
+            stores_done: HashSet::new(),
+            failed: HashSet::new(),
         }
     }
 
-    /// Create a slot with the expected number of immediate operations.
-    pub fn create_slot_with_key(&mut self, key: SlotKey, expected_immediate_ops: u64) {
+    fn push_slot(
+        &mut self,
+        key: SlotKey,
+        kind: NewSlotKind,
+        expected_immediate_ops: u64,
+    ) {
         self.new_slots.push(NewSlotInfo {
             key,
+            kind,
             expected_immediate_ops,
         });
+    }
+
+    /// Create a fresh prefill/decode slot.
+    pub fn create_prefill_slot(&mut self, key: SlotKey) {
+        self.push_slot(key, NewSlotKind::Prefill, 0);
+    }
+
+    /// Create an onboarding slot that must carry one or more immediate load
+    /// operations in the same metadata batch.
+    pub fn create_onboarding_slot(&mut self, key: SlotKey, expected_immediate_ops: u64) {
+        debug_assert!(
+            expected_immediate_ops > 0,
+            "onboarding slots must declare at least one immediate load op"
+        );
+        self.push_slot(key, NewSlotKind::Onboarding, expected_immediate_ops);
     }
 
     pub fn add_operations(&mut self, xfer_reqs: Vec<WorkerTransferRequest>) {

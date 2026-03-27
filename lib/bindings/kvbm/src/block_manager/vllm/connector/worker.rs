@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use dynamo_llm::block_manager::connector::protocol::{SlotKey, TransferType};
+use dynamo_llm::block_manager::connector::protocol::{
+    RequestType, SlotKey, TransferType, WorkerTransferRequest,
+};
 use dynamo_llm::block_manager::connector::scheduler::{
     Scheduler, TransferSchedulerClient, WorkerSchedulerClient,
 };
@@ -52,13 +54,11 @@ pub trait Worker: Send + Sync {
 
     /// Get block IDs that failed to load and clear the set
     fn get_block_ids_with_load_errors(&mut self) -> HashSet<u32>;
-}
 
-#[derive(Debug, Clone, Default)]
-struct LocalEpochState {
-    onboarding_pending: bool,
-    offloading_pending: bool,
-    terminal_seen: bool,
+    /// v0.18 worker metadata: JSON `{"onboard":{req:[uuid..]},"offload":{...},"failed":{...}}`.
+    fn build_connector_worker_meta_json(&mut self) -> Option<String> {
+        None
+    }
 }
 
 pub struct KvConnectorWorker {
@@ -69,11 +69,15 @@ pub struct KvConnectorWorker {
 
     kv_cache_layers: Vec<(String, Arc<dyn TorchTensor>)>,
 
+    /// Completion snapshots from the leader (refreshed each iteration via metadata).
+    loads_done: HashSet<String>,
+    stores_done: HashSet<String>,
+    failed_requests: HashSet<String>,
+
     /// Current active epoch per request id, used only as the external adapter.
     active_epochs: HashMap<String, SlotKey>,
-
-    /// Worker-local projection of scheduler-owned epoch state.
-    local_epochs: HashMap<SlotKey, LocalEpochState>,
+    /// Request IDs already reported as onboarding-complete (dedup).
+    reported_onboarding: HashSet<String>,
 
     /// For now, offloading operations will be enqueued at the end of the forward pass
     offloading_operations: Vec<WorkerTransferRequest>,
@@ -95,13 +99,16 @@ pub struct KvConnectorWorker {
 
     /// Pending failure notifications not yet processed (epoch → failed UUIDs)
     pending_failures: HashMap<SlotKey, HashSet<uuid::Uuid>>,
+
+    /// Onboarding epochs that the scheduler has declared failed and whose load
+    /// errors should be surfaced back to vLLM.
+    failed_onboarding_keys: HashSet<SlotKey>,
 }
 
 impl KvConnectorWorker {
-    fn ensure_local_epoch(&mut self, key: &SlotKey) -> &mut LocalEpochState {
+    fn track_epoch(&mut self, key: &SlotKey) {
         self.active_epochs
             .insert(key.request_id.clone(), key.clone());
-        self.local_epochs.entry(key.clone()).or_default()
     }
 
     fn new(drt: Option<Arc<DistributedRuntime>>, vllm_worker_id: String) -> anyhow::Result<Self> {
@@ -131,8 +138,11 @@ impl KvConnectorWorker {
             kvbm_worker: OnceLock::new(),
             connector: worker_client,
             transfer_client,
+            loads_done: HashSet::new(),
+            stores_done: HashSet::new(),
+            failed_requests: HashSet::new(),
             active_epochs: HashMap::new(),
-            local_epochs: HashMap::new(),
+            reported_onboarding: HashSet::new(),
             offloading_operations: Vec::new(),
             bound: false,
             iteration: 0,
@@ -142,8 +152,10 @@ impl KvConnectorWorker {
             request_to_blocks: HashMap::new(),
             failed_block_ids: HashSet::new(),
             pending_failures: HashMap::new(),
+            failed_onboarding_keys: HashSet::new(),
         })
     }
+
 }
 
 impl Worker for KvConnectorWorker {
@@ -258,6 +270,24 @@ impl Worker for KvConnectorWorker {
     fn bind_connector_metadata(&mut self, metadata: Vec<u8>) -> anyhow::Result<()> {
         // debug_assert!(!self.bound, "connector metadata already bound");
         let metadata: ConnectorMetadata = serde_json::from_slice(&metadata)?;
+        self.loads_done = metadata.loads_done.clone();
+        self.stores_done = metadata.stores_done.clone();
+        self.failed_requests = metadata.failed.clone();
+        // Onboarding cardinality must be derived from the concrete immediate
+        // load ops the worker is about to enqueue, not trusted from metadata
+        // blindly. `NewSlotInfo.expected_immediate_ops` is treated as a
+        // checksum only.
+        let derived_immediate_loads: HashMap<SlotKey, u64> = metadata
+            .operations
+            .iter()
+            .filter(|op| {
+                op.transfer_type == TransferType::Load
+                    && op.request_type == RequestType::Immediate
+            })
+            .fold(HashMap::new(), |mut counts, op| {
+                *counts.entry(op.key.clone()).or_insert(0) += 1;
+                counts
+            });
         self.bound = true;
         self.iteration = metadata.iteration;
         self.layers_complete = 0;
@@ -284,26 +314,56 @@ impl Worker for KvConnectorWorker {
         // - send the list of actions to the engine to track completion
 
         for slot_info in &metadata.new_slots {
-            if let Some(existing_key) = self.active_epochs.get(&slot_info.key.request_id).cloned() {
-                if existing_key != slot_info.key && self.connector.has_key(&existing_key) {
-                    if self.connector.is_key_complete(&existing_key) {
-                        tracing::debug!(
-                            request_id = %slot_info.key.request_id,
-                            previous_generation = existing_key.generation,
-                            new_generation = slot_info.key.generation,
-                            expected_immediate_ops = slot_info.expected_immediate_ops,
-                            "replacing completed epoch slot"
-                        );
-                        self.connector.remove_key(&existing_key)?;
-                        self.local_epochs.remove(&existing_key);
-                    } else {
+            let actual_immediate_ops = derived_immediate_loads
+                .get(&slot_info.key)
+                .copied()
+                .unwrap_or(0);
+            match slot_info.kind {
+                NewSlotKind::Onboarding => {
+                    if actual_immediate_ops == 0 {
                         return Err(anyhow::anyhow!(
-                            "Cannot create new epoch slot for request '{}': \
-                             previous epoch {} still has incomplete operations.",
-                            slot_info.key.request_id,
-                            existing_key.generation
+                            "invalid onboarding metadata for request '{}': onboarding slot carries zero immediate load ops",
+                            slot_info.key.request_id
                         ));
                     }
+                    if slot_info.expected_immediate_ops != actual_immediate_ops {
+                        return Err(anyhow::anyhow!(
+                            "invalid onboarding metadata for request '{}': leader expected {} immediate ops but worker derived {} from operations",
+                            slot_info.key.request_id,
+                            slot_info.expected_immediate_ops,
+                            actual_immediate_ops
+                        ));
+                    }
+                }
+                NewSlotKind::Prefill => {
+                    if actual_immediate_ops != 0 {
+                        return Err(anyhow::anyhow!(
+                            "invalid prefill metadata for request '{}': prefill slot carries {} immediate load ops",
+                            slot_info.key.request_id,
+                            actual_immediate_ops
+                        ));
+                    }
+                    if slot_info.expected_immediate_ops != 0 {
+                        return Err(anyhow::anyhow!(
+                            "invalid prefill metadata for request '{}': expected_immediate_ops must be 0, got {}",
+                            slot_info.key.request_id,
+                            slot_info.expected_immediate_ops
+                        ));
+                    }
+                }
+            }
+
+            if let Some(existing_key) = self.active_epochs.get(&slot_info.key.request_id).cloned() {
+                if existing_key != slot_info.key && self.connector.has_key(&existing_key) {
+                    tracing::debug!(
+                        request_id = %slot_info.key.request_id,
+                        previous_generation = existing_key.generation,
+                        new_generation = slot_info.key.generation,
+                        slot_kind = ?slot_info.kind,
+                        expected_immediate_ops = actual_immediate_ops,
+                        "replacing previous epoch slot"
+                    );
+                    let _ = self.connector.remove_key(&existing_key);
                 } else if existing_key == slot_info.key && self.connector.has_key(&existing_key) {
                     continue;
                 }
@@ -311,14 +371,15 @@ impl Worker for KvConnectorWorker {
 
             tracing::debug!(
                 request_id = %slot_info.key.request_id,
-                expected_immediate_ops = slot_info.expected_immediate_ops,
+                slot_kind = ?slot_info.kind,
+                expected_immediate_ops = actual_immediate_ops,
                 "creating connector slot"
             );
             self.connector.create_slot_with_key_and_immediate_ops(
                 slot_info.key.clone(),
-                slot_info.expected_immediate_ops,
+                actual_immediate_ops,
             )?;
-            self.ensure_local_epoch(&slot_info.key);
+            self.track_epoch(&slot_info.key);
         }
 
         let mut onboarding_operations = Vec::new();
@@ -350,8 +411,7 @@ impl Worker for KvConnectorWorker {
 
             let key = operation.key.clone();
             self.connector.enqueue_request(operation)?;
-            let state = self.ensure_local_epoch(&key);
-            state.onboarding_pending = true;
+            self.track_epoch(&key);
         }
 
         self.offloading_operations = offloading_operations;
@@ -417,156 +477,58 @@ impl Worker for KvConnectorWorker {
         &mut self,
         finished_requests: HashSet<String>,
     ) -> (HashSet<String>, HashSet<String>) {
-        tracing::debug!(
-            iteration = self.iteration,
-            "Getting finished requests: {finished_requests:?}"
-        );
-
         let mut is_finished_offloading = HashSet::new();
         let mut is_finished_onboarding = HashSet::new();
 
         for request_id in finished_requests {
-            tracing::debug!(request_id, "marking request as finished");
             let Some(key) = self.active_epochs.get(&request_id).cloned() else {
-                tracing::warn!(
-                    request_id,
-                    "finished request received for unknown request_id; dropping silently"
-                );
                 continue;
             };
-
-            let is_complete = !self.connector.has_key(&key) || self.connector.is_key_complete(&key);
-            if is_complete {
+            let stores_done = self.stores_done.contains(&request_id);
+            if stores_done {
                 if self.connector.has_key(&key) {
                     let _ = self.connector.remove_key(&key);
                 }
-                self.local_epochs.remove(&key);
                 self.active_epochs.remove(&request_id);
-                self.request_to_blocks.remove(&key);
-                self.pending_failures.remove(&key);
+                self.reported_onboarding.remove(&request_id);
                 is_finished_offloading.insert(request_id);
-                continue;
-            }
-
-            if let Some(state) = self.local_epochs.get_mut(&key) {
-                state.onboarding_pending = false;
-                state.offloading_pending = true;
-                state.terminal_seen = true;
             }
         }
 
-        let offloading_pending_keys: Vec<SlotKey> = self
-            .local_epochs
-            .iter()
-            .filter_map(|(key, state)| {
-                if state.offloading_pending {
-                    Some(key.clone())
-                } else {
-                    None
-                }
-            })
+        let active_req_ids: Vec<_> = self
+            .active_epochs
+            .keys()
+            .filter(|rid| !self.reported_onboarding.contains(*rid))
+            .cloned()
             .collect();
-        for key in offloading_pending_keys {
-            if !self.connector.has_key(&key) || self.connector.is_key_complete(&key) {
-                is_finished_offloading.insert(key.request_id.clone());
+        for request_id in active_req_ids {
+            if self.loads_done.contains(&request_id) {
+                is_finished_onboarding.insert(request_id.clone());
+                self.reported_onboarding.insert(request_id.clone());
             }
-        }
-
-        for request_id in &is_finished_offloading {
-            if let Some(key) = self.active_epochs.remove(request_id) {
-                if self.connector.has_key(&key) {
-                    let _ = self.connector.remove_key(&key);
-                }
-                self.local_epochs.remove(&key);
-                self.request_to_blocks.remove(&key);
-                self.pending_failures.remove(&key);
-            }
-        }
-
-        for (request_id, failed_uuids) in self.connector.drain_failures() {
-            if let Some(key) = self.active_epochs.get(&request_id).cloned() {
-                self.pending_failures
-                    .entry(key)
-                    .or_default()
-                    .extend(failed_uuids);
-            }
-        }
-
-        let onboarding_pending_keys: Vec<SlotKey> = self
-            .local_epochs
-            .iter()
-            .filter_map(|(key, state)| {
-                if state.onboarding_pending && !state.terminal_seen {
-                    Some(key.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        for key in onboarding_pending_keys {
-            if !self.connector.has_key(&key) || self.connector.is_key_complete(&key) {
-                if let Some(failed_uuids) = self.pending_failures.get(&key)
-                    && let Some(uuid_to_blocks) = self.request_to_blocks.get(&key)
-                {
-                    for failed_uuid in failed_uuids {
-                        if let Some(block_ids) = uuid_to_blocks.get(failed_uuid) {
-                            for &block_id in block_ids {
-                                self.failed_block_ids.insert(block_id as u32);
-                            }
-                        }
-                    }
-                }
-                is_finished_onboarding.insert(key.request_id.clone());
-            }
-        }
-
-        for request_id in &is_finished_onboarding {
-            if let Some(key) = self.active_epochs.get(request_id).cloned() {
-                if self.connector.has_key(&key) {
-                    let _ = self.connector.remove_key(&key);
-                }
-                self.request_to_blocks.remove(&key);
-                self.pending_failures.remove(&key);
-                if let Some(state) = self.local_epochs.get_mut(&key) {
-                    state.onboarding_pending = false;
+            if self.failed_requests.contains(&request_id) {
+                if let Some(key) = self.active_epochs.get(&request_id) {
+                    self.failed_onboarding_keys.insert(key.clone());
                 }
             }
         }
 
-        self.local_epochs
-            .retain(|_, state| state.onboarding_pending || state.offloading_pending);
-        self.active_epochs
-            .retain(|_, key| self.local_epochs.contains_key(key) || self.connector.has_key(key));
+        tracing::info!(
+            iteration = self.iteration,
+            finished_offloading = ?is_finished_offloading,
+            finished_onboarding = ?is_finished_onboarding,
+            "worker get_finished: returning request IDs to vLLM"
+        );
 
         (is_finished_offloading, is_finished_onboarding)
     }
 
     fn get_block_ids_with_load_errors(&mut self) -> HashSet<u32> {
-        for (request_id, failed_uuids) in self.connector.drain_failures() {
-            if let Some(key) = self.active_epochs.get(&request_id).cloned() {
-                self.pending_failures
-                    .entry(key)
-                    .or_default()
-                    .extend(failed_uuids);
-            }
-        }
-
-        let onboarding_keys: Vec<SlotKey> = self
-            .local_epochs
-            .iter()
-            .filter_map(|(key, state)| {
-                if state.onboarding_pending {
-                    Some(key.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        for key in onboarding_keys {
-            if self.connector.has_key(&key)
-                && self.connector.is_key_complete(&key)
-                && let Some(failed_uuids) = self.pending_failures.get(&key)
-                && let Some(uuid_to_blocks) = self.request_to_blocks.get(&key)
+        let failed_onboarding_keys: Vec<SlotKey> =
+            self.failed_onboarding_keys.iter().cloned().collect();
+        for key in &failed_onboarding_keys {
+            if let Some(failed_uuids) = self.pending_failures.get(key)
+                && let Some(uuid_to_blocks) = self.request_to_blocks.get(key)
             {
                 for failed_uuid in failed_uuids {
                     if let Some(block_ids) = uuid_to_blocks.get(failed_uuid) {
@@ -577,8 +539,17 @@ impl Worker for KvConnectorWorker {
                 }
             }
         }
+        for key in failed_onboarding_keys {
+            self.failed_onboarding_keys.remove(&key);
+            self.request_to_blocks.remove(&key);
+            self.pending_failures.remove(&key);
+        }
 
         std::mem::take(&mut self.failed_block_ids)
+    }
+
+    fn build_connector_worker_meta_json(&mut self) -> Option<String> {
+        None
     }
 }
 
@@ -668,6 +639,11 @@ impl PyKvConnectorWorker {
     /// Get block IDs that failed to load and clear the set
     pub fn get_block_ids_with_load_errors(&mut self) -> HashSet<u32> {
         self.connector_worker.get_block_ids_with_load_errors()
+    }
+
+    /// Worker meta is no longer needed — all completion signaling goes through TransferSignal.
+    pub fn build_connector_worker_meta_json(&mut self) -> Option<String> {
+        None
     }
 }
 

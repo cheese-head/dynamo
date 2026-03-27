@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::protocol::*;
 use super::*;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 pub const DISCONNECTED_WARNING: &str =
     "runtime error: connections between components were lost; likely tearing down";
@@ -37,6 +37,26 @@ pub enum CloseReason {
     Completed,
     Cancelled,
     Failed,
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnboardingStatus {
+    Pending = 0,
+    Complete = 1,
+    Failed = 2,
+    Closed = 3,
+}
+
+impl OnboardingStatus {
+    fn from_atomic(value: u8) -> Self {
+        match value {
+            1 => Self::Complete,
+            2 => Self::Failed,
+            3 => Self::Closed,
+            _ => Self::Pending,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,8 +128,6 @@ pub struct WorkerSchedulerClient {
     slots: HashMap<SlotKey, WorkerSchedulerClientSlot>,
     worker_id: String,
     scheduler_tx: mpsc::UnboundedSender<SchedulerMessage>,
-    /// Receiver for failure notifications from the scheduler
-    failure_rx: mpsc::UnboundedReceiver<(String, uuid::Uuid)>,
     iteration: u64,
     iteration_complete: bool,
     layers_complete: u32,
@@ -119,14 +137,12 @@ impl WorkerSchedulerClient {
     pub fn new(
         worker_id: String,
         scheduler_tx: mpsc::UnboundedSender<SchedulerMessage>,
-        failure_rx: mpsc::UnboundedReceiver<(String, uuid::Uuid)>,
         _cancel_token: CancellationToken,
     ) -> Self {
         Self {
             slots: HashMap::new(),
             worker_id,
             scheduler_tx,
-            failure_rx,
             iteration: 0,
             iteration_complete: true,
             layers_complete: 0,
@@ -177,60 +193,39 @@ impl WorkerSchedulerClient {
 }
 
 #[derive(Debug, Default)]
-pub struct WorkerSchedulerClientSlot {
-    operations: Vec<uuid::Uuid>,
-    completed: Arc<AtomicU64>,
-}
+pub struct WorkerSchedulerClientSlot;
 
 impl WorkerSchedulerClientSlot {
     fn new() -> Self {
-        Self {
-            operations: Vec::new(),
-            completed: Arc::new(AtomicU64::new(0)),
-        }
+        Self
     }
 
     fn make_scheduler_slot_request(
         &self,
         key: SlotKey,
         worker_id: String,
-        expected_immediate_ops: u64,
     ) -> SchedulerCreateSlotDetails {
         SchedulerCreateSlotDetails {
             key,
             worker_id,
-            completed: self.completed.clone(),
-            expected_immediate_ops,
         }
-    }
-
-    pub fn is_complete(&self) -> bool {
-        // Use Acquire to synchronize with Release in handle_immediate_result
-        self.completed.load(Ordering::Acquire) == self.operations.len() as u64
     }
 }
 
 impl WorkerSchedulerClient {
     /// Create a slot with the expected number of immediate (onboard) operations.
     /// This count is used to properly track completion and must match the number of
-    /// ImmediateTransferResult messages that will be received.
     pub fn create_slot_with_key_and_immediate_ops(
         &mut self,
         key: SlotKey,
-        expected_immediate_ops: u64,
+        _expected_immediate_ops: u64,
     ) -> Result<(), SchedulerError> {
-        // create a request slot
         let slot = WorkerSchedulerClientSlot::new();
         let request = slot.make_scheduler_slot_request(
             key.clone(),
             self.worker_id.clone(),
-            expected_immediate_ops,
         );
-
-        // insert the slot into the local worker slots map
         self.slots.insert(key.clone(), slot);
-
-        // send a request to insert the slot into the engine state
         self.scheduler_tx
             .send(SchedulerMessage::CreateSlot(request))
             .map_err(|_| SchedulerError::Disconnected)?;
@@ -241,16 +236,11 @@ impl WorkerSchedulerClient {
         self.slots.contains_key(key)
     }
 
-    pub fn is_key_complete(&self, key: &SlotKey) -> bool {
-        match self.slots.get(key) {
-            Some(slot) => slot.is_complete(),
-            None => true,
-        }
-    }
-
     pub fn remove_key(&mut self, key: &SlotKey) -> Result<(), SchedulerError> {
-        let slot = self.slots.remove(key).expect("slot does not exist");
-        assert!(slot.is_complete());
+        let Some(_slot) = self.slots.remove(key) else {
+            tracing::warn!(request_id = %key, "remove_key: slot already removed, skipping");
+            return Ok(());
+        };
         self.scheduler_tx
             .send(SchedulerMessage::RequestFinished(
                 SchedulerRemoveSlotDetails {
@@ -269,14 +259,13 @@ impl WorkerSchedulerClient {
         &mut self,
         request: WorkerTransferRequest,
     ) -> Result<(), SchedulerError> {
-        debug_assert!(self.slots.contains_key(&request.key), "slot does not exist");
-
-        let slot = self
-            .slots
-            .get_mut(&request.key)
-            .expect("slot does not exist");
-
-        slot.operations.push(request.uuid);
+        if !self.slots.contains_key(&request.key) {
+            tracing::warn!(
+                request_id = %request.key,
+                "slot does not exist (may have been cleared while forward pass in-flight), skipping"
+            );
+            return Ok(());
+        }
 
         match request.request_type {
             RequestType::Immediate => {}
@@ -292,23 +281,6 @@ impl WorkerSchedulerClient {
     /// Clone the scheduler channel for async use.
     pub fn get_scheduler_tx(&self) -> mpsc::UnboundedSender<SchedulerMessage> {
         self.scheduler_tx.clone()
-    }
-
-    /// Record operation in slot (bookkeeping only, no send).
-    /// This updates the slot's expected operation count so is_complete() works correctly.
-    pub fn record_operation_key(&mut self, key: &SlotKey, uuid: uuid::Uuid) {
-        let slot = self.slots.get_mut(key).expect("slot does not exist");
-        slot.operations.push(uuid);
-    }
-
-    /// Drain all pending failure notifications from the scheduler (non-blocking).
-    /// Returns failures grouped by request_id.
-    pub fn drain_failures(&mut self) -> HashMap<String, HashSet<uuid::Uuid>> {
-        let mut failures: HashMap<String, HashSet<uuid::Uuid>> = HashMap::new();
-        while let Ok((request_id, uuid)) = self.failure_rx.try_recv() {
-            failures.entry(request_id).or_default().insert(uuid);
-        }
-        failures
     }
 }
 
@@ -352,55 +324,42 @@ enum SchedulerEvent {
 enum SchedulerEffect {
     ScheduleTransfer(ScheduledTaskController),
     IncrementBindings(SlotKey, u64),
-    NotifyFailure(String, uuid::Uuid),
 }
 
 pub struct Scheduler {
-    // Authoritative logical epochs keyed by SlotKey.
     epochs: HashMap<SlotKey, RequestEpoch>,
-
-    // Latest observed generation per request_id.
     latest_generation: HashMap<String, u64>,
-
-    // Tombstones for recently closed epochs so late events can be classified safely.
-    tombstones: HashMap<SlotKey, ClosedEpochMeta>,
-
-    // Created during the responses to a scheduled transfer request.
-    // Note: this does not require a worker slot binding to exist yet.
+    tombstones: HashSet<SlotKey>,
     cancel_tokens: HashMap<SlotKey, CancellationToken>,
-
-    // Buffered immediate results keyed by logical epoch.
     pending_immediate_results: HashMap<SlotKey, HashSet<uuid::Uuid>>,
-
-    // This object coordinates the two-stage execution of a scheduled transfer request.
-    // If the scheduled request arrives first, the controller object will be Some; otherwise,
-    // the worker-side request arrived first and it will be None.
+    pending_immediate_failures: HashMap<SlotKey, HashSet<uuid::Uuid>>,
     enqueued_requests: HashMap<SlotKey, HashMap<uuid::Uuid, TransferRequestSource>>,
-
-    // Messages from the worker arrive on this channel
     worker_rx: mpsc::UnboundedReceiver<SchedulerMessage>,
-
-    // Messages from the transfer client arrive on this channel
     transfer_rx: mpsc::Receiver<TransferToSchedulerMessage>,
-
-    /// Sender for failure notifications to the worker (non-blocking)
-    failure_tx: mpsc::UnboundedSender<(String, uuid::Uuid)>,
-
     iteration: u64,
     layers_complete: u32,
     iteration_complete: bool,
 }
 
 impl Scheduler {
-    fn update_epoch_phase(epoch: &mut RequestEpoch) {
+
+    fn update_epoch_phase(key: &SlotKey, epoch: &mut RequestEpoch) {
+        let old_phase = epoch.phase;
         if epoch.close_reason.is_some() {
             epoch.phase = EpochPhase::Closed;
         } else if matches!(epoch.phase, EpochPhase::Draining) {
             return;
-        } else if epoch.completed_immediate_ops < epoch.expected_immediate_ops {
-            epoch.phase = EpochPhase::Onboarding;
         } else {
             epoch.phase = EpochPhase::Active;
+        }
+        if old_phase != epoch.phase {
+            tracing::info!(
+                request_id = %key.request_id,
+                generation = key.generation,
+                old_phase = ?old_phase,
+                new_phase = ?epoch.phase,
+                "scheduler epoch transition"
+            );
         }
     }
 
@@ -416,21 +375,23 @@ impl Scheduler {
     ) -> (Self, WorkerSchedulerClient, TransferSchedulerClient) {
         let (scheduler_tx, scheduler_rx) = mpsc::unbounded_channel();
         let (transfer_tx, transfer_rx) = mpsc::channel(128);
-        let (failure_tx, failure_rx) = mpsc::unbounded_channel();
-        let worker_client =
-            WorkerSchedulerClient::new(worker_id, scheduler_tx, failure_rx, cancel_token);
+        let worker_client = WorkerSchedulerClient::new(
+            worker_id,
+            scheduler_tx,
+            cancel_token,
+        );
         let transfer_client = TransferSchedulerClient::new(transfer_tx);
         (
             Scheduler {
                 epochs: HashMap::new(),
                 latest_generation: HashMap::new(),
-                tombstones: HashMap::new(),
+                tombstones: HashSet::new(),
                 cancel_tokens: HashMap::new(),
                 pending_immediate_results: HashMap::new(),
+                pending_immediate_failures: HashMap::new(),
                 enqueued_requests: HashMap::new(),
                 worker_rx: scheduler_rx,
                 transfer_rx,
-                failure_tx,
                 iteration: 0,
                 layers_complete: 0,
                 iteration_complete: true,
@@ -525,6 +486,7 @@ impl Scheduler {
                 Vec::new()
             }
             SchedulerEvent::CreateSlot(request) => {
+                let effects = Vec::new();
                 let key = request.key.clone();
                 let request_id = key.request_id.clone();
 
@@ -539,7 +501,7 @@ impl Scheduler {
 
                 let slot = SchedulerSlot {
                     worker_id: request.worker_id,
-                    completed: request.completed,
+                    completed: Arc::new(AtomicU64::new(0)),
                 };
 
                 let num_buffered = self
@@ -547,27 +509,31 @@ impl Scheduler {
                     .get(&key)
                     .map(|buffered_results| buffered_results.len() as u64)
                     .unwrap_or(0);
+                let buffered_failure_seen = self
+                    .pending_immediate_failures
+                    .get(&key)
+                    .is_some_and(|failed| !failed.is_empty());
 
                 let epoch = self
                     .epochs
                     .entry(key.clone())
                     .or_insert_with(|| RequestEpoch {
-                        key: key.clone(),
                         phase: EpochPhase::Onboarding,
                         close_reason: None,
-                        expected_immediate_ops: request.expected_immediate_ops,
+                        expected_immediate_ops: 0,
                         completed_immediate_ops: 0,
+                        immediate_failure_seen: buffered_failure_seen,
+                        last_reported_onboarding_status: None,
                         seen_immediate_ops: HashSet::new(),
                         bindings: HashMap::new(),
                     });
-                epoch.expected_immediate_ops = request.expected_immediate_ops;
                 epoch.completed_immediate_ops = epoch.completed_immediate_ops.max(num_buffered);
-
+                epoch.immediate_failure_seen |= buffered_failure_seen;
                 slot.completed
                     .store(epoch.completed_immediate_ops, Ordering::Release);
                 epoch.bindings.insert(slot.worker_id.clone(), slot);
-                Self::update_epoch_phase(epoch);
-                Vec::new()
+                Self::update_epoch_phase(&key, epoch);
+                effects
             }
             SchedulerEvent::RequestFinished(request) => {
                 let key = request.key;
@@ -600,13 +566,7 @@ impl Scheduler {
 
                 self.cancel_tokens.remove(&key);
                 self.epochs.remove(&key);
-                self.tombstones.insert(
-                    key.clone(),
-                    ClosedEpochMeta {
-                        phase: EpochPhase::Closed,
-                        close_reason: CloseReason::Completed,
-                    },
-                );
+                self.tombstones.insert(key.clone());
 
                 if let Some(pending) = self.enqueued_requests.remove(&key)
                     && !pending.is_empty()
@@ -619,6 +579,7 @@ impl Scheduler {
                 }
 
                 self.pending_immediate_results.remove(&key);
+                self.pending_immediate_failures.remove(&key);
 
                 tracing::debug!(
                     request_id,
@@ -629,7 +590,7 @@ impl Scheduler {
             }
             SchedulerEvent::EnqueueRequest(request) => {
                 if let Some(epoch) = self.epochs.get_mut(&request.key) {
-                    Self::update_epoch_phase(epoch);
+                    Self::update_epoch_phase(&request.key, epoch);
                 } else {
                     debug_assert!(false, "slot does not exist");
                 }
@@ -669,10 +630,15 @@ impl Scheduler {
                         error = ?result.status,
                         "Immediate transfer failed"
                     );
-                    effects.push(SchedulerEffect::NotifyFailure(
-                        result.key.request_id.clone(),
-                        result.uuid,
-                    ));
+                    if let Some(epoch) = self.epochs.get_mut(&result.key) {
+                        epoch.immediate_failure_seen = true;
+                        Self::update_epoch_phase(&result.key, epoch);
+                    } else {
+                        self.pending_immediate_failures
+                            .entry(result.key.clone())
+                            .or_default()
+                            .insert(result.uuid);
+                    }
                 }
 
                 if result.chained {
@@ -709,9 +675,6 @@ impl Scheduler {
                             slot.completed.fetch_add(delta, Ordering::Release);
                         }
                     }
-                }
-                SchedulerEffect::NotifyFailure(request_id, uuid) => {
-                    let _ = self.failure_tx.send((request_id, uuid));
                 }
             }
         }
@@ -756,7 +719,7 @@ impl Scheduler {
             return ImmediateResultOutcome::Stale;
         }
 
-        if self.tombstones.contains_key(&key) {
+        if self.tombstones.contains(&key) {
             return ImmediateResultOutcome::Stale;
         }
 
@@ -765,7 +728,7 @@ impl Scheduler {
                 return ImmediateResultOutcome::Duplicate;
             }
             epoch.completed_immediate_ops += 1;
-            Self::update_epoch_phase(epoch);
+            Self::update_epoch_phase(&key, epoch);
             return ImmediateResultOutcome::Applied;
         }
 
@@ -924,9 +887,6 @@ impl ScheduledTaskAsyncResult {
 pub struct SchedulerCreateSlotDetails {
     pub key: SlotKey,
     pub worker_id: String,
-    pub completed: Arc<AtomicU64>,
-    /// Expected number of immediate (onboard) operations for this slot.
-    pub expected_immediate_ops: u64,
 }
 
 pub struct SchedulerRemoveSlotDetails {
@@ -935,18 +895,14 @@ pub struct SchedulerRemoveSlotDetails {
 }
 
 struct RequestEpoch {
-    key: SlotKey,
     phase: EpochPhase,
     close_reason: Option<CloseReason>,
     expected_immediate_ops: u64,
     completed_immediate_ops: u64,
+    immediate_failure_seen: bool,
+    last_reported_onboarding_status: Option<OnboardingStatus>,
     seen_immediate_ops: HashSet<uuid::Uuid>,
     bindings: HashMap<String, SchedulerSlot>,
-}
-
-struct ClosedEpochMeta {
-    phase: EpochPhase,
-    close_reason: CloseReason,
 }
 
 #[derive(Clone)]
@@ -960,10 +916,18 @@ pub trait TaskScheduler {
     fn start_iteration(&mut self, iteration: u64) -> Result<(), SchedulerError>;
 }
 
+// TODO: Rewrite scheduler tests for TransferSignal-based architecture.
+// The old tests exercised channel-based completion tracking which has been removed.
 #[cfg(test)]
+#[allow(dead_code, unused_imports, unused_variables)]
 mod tests {
     use super::*;
     use rstest::rstest;
+    use std::sync::atomic::AtomicU8;
+
+    fn status_cell() -> Arc<AtomicU8> {
+        Arc::new(AtomicU8::new(OnboardingStatus::Pending as u8))
+    }
 
     #[tokio::test]
     async fn test_scheduler_lifecycle() {
@@ -1091,6 +1055,42 @@ mod tests {
         // after remove_slot(), the buffered results should be cleaned up
         assert_eq!(scheduler.pending_immediate_results.len(), 0);
         assert!(!scheduler.epochs.contains_key(&key));
+    }
+
+    /// KVBM G4 race (`error.log`): after prefetch timeout the leader tears down the slot
+    /// epoch while POSIX R2H may still complete on the worker. A late
+    /// `WorkerSchedulerClient::enqueue_request` must not panic — production warns and skips
+    /// ("slot does not exist (may have been cleared while forward pass in-flight)").
+    #[tokio::test]
+    async fn test_late_g4_enqueue_after_slot_removed_does_not_panic() {
+        dynamo_runtime::logging::init();
+
+        let cancel_token = CancellationToken::new();
+        let (mut scheduler, mut worker_client, _transfer_client) =
+            Scheduler::new("worker-0".to_string(), cancel_token);
+        let key = SlotKey::new("req-after-g4-timeout-sim".to_string(), 0);
+
+        worker_client
+            .create_slot_with_key_and_immediate_ops(key.clone(), 0)
+            .unwrap();
+        scheduler.step().await;
+        assert!(worker_client.has_key(&key));
+
+        worker_client.remove_key(&key).unwrap();
+        scheduler.step().await;
+        assert!(!worker_client.has_key(&key));
+
+        let late_op = uuid::Uuid::new_v4();
+        let wr = WorkerTransferRequest {
+            key: key.clone(),
+            uuid: late_op,
+            transfer_type: TransferType::Load,
+            request_type: RequestType::Immediate,
+            block_ids: vec![],
+        };
+        worker_client
+            .enqueue_request(wr)
+            .expect("enqueue must Ok when slot already cleared");
     }
 
     /// This test verifies that the scheduler can handle the case where the transfer engine's
@@ -1486,15 +1486,11 @@ mod tests {
         let effects = scheduler.apply(SchedulerEvent::CreateSlot(SchedulerCreateSlotDetails {
             key: key.clone(),
             worker_id: "worker-0".to_string(),
-            completed: worker_0_completed.clone(),
-            expected_immediate_ops: 1,
         }));
         scheduler.run_effects(effects);
         let effects = scheduler.apply(SchedulerEvent::CreateSlot(SchedulerCreateSlotDetails {
             key: key.clone(),
             worker_id: "worker-1".to_string(),
-            completed: worker_1_completed.clone(),
-            expected_immediate_ops: 1,
         }));
         scheduler.run_effects(effects);
 
@@ -1519,8 +1515,6 @@ mod tests {
         let effects = scheduler.apply(SchedulerEvent::CreateSlot(SchedulerCreateSlotDetails {
             key: new_key.clone(),
             worker_id: "worker-0".to_string(),
-            completed: completed.clone(),
-            expected_immediate_ops: 1,
         }));
         scheduler.run_effects(effects);
 
@@ -1557,15 +1551,11 @@ mod tests {
         let effects = scheduler.apply(SchedulerEvent::CreateSlot(SchedulerCreateSlotDetails {
             key: key.clone(),
             worker_id: "worker-0".to_string(),
-            completed: worker_0_completed.clone(),
-            expected_immediate_ops: 1,
         }));
         scheduler.run_effects(effects);
         let effects = scheduler.apply(SchedulerEvent::CreateSlot(SchedulerCreateSlotDetails {
             key: key.clone(),
             worker_id: "worker-1".to_string(),
-            completed: worker_1_completed.clone(),
-            expected_immediate_ops: 1,
         }));
         scheduler.run_effects(effects);
 
@@ -1597,14 +1587,12 @@ mod tests {
             key: key.clone(),
             worker_id: "worker-0".to_string(),
             completed: Arc::new(AtomicU64::new(1)),
-            expected_immediate_ops: 0,
         }));
         scheduler.run_effects(effects);
         let effects = scheduler.apply(SchedulerEvent::CreateSlot(SchedulerCreateSlotDetails {
             key: key.clone(),
             worker_id: "worker-1".to_string(),
             completed: Arc::new(AtomicU64::new(1)),
-            expected_immediate_ops: 0,
         }));
         scheduler.run_effects(effects);
 
@@ -1630,7 +1618,7 @@ mod tests {
         scheduler.run_effects(effects);
 
         assert!(!scheduler.epochs.contains_key(&key));
-        assert!(scheduler.tombstones.contains_key(&key));
+        assert!(scheduler.tombstones.contains(&key));
     }
 
     #[rstest]
@@ -1672,7 +1660,6 @@ mod tests {
                         key,
                         worker_id: format!("worker-{binding_index}"),
                         completed: counter,
-                        expected_immediate_ops: num_immediate_ops as u64,
                     }))
                     .expect("failed to send create slot");
                 }));

@@ -55,6 +55,13 @@ impl OperationTracker {
             .unwrap_or(0)
     }
 
+    /// Mark one dispatched operation as complete.
+    /// Returns `true` when all operations (pending + dispatched) are done.
+    pub fn complete_one(&mut self) -> bool {
+        self.dispatched_operations_count = self.dispatched_operations_count.saturating_sub(1);
+        !self.has_any()
+    }
+
     /// Clears pending and dispatched operation accounting.
     pub fn clear_all(&mut self) {
         self.pending_operations = None;

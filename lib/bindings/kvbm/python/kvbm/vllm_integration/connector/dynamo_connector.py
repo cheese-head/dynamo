@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Iterable
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -293,7 +294,15 @@ class DynamoConnector(KVConnectorBase_V1):
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
-        return self._worker.get_finished(finished_req_ids)
+        result = self._worker.get_finished(finished_req_ids)
+        logger.info(
+            "[KVBM-DIAG] get_finished -> vLLM: input_finished=%s "
+            "finished_offloading=%s finished_onboarding=%s",
+            sorted(finished_req_ids),
+            sorted(result[0]) if result[0] is not None else None,
+            sorted(result[1]) if result[1] is not None else None,
+        )
+        return result
 
     @override
     def get_block_ids_with_load_errors(self) -> set[int]:
@@ -301,6 +310,63 @@ class DynamoConnector(KVConnectorBase_V1):
         if self._worker is None:
             return set()
         return self._worker.get_block_ids_with_load_errors()
+
+    @override
+    def handle_preemptions(self, preempted_req_ids: set[str]):
+        """Handle preempted requests before blocks are overwritten (v0.18.0).
+
+        Cancels in-flight async saves for preempted request IDs on the worker side.
+        """
+        if self._worker is not None and preempted_req_ids:
+            self._worker.handle_preemptions(preempted_req_ids)
+
+    # === vLLM v0.18.0 API ===
+
+    def take_events(self):
+        """Return KV cache events collected since last call."""
+        return ()
+
+    def reset_cache(self):
+        """Reset the connector's internal cache via vLLM's standard interface."""
+        if self._scheduler is not None:
+            try:
+                self._scheduler.clear_pool("host")
+                return True
+            except Exception:
+                return False
+        return None
+
+    def register_cross_layers_kv_cache(self, kv_cache, attn_backend):
+        """Cross-layer KV registration (not yet optimized for KVBM)."""
+        pass
+
+    def get_kv_connector_stats(self):
+        """KVBM uses its own CacheStatsTracker + KvbmMetrics."""
+        return None
+
+    def get_kv_connector_kv_cache_events(self):
+        """KV cache events per step (consolidator integration pending)."""
+        return None
+
+    def get_finished_count(self):
+        return None
+
+    def build_connector_worker_meta(self):
+        """Build worker metadata for scheduler feedback (v0.18.0)."""
+        if self._worker is not None:
+            return self._worker.build_connector_worker_meta()
+        return None
+
+    def update_connector_output(self, connector_output):
+        pass
+
+    @classmethod
+    def get_required_kvcache_layout(cls, vllm_config):
+        return None
+
+    @classmethod
+    def requires_piecewise_for_cudagraph(cls, extra_config):
+        return False
 
     # Management API
 
@@ -333,9 +399,7 @@ class DynamoConnector(KVConnectorBase_V1):
         Called when the worker process is shutting down to ensure
         all async operations complete and resources are released.
         """
-        # TODO: Implement proper cleanup in Rust layer
-        # if self._worker:
-        #     self._worker.shutdown()
-        # if self._scheduler:
-        #     self._scheduler.shutdown()
+        # Rust resources (transfer engine, block pools, NIXL agents) are
+        # cleaned up via Drop impls when the ConnectorSlotManager and
+        # KvbmWorker are dropped. No explicit shutdown call needed.
         pass

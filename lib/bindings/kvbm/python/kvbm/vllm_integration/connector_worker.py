@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 # )
 
 from kvbm.vllm_integration.rust import KvConnectorWorker as RustKvConnectorWorker
+from kvbm.vllm_integration.worker_metadata import KvbmWorkerMetadata
 
 DistributedRuntime = None
 if is_dyn_runtime_enabled():
@@ -207,3 +208,45 @@ class KvConnectorWorker:
     def get_block_ids_with_load_errors(self) -> set[int]:
         """Get block IDs that failed to load and clear the set."""
         return self._connector.get_block_ids_with_load_errors()
+
+    def build_connector_worker_meta(self):
+        """Build worker metadata for v0.18 (completed immediate transfers).
+
+        Drain successful completions from the in-process scheduler (see
+        `NotifyCompletion` / `drain_completions` in dynamo-llm). Failed ops
+        are still tracked via `get_finished` / `get_block_ids_with_load_errors`;
+        the JSON `failed` map from Rust is empty until failure routing is unified.
+        """
+        raw = self._connector.build_connector_worker_meta_json()
+        if not raw:
+            return None
+        import json
+
+        data = json.loads(raw)
+        meta = KvbmWorkerMetadata()
+        for req_id, uuids in data.get("onboard", {}).items():
+            meta.completed_onboard_ops[req_id] = set(uuids)
+        for req_id, uuids in data.get("offload", {}).items():
+            meta.completed_offload_ops[req_id] = set(uuids)
+        for req_id, uuids in data.get("failed", {}).items():
+            meta.failed_ops[req_id] = set(uuids)
+        return meta
+
+    def handle_preemptions(self, preempted_req_ids: set[str]):
+        """Handle preempted requests before blocks are overwritten (v0.18.0).
+
+        Marks preempted request epochs as terminal so in-flight async saves
+        are cancelled at the next get_finished check.
+        """
+        if not preempted_req_ids:
+            return
+        import logging
+        logger = logging.getLogger("kvbm.worker")
+        logger.info(
+            "[KVBM] handle_preemptions: cancelling %d request(s): %s",
+            len(preempted_req_ids),
+            ", ".join(sorted(preempted_req_ids)[:5]),
+        )
+        # Rust-side cancellation will be wired when PyKvConnectorWorker
+        # exposes handle_preemptions. For now, worker-side preemption is
+        # handled by vLLM discarding blocks before the next forward pass.

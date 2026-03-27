@@ -20,7 +20,7 @@ use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
-const DEFAULT_REMOTE_DISK_FD_CACHE_MAX_ENTRIES: usize = 50_000;
+const DEFAULT_REMOTE_DISK_FD_CACHE_MAX_ENTRIES: usize = 131_072;
 const REMOTE_DISK_O_DIRECT_KEY: &str = "DYN_KVBM_REMOTE_DISK_O_DIRECT";
 const REMOTE_DISK_ALIGNMENT_VALIDATE_KEY: &str = "DYN_KVBM_REMOTE_DISK_VALIDATE_ALIGNMENT";
 const REMOTE_DISK_ALIGNMENT_OVERRIDE_KEY: &str = "DYN_KVBM_REMOTE_DISK_ALIGNMENT_BYTES";
@@ -547,23 +547,42 @@ where
         (xfer_req, still_pending)
     };
 
-    // Wait for completion with cancellation support
     if still_pending {
-        // Try async notification system, fall back to inline polling if unavailable
-        match ctx.register_nixl_transfer(agent, xfer_req) {
+        let nixl_otel_name = match direction {
+            RemoteTransferDirection::Onboard => "kvbm.nixl_read",
+            RemoteTransferDirection::Offload => "kvbm.nixl_write",
+        };
+        let nixl_span = tracing::info_span!(
+            "nixl_io",
+            otel.name = nixl_otel_name,
+            description = "NIXL object store I/O (post + completion wait)",
+            num_blocks,
+            direction = ?direction,
+        );
+
+        let registered = {
+            let _enter = nixl_span.enter();
+            ctx.register_nixl_transfer(agent, xfer_req)
+        };
+
+        use tracing::Instrument;
+        match registered {
             Ok(notification) => {
-                tokio::select! {
-                    result = notification => {
-                        result.map_err(|e| TransferError::ExecutionError(e.to_string()))?;
+                async {
+                    tokio::select! {
+                        result = notification => {
+                            result.map_err(|e| TransferError::ExecutionError(e.to_string()))
+                        }
+                        _ = cancel_token.cancelled() => {
+                            Err(TransferError::Cancelled)
+                        }
                     }
-                    _ = cancel_token.cancelled() => {
-                        return Err(TransferError::Cancelled);
-                    }
-                }
+                }.instrument(nixl_span.clone()).await?;
             }
             Err((_, xfer_req)) => {
-                // Fall back to inline polling
-                poll_transfer_completion_inline(agent, &xfer_req, cancel_token).await?;
+                poll_transfer_completion_inline(agent, &xfer_req, cancel_token)
+                    .instrument(nixl_span)
+                    .await?;
             }
         }
     }
@@ -652,14 +671,11 @@ where
 
     // Use a scope block to ensure all non-Send types are dropped before await
     // (OptArgs contains NonNull which is !Send)
-    let (xfer_req, still_pending, disk_storages) = {
-        // Dynamically create/open and register disk storage for each block
-        let mut disk_storages: Vec<Arc<SyncMutex<RemoteDiskStorage>>> =
-            Vec::with_capacity(num_blocks);
-
+    let (xfer_req, still_pending, _disk_storages) = {
         let worker_id = ctx.worker_id() as usize;
         let world_size = ctx.world_size();
 
+        let mut file_paths: Vec<String> = Vec::with_capacity(num_blocks);
         for desc in descriptors.iter() {
             let file_path = match desc.key() {
                 RemoteKey::Disk(disk_key) => {
@@ -677,29 +693,36 @@ where
                     ));
                 }
             };
-
-            if disk_storages.is_empty() {
-                tracing::info!(
-                    target: "kvbm-diag",
-                    direction = op,
-                    first_file = %file_path,
-                    num_blocks,
-                    "Disk transfer files (showing first)"
-                );
-            }
-
-            let disk_storage = get_or_open_remote_disk_storage(
-                agent,
-                &file_path,
-                block_size,
-                create_files,
-                use_odirect,
-                use_gds_backend,
-            )
-            .await?;
-
-            disk_storages.push(disk_storage);
+            file_paths.push(file_path);
         }
+
+        if let Some(first) = file_paths.first() {
+            tracing::info!(
+                target: "kvbm-diag",
+                direction = op,
+                first_file = %first,
+                num_blocks,
+                "Disk transfer files (showing first)"
+            );
+        }
+
+        let disk_storages = {
+            let mut storages: Vec<Arc<SyncMutex<RemoteDiskStorage>>> =
+                Vec::with_capacity(num_blocks);
+            for path in &file_paths {
+                let storage = get_or_open_remote_disk_storage(
+                    agent,
+                    path,
+                    block_size,
+                    create_files,
+                    use_odirect,
+                    use_gds_backend,
+                )
+                .await?;
+                storages.push(storage);
+            }
+            storages
+        };
 
         // Build transfer descriptor lists for disk
         let mut src_dl = XferDescList::new(MemType::Dram).map_err(|e| {
@@ -777,39 +800,46 @@ where
             TransferError::ExecutionError(format!("Failed to post xfer_req: {:?}", e))
         })?;
 
-        // Return disk_storages to keep them alive during the transfer
         (xfer_req, still_pending, disk_storages)
     };
 
-    // Wait for completion with cancellation support
     if still_pending {
-        // Try async notification system, fall back to inline polling if unavailable
-        match ctx.register_nixl_transfer(agent, xfer_req) {
+        let nixl_otel_name = match direction {
+            RemoteTransferDirection::Onboard => "kvbm.nixl_read",
+            RemoteTransferDirection::Offload => "kvbm.nixl_write",
+        };
+        let nixl_span = tracing::info_span!(
+            "nixl_io",
+            otel.name = nixl_otel_name,
+            description = "NIXL disk I/O (post + completion wait)",
+            num_blocks,
+            direction = op,
+        );
+
+        let registered = {
+            let _enter = nixl_span.enter();
+            ctx.register_nixl_transfer(agent, xfer_req)
+        };
+
+        use tracing::Instrument;
+        match registered {
             Ok(notification) => {
-                tokio::select! {
-                    result = notification => {
-                        result.map_err(|e| TransferError::ExecutionError(e.to_string()))?;
+                async {
+                    tokio::select! {
+                        result = notification => {
+                            result.map_err(|e| TransferError::ExecutionError(e.to_string()))
+                        }
+                        _ = cancel_token.cancelled() => {
+                            Err(TransferError::Cancelled)
+                        }
                     }
-                    _ = cancel_token.cancelled() => {
-                        return Err(TransferError::Cancelled);
-                    }
-                }
+                }.instrument(nixl_span.clone()).await?;
             }
             Err((_, xfer_req)) => {
-                // Fall back to inline polling
-                poll_transfer_completion_inline(agent, &xfer_req, cancel_token).await?;
+                poll_transfer_completion_inline(agent, &xfer_req, cancel_token)
+                    .instrument(nixl_span)
+                    .await?;
             }
-        }
-    }
-
-    // After a POSIX offload, flush dirty page-cache pages to storage so that
-    // a subsequent GDS O_DIRECT read (which bypasses the page cache) sees
-    // the committed data.  This is a no-op for GDS writes and for onboard.
-    if create_files && !gds_write {
-        for ds in &disk_storages {
-            ds.lock()
-                .fdatasync()
-                .map_err(|e| TransferError::ExecutionError(format!("fdatasync failed: {:?}", e)))?;
         }
     }
 
@@ -829,7 +859,7 @@ mod tests {
     use crate::block_manager::{
         LayoutConfig,
         block::{BasicMetadata, Block, BlockData, locality},
-        config::{RemoteStorageConfig, RemoteTransferContext},
+        config::{RemoteStorageConfig, RemoteTransferContext, DISK_FLAGS_POSIX_BOTH},
         layout::{BlockLayoutConfig, FullyContiguous, nixl::NixlLayout},
         storage::{PinnedAllocator, PinnedStorage},
     };
@@ -887,16 +917,14 @@ mod tests {
     fn create_transfer_context() -> Arc<TransferContext> {
         let stream = CUDA_CTX.default_stream();
         let handle = tokio::runtime::Handle::current();
-        Arc::new(TransferContext::new(
-            TEST_AGENT.clone(),
-            stream,
-            handle,
-            None,
-        ))
+        Arc::new(
+            TransferContext::new(TEST_AGENT.clone(), stream, handle, None)
+                .expect("TransferContext::new for NIXL tests"),
+        )
     }
 
     fn create_disk_remote_context(base: Arc<TransferContext>, path: &str) -> RemoteTransferContext {
-        RemoteTransferContext::new(base, RemoteStorageConfig::disk(path, false))
+        RemoteTransferContext::new(base, RemoteStorageConfig::disk(path, DISK_FLAGS_POSIX_BOTH))
     }
 
     fn create_object_remote_context(
@@ -1075,7 +1103,7 @@ mod tests {
             .unwrap();
         let onboard_layout = Arc::new(onboard_layout);
 
-        let mut onboard_blocks: Vec<Block<PinnedStorage, locality::Local, BasicMetadata>> = (0..2)
+        let onboard_blocks: Vec<Block<PinnedStorage, locality::Local, BasicMetadata>> = (0..2)
             .map(|i| {
                 let data = BlockData::new(onboard_layout.clone(), i, 0, 0);
                 Block::new(data, BasicMetadata::default()).unwrap()
@@ -1194,7 +1222,7 @@ mod tests {
             .unwrap();
         let onboard_layout = Arc::new(onboard_layout);
 
-        let mut onboard_blocks: Vec<Block<PinnedStorage, locality::Local, BasicMetadata>> = (0..2)
+        let onboard_blocks: Vec<Block<PinnedStorage, locality::Local, BasicMetadata>> = (0..2)
             .map(|i| {
                 let data = BlockData::new(onboard_layout.clone(), i, 0, 0);
                 Block::new(data, BasicMetadata::default()).unwrap()

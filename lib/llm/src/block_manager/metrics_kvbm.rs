@@ -366,6 +366,15 @@ impl KvbmMetrics {
             .with_label_values(&[direction, result, backend])
             .observe(seconds);
     }
+
+    /// Reset histogram metrics so per-interval measurements start fresh.
+    /// IntCounters cannot be reset (Prometheus spec: counters are monotonic),
+    /// but the sweep script computes deltas for those. Histograms need a true
+    /// reset because percentiles can't be delta'd from cumulative buckets.
+    pub fn reset_histograms(&self) {
+        self.remote_transfer_latency_seconds.reset();
+        tracing::info!("KVBM metrics histograms reset");
+    }
 }
 
 impl Drop for KvbmMetrics {

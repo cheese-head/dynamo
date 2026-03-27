@@ -120,7 +120,6 @@ impl Default for ZmqTransportConfig {
 /// Both sockets have configurable high-water marks to prevent
 /// unbounded memory growth under load.
 pub struct ZmqTransport {
-    config: ZmqTransportConfig,
     dealer_tx: mpsc::Sender<DealerCommand>,
     push_tx: mpsc::Sender<PushCommand>,
     /// Monotonically increasing request ID for correlating responses.
@@ -168,7 +167,6 @@ impl ZmqTransport {
         tokio::spawn(Self::push_task(pusher, push_rx));
 
         Ok(Self {
-            config,
             dealer_tx,
             push_tx,
             next_request_id: AtomicU32::new(1),

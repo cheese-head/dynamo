@@ -233,8 +233,11 @@ pub mod kvbm {
     }
     /// Transfer configuration
     pub mod transfer {
-        /// Maximum number of blocks per transfer batch
+        /// Maximum number of blocks per transfer batch (default: 16)
         pub const DYN_KVBM_TRANSFER_BATCH_SIZE: &str = "DYN_KVBM_TRANSFER_BATCH_SIZE";
+
+        /// Maximum number of concurrent offload/onboard transfers (default: 4)
+        pub const DYN_KVBM_MAX_CONCURRENT_TRANSFERS: &str = "DYN_KVBM_MAX_CONCURRENT_TRANSFERS";
     }
 
     /// Remote storage (G4) configuration
@@ -542,6 +545,7 @@ mod tests {
             kvbm::remote_storage::DYN_KVBM_G4_MAX_REMOTE_INFLIGHT,
             kvbm::remote_storage::DYN_KVBM_G4_REMOTE_HIGH_QUEUE_CAP,
             kvbm::remote_storage::DYN_KVBM_G4_REMOTE_LOW_QUEUE_CAP,
+            kvbm::transfer::DYN_KVBM_MAX_CONCURRENT_TRANSFERS,
             // LLM
             llm::DYN_HTTP_BODY_LIMIT_MB,
             llm::DYN_LORA_ENABLED,
