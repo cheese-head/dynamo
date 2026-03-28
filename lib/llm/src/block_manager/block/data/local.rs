@@ -28,7 +28,7 @@ where
     S: Storage,
 {
     /// Create a new block storage
-    pub(crate) fn new(
+    pub fn new(
         layout: Arc<dyn BlockLayout<StorageType = S>>,
         block_idx: usize,
         block_set_idx: usize,
