@@ -84,6 +84,10 @@ fn get_tuning_params() -> pyo3::PyResult<std::collections::HashMap<String, u64>>
         "g4_transfer_timeout_secs".into(),
         dynamo_llm::block_manager::distributed::vllm::g4_transfer_timeout().as_secs(),
     );
+    m.insert(
+        "prefetch_timeout_secs".into(),
+        dynamo_llm::block_manager::distributed::vllm::prefetch_timeout().as_secs(),
+    );
     Ok(m)
 }
 
@@ -107,9 +111,13 @@ fn set_tuning_param(name: &str, value: u64) -> pyo3::PyResult<()> {
         "g4_transfer_timeout_secs" => {
             dynamo_llm::block_manager::distributed::vllm::set_g4_transfer_timeout_secs(value);
         }
+        "prefetch_timeout_secs" => {
+            dynamo_llm::block_manager::distributed::vllm::set_prefetch_timeout_secs(value);
+        }
         _ => {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "unknown tuning parameter: '{}'. Valid: transfer_batch_size, max_concurrent_transfers, flush_batch_size, g4_pipeline_chunk_size, g4_transfer_timeout_secs",
+                "unknown tuning parameter: '{}'. Valid: transfer_batch_size, max_concurrent_transfers, \
+                 flush_batch_size, g4_pipeline_chunk_size, g4_transfer_timeout_secs, prefetch_timeout_secs",
                 name
             )));
         }

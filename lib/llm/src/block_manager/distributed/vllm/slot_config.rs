@@ -65,6 +65,10 @@ pub fn prefetch_timeout() -> Duration {
     Duration::from_secs(PREFETCH_TIMEOUT_SECS.load(Ordering::Relaxed))
 }
 
+pub fn set_prefetch_timeout_secs(secs: u64) {
+    PREFETCH_TIMEOUT_SECS.store(secs, Ordering::Relaxed);
+}
+
 #[inline]
 pub fn g4_min_candidate_blocks() -> usize {
     *G4_MIN_CANDIDATE_BLOCKS
