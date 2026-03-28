@@ -23,7 +23,7 @@ testing-nixl = ["dep:nixl-sys", "dynamo-memory/testing-nixl"]
 testing-etcd = []
 testing-remote-storage = []  # Requires NIXL OBJ/POSIX backends for remote transfer tests
 block-manager = ["dep:nixl-sys", "dep:cudarc", "dep:nix", "dep:aligned-vec"]
-block-manager-bench = ["block-manager", "testing-full", "dep:clap", "dep:indicatif"]
+block-manager-bench = ["block-manager", "testing-full", "dep:clap", "dep:comfy-table", "dep:indicatif", "dep:tracing-subscriber"]
 cuda = ["dep:cudarc"]
 integration = ["dynamo-runtime/integration"]
 media-ffmpeg = ["dep:video-rs", "dep:ffmpeg-next", "dep:memfile"]
@@ -119,7 +119,9 @@ flate2 = { version = "1" }
 
 # block_manager_bench
 clap = { version = "4.5.49", features = ["derive"], optional = true }
+comfy-table = { version = "7.2", optional = true }
 indicatif = { version = "0.18.0", optional = true }
+tracing-subscriber = { workspace = true, optional = true }
 
 # http-service
 axum = { workspace = true }
@@ -166,6 +168,7 @@ ndarray = { version = "0.16" }
 # Publishers
 zeromq = "0.4.1"
 rmp-serde = "1.3"
+serde_yaml = "0.9"
 
 [dev-dependencies]
 approx = "0.5"
@@ -185,8 +188,6 @@ insta = { version = "1.41", features = [
   "redactions",
   "filters",
 ] }
-serde_yaml = "0.9"
-
 lazy_static = "1.4"
 mockito = "1.7.0"
 dynamo-bench = { path = "../bench" }
@@ -201,4 +202,9 @@ tonic-build = { version = "0.13.1" }
 [[bin]]
 name = "bench_local_transfer_v2"
 path = "bin/bench_local_transfer_v2.rs"
+required-features = ["block-manager-bench"]
+
+[[bin]]
+name = "bench_disk"
+path = "bin/bench_disk/main.rs"
 required-features = ["block-manager-bench"]
