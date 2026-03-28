@@ -9,6 +9,9 @@ mod nixl;
 pub mod remote;
 mod strategy;
 
+pub use nixl::clear_remote_disk_fd_cache;
+pub use nixl::take_fd_open_durations;
+
 use super::*;
 
 use crate::block_manager::storage::{

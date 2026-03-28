@@ -5,7 +5,6 @@
 # Assumptions:
 #   - Running as root
 #   - UCX is pre-installed at /usr/local/ucx
-#   - CUDA is pre-installed at /usr/local/cuda
 #   - Architecture is x86_64
 
 set -euo pipefail
@@ -15,6 +14,7 @@ NIXL_REPO="${NIXL_REPO:-https://github.com/ai-dynamo/nixl.git}"
 INSTALL_PREFIX="${INSTALL_PREFIX:-/opt/nvidia/nvda_nixl}"
 UCX_PATH="${UCX_PATH:-/usr/local/ucx}"
 CUDA_PATH="${CUDA_PATH:-/usr/local/cuda}"
+CUDA_TOOLKIT_VERSION="${CUDA_TOOLKIT_VERSION:-12-9}"
 BUILD_DIR="${BUILD_DIR:-/tmp/nixl-build}"
 
 ARCH_NAME="x86_64-linux-gnu"
@@ -24,6 +24,9 @@ apt-get update
 apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
+    "cuda-toolkit-${CUDA_TOOLKIT_VERSION}" \
+    libaio-dev \
+    libaio1t64 \
     pkg-config \
     liburing-dev
 
@@ -46,8 +49,7 @@ meson setup builddir \
     --buildtype=release \
     -Dcudapath_lib="${CUDA_PATH}/lib64" \
     -Dcudapath_inc="${CUDA_PATH}/include" \
-    -Ducx_path="${UCX_PATH}" \
-    -Dpython_bindings=false
+    -Ducx_path="${UCX_PATH}"
 
 echo "=== Building and installing ==="
 ninja -C builddir

@@ -143,6 +143,28 @@ impl RemoteDiskFdCache {
 
         self.entries.remove(&lru_key);
     }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.access_tick = 0;
+    }
+}
+
+/// Drop all cached remote-disk file descriptors and their NIXL registrations.
+///
+/// Call this between benchmark sweep points or whenever the NIXL agent/backend
+/// changes so that subsequent transfers re-open and re-register files against
+/// the current agent.
+pub async fn clear_remote_disk_fd_cache() {
+    REMOTE_DISK_FD_CACHE.lock().await.clear();
+}
+
+static FD_OPEN_DURATIONS: Lazy<parking_lot::Mutex<Vec<Duration>>> =
+    Lazy::new(|| parking_lot::Mutex::new(Vec::new()));
+
+/// Drain and return all recorded per-file open+register durations.
+pub fn take_fd_open_durations() -> Vec<Duration> {
+    std::mem::take(&mut *FD_OPEN_DURATIONS.lock())
 }
 
 async fn get_or_open_remote_disk_storage(
@@ -165,6 +187,7 @@ async fn get_or_open_remote_disk_storage(
         }
     }
 
+    let fd_start = std::time::Instant::now();
     let mut storage =
         RemoteDiskStorage::open(path, block_size, create, use_odirect, preallocate).map_err(|e| {
             TransferError::ExecutionError(format!(
@@ -177,6 +200,7 @@ async fn get_or_open_remote_disk_storage(
     storage.nixl_register(agent, None).map_err(|e| {
         TransferError::ExecutionError(format!("Failed to register disk storage {}: {:?}", path, e))
     })?;
+    FD_OPEN_DURATIONS.lock().push(fd_start.elapsed());
 
     let storage = Arc::new(SyncMutex::new(storage));
 

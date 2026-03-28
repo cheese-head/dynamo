@@ -205,6 +205,6 @@ path = "bin/bench_local_transfer_v2.rs"
 required-features = ["block-manager-bench"]
 
 [[bin]]
-name = "bench_disk"
-path = "bin/bench_disk/main.rs"
+name = "kvbm-bench"
+path = "bin/kvbm_bench/main.rs"
 required-features = ["block-manager-bench"]

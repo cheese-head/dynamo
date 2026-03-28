@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use dynamo_llm::block_manager::block::transfer::remote::RemoteTransferPipeline;
 
-use crate::cli::Cli;
+use crate::cli::DiskArgs;
 use crate::layout::{effective_num_blocks, resolve_layout};
 use crate::table;
 use crate::worker::{
@@ -18,7 +18,7 @@ use crate::worker::{
     spawn_progress_heartbeat,
 };
 
-pub async fn cmd_setup(cli: &Cli, num_users: usize) -> Result<()> {
+pub async fn cmd_setup(cli: &DiskArgs, num_users: usize) -> Result<()> {
     let resolved = resolve_layout(cli);
     let bb = resolved.block_bytes();
     let nb = effective_num_blocks(cli);
@@ -49,6 +49,7 @@ pub async fn cmd_setup(cli: &Cli, num_users: usize) -> Result<()> {
             let io_api = cli.io_api.clone();
             let o_direct = cli.o_direct;
             let use_gds = cli.use_gds();
+            let gds_threads = cli.gds_threads;
             let disk_flags = cli.disk_transfer_flags();
             let tp = cli.tp;
             let layout_cfg = layout_cfg.clone();
@@ -56,7 +57,7 @@ pub async fn cmd_setup(cli: &Cli, num_users: usize) -> Result<()> {
             handles.push(tokio::spawn(async move {
                 unsafe { std::env::set_var("DYN_KVBM_REMOTE_DISK_O_DIRECT", if o_direct { "true" } else { "false" }) };
 
-                let agent = build_agent(&format!("setup-w{wid}-u{uid}"), &io_api, use_gds);
+                let agent = build_agent(&format!("setup-w{wid}-u{uid}"), &io_api, use_gds, gds_threads);
                 let (_layout, blocks) = allocate_and_register(layout_cfg, &agent);
 
                 let nb = blocks.len();
@@ -85,7 +86,7 @@ pub async fn cmd_setup(cli: &Cli, num_users: usize) -> Result<()> {
 }
 
 pub async fn cmd_read(
-    cli: &Cli,
+    cli: &DiskArgs,
     num_users: usize,
     concurrent_chunks: usize,
     agent_per_chunk: bool,
@@ -140,6 +141,7 @@ pub async fn cmd_read(
                 let cancel = cancel.clone();
                 let io_api = cli.io_api.clone();
                 let use_gds = cli.use_gds();
+                let gds_threads = cli.gds_threads;
                 let disk_flags = cli.disk_transfer_flags();
                 let wid = w.id;
 
@@ -147,7 +149,7 @@ pub async fn cmd_read(
                     run_chunked_pipeline(
                         &blocks, &descs, &ctx,
                         chunk_sz, concurrent_chunks, agent_per_chunk,
-                        &io_api, use_gds, disk_flags, wid, &cancel,
+                        &io_api, use_gds, gds_threads, disk_flags, wid, &cancel,
                     ).await
                 }));
             }

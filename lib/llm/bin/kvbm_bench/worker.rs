@@ -23,26 +23,24 @@ use dynamo_llm::block_manager::{
     storage::PinnedAllocator,
 };
 
-use crate::cli::Cli;
+use crate::cli::DiskArgs;
 
 pub type HostBlock = BlockData<PinnedStorage>;
 
-pub fn build_agent(name: &str, io_api: &str, use_gds: bool) -> NixlAgent {
+pub fn build_agent(name: &str, io_api: &str, use_gds: bool, gds_threads: usize) -> NixlAgent {
     let agent = NixlAgent::new(name).expect("Failed to create NIXL agent");
-
-    match agent.get_plugin_params("UCX") {
-        Ok((_, ucx_params)) => match agent.create_backend("UCX", &ucx_params) {
-            Ok(_) => {}
-            Err(e) => tracing::warn!(error = %e, "UCX backend unavailable"),
-        },
-        Err(e) => tracing::warn!(error = %e, "UCX plugin not found"),
-    }
 
     if use_gds {
         match agent.get_plugin_params("GDS_MT") {
-            Ok((_, gds_params)) => match agent.create_backend("GDS_MT", &gds_params) {
-                Ok(_) => tracing::info!("GDS_MT backend created"),
-                Err(e) => tracing::warn!(error = %e, "GDS_MT backend failed"),
+            Ok((_, default_gds_params)) => {
+                let mut gds_params = default_gds_params.clone().expect("Failed to clone GDS_MT params");
+                if gds_threads > 0 {
+                    gds_params.set("thread_count", &gds_threads.to_string()).unwrap();
+                }
+                match agent.create_backend("GDS_MT", &gds_params) {
+                    Ok(_) => tracing::info!("GDS_MT backend created"),
+                    Err(e) => tracing::warn!(error = %e, "GDS_MT backend failed"),
+                }
             },
             Err(e) => tracing::warn!(error = %e, "GDS_MT plugin not available"),
         }
@@ -73,7 +71,7 @@ pub fn build_agent(name: &str, io_api: &str, use_gds: bool) -> NixlAgent {
     agent
 }
 
-pub fn build_layout_config(cli: &Cli, layout: &super::layout::ResolvedLayout) -> LayoutConfig {
+pub fn build_layout_config(cli: &DiskArgs, layout: &super::layout::ResolvedLayout) -> LayoutConfig {
     let nb = super::layout::effective_num_blocks(cli);
     let (nl, od, ps, id, dt) = layout.as_tuple();
     LayoutConfig::builder()
@@ -151,8 +149,8 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub fn new(cli: &Cli, resolved: &super::layout::ResolvedLayout, worker_id: usize, num_users: usize) -> Self {
-        let agent = build_agent(&format!("bench-worker-{worker_id}"), &cli.io_api, cli.use_gds());
+    pub fn new(cli: &DiskArgs, resolved: &super::layout::ResolvedLayout, worker_id: usize, num_users: usize) -> Self {
+        let agent = build_agent(&format!("bench-worker-{worker_id}"), &cli.io_api, cli.use_gds(), cli.gds_threads);
         let bb = resolved.block_bytes();
         let nb = super::layout::effective_num_blocks(cli);
 
@@ -197,6 +195,7 @@ pub async fn run_chunked_pipeline(
     agent_per_chunk: bool,
     io_api: &str,
     use_gds: bool,
+    gds_threads: usize,
     disk_flags: DiskTransferFlags,
     worker_id: usize,
     cancel: &CancellationToken,
@@ -231,6 +230,7 @@ pub async fn run_chunked_pipeline(
                     &format!("bench-w{worker_id}-c{chunk_idx}"),
                     io_api,
                     use_gds,
+                    gds_threads,
                 );
                 build_remote_ctx(
                     Arc::new(Some(a)),

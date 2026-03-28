@@ -3,20 +3,49 @@
 #
 # Development environment for KVBM distributed work.
 # Starts shared infra plus a long-lived workspace container, but does not launch vLLM.
+# The compose project name is fixed to `distributed-dev` to avoid colliding with
+# other `distributed-*` stacks on the same host.
 #
 # Usage:
 #   docker compose \
-#     --env-file examples/kvbm/distributed/.env-distributed-disk \
+#     --env-file examples/kvbm/distributed/.env-dev \
 #     -f examples/kvbm/distributed/docker-compose.dev.yml \
 #     up -d
 #
 # Enter the dev container:
 #   docker compose -f examples/kvbm/distributed/docker-compose.dev.yml exec dynamo-dev bash
 #
+# Default published host ports use the 20k range to avoid conflicts with other local stacks:
+#   registry query    20555 -> 5555
+#   registry register 20556 -> 5556
+#   dynamo-dev mgmt   20881 -> 6881
+# Override any of them if needed:
+#   DYNAMO_DEV_HOST_PORT=21881 REGISTRY_QUERY_HOST_PORT=21555 REGISTRY_REGISTER_HOST_PORT=21556 docker compose ... up -d
+#   (container ports remain 5555/5556/6881 on the internal bridge network.)
+#
+# DNS in bridge networks: many Linux hosts use systemd-resolved (nameserver 127.0.0.53 in /etc/resolv.conf).
+# That address is wrong inside a container — ping/cargo then fail while the host resolves fine. Services that
+# need outbound DNS bind-mount the file that lists real upstream servers (default on systemd hosts):
+#   /run/systemd/resolve/resolv.conf  ->  /etc/resolv.conf in the container
+# Override the host path if needed: HOST_RESOLV_CONF_PATH=/path/to/resolv.conf docker compose ... up -d
+# (Use a file whose nameserver lines are reachable from containers, not 127.0.0.53.)
+# macOS / other layouts: if the default path is missing, use a docker-compose.override.yml or set the variable
+# to a suitable host file; or use: docker compose ... run --rm --no-deps --network host dynamo-dev bash -lc '...'
+#
 # Typical commands inside the container:
 #   cd /workspace/lib/bindings/kvbm
 #   maturin build --profile dev
 #   cargo test -p dynamo-llm block_manager::connector::scheduler::tests -- --nocapture
+#
+# G4 host-prefetch timeout / late-completion race (no vLLM):
+#   cargo test substring is NOT regex — do not use test_a|test_b (matches 0 tests).
+#   cd /workspace && cargo test -p dynamo-llm --lib test_g4_prefetch -- --nocapture
+#   cd /workspace && cargo test -p dynamo-llm --lib test_late_g4_enqueue -- --nocapture
+#   cd /workspace && cargo test -p dynamo-llm --lib test_prefetching_transfer_completed -- --nocapture
+# Or full slot_machine_tests module:
+#   cd /workspace && cargo test -p dynamo-llm --lib slot_machine_tests -- --nocapture
+
+name: distributed-dev
 
 networks:
   kvbm:
@@ -47,6 +76,7 @@ services:
   registry:
     image: ${DYNAMO_IMAGE:-gtc-demo-vllm-local-dev:latest}
     volumes:
+      - ${HOST_RESOLV_CONF_PATH:-/run/systemd/resolve/resolv.conf}:/etc/resolv.conf:ro
       - ${WORKSPACE_HOST_PATH:-../../..}:/workspace
     working_dir: /workspace
     command:
@@ -62,24 +92,40 @@ services:
       DYN_REGISTRY_HUB_CAPACITY: "1000000"
       RUST_LOG: "${REGISTRY_LOG:-dynamo_llm::block_manager::distributed::registry=debug,registry=debug}"
     ports:
-      - "5555:5555"
-      - "5556:5556"
+      - "${REGISTRY_QUERY_HOST_PORT:-20555}:5555"
+      - "${REGISTRY_REGISTER_HOST_PORT:-20556}:5556"
     networks:
       - kvbm
 
   dynamo-dev:
     image: ${DYNAMO_IMAGE:-gtc-demo-vllm-local-dev:latest}
     user: "0"
+    privileged: true
+    security_opt:
+      # Required for io_uring_setup inside the container; Docker's default
+      # seccomp profile returns EPERM and prevents the NIXL POSIX uring backend
+      # from initializing.
+      - seccomp=unconfined
     volumes:
+      - ${HOST_RESOLV_CONF_PATH:-/run/systemd/resolve/resolv.conf}:/etc/resolv.conf:ro
       - ${WORKSPACE_HOST_PATH:-../../..}:/workspace
       - ${HF_HOME:-${HOME}/.cache/huggingface}:/opt/models
       - /dev/hugepages:/dev/hugepages
       - /dev/infiniband:/dev/infiniband
-      - ${KVBM_REMOTE_DISK_HOST_PATH:-/tmp/disk-kvcache}:${KVBM_REMOTE_DISK_CONTAINER_PATH:-/tmp/disk-kvcache}
+      - ${KVBM_REMOTE_DISK_HOST_PATH}:${KVBM_REMOTE_DISK_CONTAINER_PATH:-/mnt/kvbm_cache}
     ulimits:
       memlock:
         soft: -1
         hard: -1
+      nofile:
+        soft: 1048576
+        hard: 1048576
+      core:
+        soft: -1
+        hard: -1
+      stack:
+        soft: 67108864
+        hard: 67108864
     working_dir: /workspace
     deploy:
       resources:
@@ -89,31 +135,34 @@ services:
               count: ${TP_SIZE:-1}
               capabilities: [gpu]
     environment:
-      DYN_LOG: ${DYN_LOG:-debug}
-      MODEL: ${MODEL:-openai/gpt-oss-120b}
-      ENABLE_PREFIX_CACHING: ${ENABLE_PREFIX_CACHING:-false}
-      GPU_MEMORY_UTILIZATION: ${GPU_MEMORY_UTILIZATION:-0.9}
-      TP_SIZE: ${TP_SIZE:-1}
-      VLLM_EXTRA_ARGS: ${VLLM_EXTRA_ARGS:-}
-      HF_HOME: /opt/models
-      HF_TOKEN: ${HF_TOKEN:-}
-      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
-      DYN_STORE_KV: etcd
-      DYN_REQUEST_PLANE: tcp
-      ETCD_ENDPOINTS: http://etcd-server:2379
-      NATS_SERVER: nats://nats-server:4222
-      DYN_REGISTRY_ENABLE: "1"
-      DYN_REGISTRY_CLIENT_QUERY_ADDR: tcp://registry:5555
+      # --- Infra ---
+      DYN_LOG:                          ${DYN_LOG:-debug}
+      DYN_STORE_KV:                     etcd
+      DYN_REQUEST_PLANE:                tcp
+      ETCD_ENDPOINTS:                   http://etcd-server:2379
+      NATS_SERVER:                      nats://nats-server:4222
+      DYN_REGISTRY_ENABLE:              "1"
+      DYN_REGISTRY_CLIENT_QUERY_ADDR:   tcp://registry:5555
       DYN_REGISTRY_CLIENT_REGISTER_ADDR: tcp://registry:5556
-      KVBM_DEV_MODE: ${KVBM_DEV_MODE:-TRUE}
-      KVBM_MANAGEMENT_PORT: ${KVBM_MANAGEMENT_PORT:-6881}
-      DYN_KVBM_CPU_CACHE_GB: ${DYN_KVBM_CPU_CACHE_GB:-500}
-      DYN_KVBM_DISK_CACHE_GB: ${DYN_KVBM_DISK_CACHE_GB:-}
-      DYN_KVBM_REMOTE_STORAGE_TYPE: disk
-      DYN_KVBM_REMOTE_DISK_PATHS: ${KVBM_REMOTE_DISK_PATHS:-/mnt/pure/kvbm-{worker_id}}
-      DYN_KVBM_REMOTE_DISK_USE_GDS: ${DYN_KVBM_REMOTE_DISK_USE_GDS:-0}
-      DYN_KVBM_DISK_ZEROFILL_FALLBACK: ${DYN_KVBM_DISK_ZEROFILL_FALLBACK:-true}
-      DYN_KVBM_DISK_DISABLE_O_DIRECT: ${DYN_KVBM_DISK_DISABLE_O_DIRECT:-true}
+
+      # --- vLLM / Model ---
+      MODEL:                            ${MODEL:-openai/gpt-oss-120b}
+      ENABLE_PREFIX_CACHING:            ${ENABLE_PREFIX_CACHING:-false}
+      GPU_MEMORY_UTILIZATION:           ${GPU_MEMORY_UTILIZATION:-0.9}
+      TP_SIZE:                          ${TP_SIZE:-1}
+      VLLM_EXTRA_ARGS:                  ${VLLM_EXTRA_ARGS:-}
+      HF_HOME:                          /opt/models
+      HF_TOKEN:                         ${HF_TOKEN:-}
+      HUGGING_FACE_HUB_TOKEN:           ${HF_TOKEN:-}
+
+      # --- KVBM ---
+      KVBM_DEV_MODE:                    ${KVBM_DEV_MODE:-TRUE}
+      KVBM_MANAGEMENT_PORT:             ${KVBM_MANAGEMENT_PORT:-6881}
+      DYN_KVBM_CPU_CACHE_GB:            ${DYN_KVBM_CPU_CACHE_GB:-256}
+      DYN_KVBM_REMOTE_STORAGE_TYPE:     disk
+      DYN_KVBM_REMOTE_DISK_PATHS:       ${DYN_KVBM_REMOTE_DISK_PATHS}
+      DYN_KVBM_REMOTE_DISK_USE_GDS:     ${DYN_KVBM_REMOTE_DISK_USE_GDS:-0}
+      DYN_KVBM_DISK_ZEROFILL_FALLBACK:  ${DYN_KVBM_DISK_ZEROFILL_FALLBACK:-true}
     depends_on:
       nats-server:
         condition: service_started
@@ -124,10 +173,10 @@ services:
     networks:
       - kvbm
     ports:
-      - "6881:6881"
+      - "${DYNAMO_DEV_HOST_PORT:-20881}:${KVBM_MANAGEMENT_PORT:-6881}"
     command:
       - bash
       - -c
       - |
-        echo "Dev container ready. Attach with: docker compose exec dynamo-dev bash"
+        echo "Dev container ready. Attach: docker compose exec dynamo-dev bash"
         exec sleep infinity

@@ -4,7 +4,7 @@
 use anyhow::Result;
 use serde::Deserialize;
 
-use crate::cli::Cli;
+use crate::cli::DiskArgs;
 
 pub struct ResolvedLayout {
     pub num_layers: usize,
@@ -38,7 +38,7 @@ impl std::fmt::Display for ResolvedLayout {
     }
 }
 
-pub fn effective_num_blocks(cli: &Cli) -> usize {
+pub fn effective_num_blocks(cli: &DiskArgs) -> usize {
     match cli.isl {
         Some(isl) => {
             assert!(cli.page_size > 0, "--page-size must be > 0");
@@ -91,7 +91,7 @@ fn download_model_config(model_id: &str) -> Result<HfModelConfig> {
     Ok(config.resolve())
 }
 
-pub fn resolve_layout(cli: &Cli) -> ResolvedLayout {
+pub fn resolve_layout(cli: &DiskArgs) -> ResolvedLayout {
     if let Some(bb) = cli.block_bytes {
         let ps = cli.page_size;
         let dt = cli.dtype_bytes;

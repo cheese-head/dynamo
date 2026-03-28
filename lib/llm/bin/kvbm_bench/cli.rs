@@ -1,16 +1,28 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, Args};
 
 use dynamo_llm::block_manager::config::{
     DiskTransferFlags, DISK_FLAGS_GDS_BOTH, DISK_FLAGS_GDS_READS_ONLY, DISK_FLAGS_POSIX_BOTH,
 };
 
 #[derive(Parser)]
-#[command(name = "bench_disk")]
-#[command(about = "Benchmark KVBM's NIXL POSIX disk I/O path")]
+#[command(name = "kvbm-bench")]
+#[command(about = "KVBM benchmark suite")]
 pub struct Cli {
+    #[command(subcommand)]
+    pub command: TopCommand,
+}
+
+#[derive(Subcommand)]
+pub enum TopCommand {
+    /// Benchmark KVBM's NIXL disk I/O path
+    Disk(DiskArgs),
+}
+
+#[derive(Args)]
+pub struct DiskArgs {
     #[arg(long, default_value_t = 4, global = true)]
     pub tp: usize,
 
@@ -26,18 +38,23 @@ pub struct Cli {
     #[arg(long, default_value_t = 3, global = true)]
     pub iterations: usize,
 
-    /// Enable O_DIRECT (pass --o-direct false to disable)
-    #[arg(long, default_value_t = true, global = true, action = clap::ArgAction::Set)]
+    /// Enable O_DIRECT (env: DYN_KVBM_REMOTE_DISK_O_DIRECT)
+    #[arg(long = "remote-disk-o-direct", default_value_t = true, global = true, action = clap::ArgAction::Set)]
     pub o_direct: bool,
 
-    /// POSIX I/O API: auto, aio, uring
-    #[arg(long, default_value = "auto", global = true)]
+    /// POSIX I/O API: auto, aio, uring (env: DYN_KVBM_NIXL_POSIX_API)
+    #[arg(long = "nixl-posix-api", default_value = "auto", global = true)]
     pub io_api: String,
 
     /// Disk backend: posix (default), gds (GDS_MT for both read+write),
     /// gds-read-only (POSIX write + GDS_MT read)
-    #[arg(long, default_value = "posix", global = true)]
+    /// (env: DYN_KVBM_REMOTE_DISK_USE_GDS + DYN_KVBM_REMOTE_DISK_GDS_READS_ONLY)
+    #[arg(long = "remote-disk-backend", default_value = "posix", global = true)]
     pub disk_backend: String,
+
+    /// GDS_MT thread count (0 = NIXL default, which is hardware_concurrency / 2)
+    #[arg(long = "gds-threads", default_value_t = 0, global = true)]
+    pub gds_threads: usize,
 
     #[arg(long, global = true)]
     pub model: Option<String>,
@@ -71,15 +88,15 @@ pub struct Cli {
     pub progress_interval_sec: u64,
 
     #[command(subcommand)]
-    pub command: Command,
+    pub command: DiskCommand,
 }
 
-impl Cli {
+impl DiskArgs {
     pub fn bench_dir(&self) -> &str {
         match &self.command {
-            Command::Setup { dir, .. }
-            | Command::Read { dir, .. }
-            | Command::Sweep { dir, .. } => dir.as_str(),
+            DiskCommand::Setup { dir, .. }
+            | DiskCommand::Read { dir, .. }
+            | DiskCommand::Sweep { dir, .. } => dir.as_str(),
         }
     }
 
@@ -97,10 +114,11 @@ impl Cli {
 }
 
 #[derive(Subcommand)]
-pub enum Command {
+pub enum DiskCommand {
     /// Create test files (offload random data to disk via NIXL)
     Setup {
-        #[arg(long)]
+        /// Benchmark directory (env: DYN_KVBM_REMOTE_DISK_PATHS)
+        #[arg(long = "remote-disk-path")]
         dir: String,
         #[arg(long, default_value_t = 1)]
         users: usize,
@@ -108,7 +126,8 @@ pub enum Command {
 
     /// Benchmark reading files (onboard from disk via NIXL)
     Read {
-        #[arg(long)]
+        /// Benchmark directory (env: DYN_KVBM_REMOTE_DISK_PATHS)
+        #[arg(long = "remote-disk-path")]
         dir: String,
         #[arg(long, default_value_t = 1)]
         users: usize,
@@ -120,7 +139,8 @@ pub enum Command {
 
     /// Sweep I/O parameters and print a comparison table
     Sweep {
-        #[arg(long)]
+        /// Benchmark directory (env: DYN_KVBM_REMOTE_DISK_PATHS)
+        #[arg(long = "remote-disk-path")]
         dir: String,
         #[arg(long, default_value_t = 3)]
         users: usize,
