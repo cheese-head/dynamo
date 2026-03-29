@@ -20,12 +20,35 @@ use dynamo_llm::block_manager::{
     },
     config::{DiskTransferFlags, RemoteStorageConfig, RemoteTransferContext},
     layout::{BlockLayoutConfig, FullyContiguous},
-    storage::PinnedAllocator,
+    storage::{
+        PinnedAllocator, Storage, StorageAllocator, SystemAllocator, SystemStorage,
+        nixl::{NixlRegisterableStorage, NixlDescriptor},
+    },
 };
 
 use crate::cli::DiskArgs;
 
-pub type HostBlock = BlockData<PinnedStorage>;
+/// Trait that ties a storage type to its allocator so generic bench code can
+/// create the right allocator without carrying an extra type parameter.
+pub trait BenchStorage: Storage + NixlRegisterableStorage + NixlDescriptor + Send + Sync + 'static {
+    type Allocator: StorageAllocator<Self> + Send + Sync + 'static;
+    fn create_allocator() -> Self::Allocator;
+    fn name() -> &'static str;
+}
+
+impl BenchStorage for PinnedStorage {
+    type Allocator = PinnedAllocator;
+    fn create_allocator() -> PinnedAllocator {
+        PinnedAllocator::new().expect("PinnedAllocator::new")
+    }
+    fn name() -> &'static str { "pinned" }
+}
+
+impl BenchStorage for SystemStorage {
+    type Allocator = SystemAllocator;
+    fn create_allocator() -> SystemAllocator { SystemAllocator }
+    fn name() -> &'static str { "system" }
+}
 
 pub fn build_agent(name: &str, io_api: &str, use_gds: bool, gds_threads: usize) -> NixlAgent {
     let agent = NixlAgent::new(name).expect("Failed to create NIXL agent");
@@ -85,18 +108,18 @@ pub fn build_layout_config(cli: &DiskArgs, layout: &super::layout::ResolvedLayou
         .expect("Invalid layout config")
 }
 
-pub fn allocate_and_register(
+pub fn allocate_and_register<S: BenchStorage>(
     config: LayoutConfig,
     agent: &NixlAgent,
-) -> (Arc<FullyContiguous<PinnedStorage>>, Vec<HostBlock>) {
-    let allocator = PinnedAllocator::new().expect("PinnedAllocator::new");
+) -> (Arc<FullyContiguous<S>>, Vec<BlockData<S>>) {
+    let allocator = S::create_allocator();
     let mut layout =
         FullyContiguous::allocate(config, &allocator).expect("FullyContiguous::allocate");
     layout.nixl_register(agent, None).expect("nixl_register failed");
 
     let num = layout.num_blocks();
     let layout = Arc::new(layout);
-    let blocks: Vec<HostBlock> = (0..num)
+    let blocks: Vec<BlockData<S>> = (0..num)
         .map(|i| BlockData::new(layout.clone(), i, 0, 0))
         .collect();
     (layout, blocks)
@@ -139,16 +162,16 @@ pub fn build_remote_ctx(
     )
 }
 
-pub struct Worker {
+pub struct Worker<S: Storage> {
     pub id: usize,
     pub _agent: NixlAgent,
-    pub user_layouts: Vec<Arc<FullyContiguous<PinnedStorage>>>,
-    pub user_blocks: Vec<Vec<HostBlock>>,
+    pub user_layouts: Vec<Arc<FullyContiguous<S>>>,
+    pub user_blocks: Vec<Vec<BlockData<S>>>,
     pub user_descriptors: Vec<Vec<RemoteBlockDescriptor>>,
     pub remote_ctx: Arc<RemoteTransferContext>,
 }
 
-impl Worker {
+impl<S: BenchStorage> Worker<S> {
     pub fn new(cli: &DiskArgs, resolved: &super::layout::ResolvedLayout, worker_id: usize, num_users: usize) -> Self {
         let agent = build_agent(&format!("bench-worker-{worker_id}"), &cli.io_api, cli.use_gds(), cli.gds_threads);
         let bb = resolved.block_bytes();
@@ -160,7 +183,7 @@ impl Worker {
 
         for uid in 0..num_users {
             let config = build_layout_config(cli, resolved);
-            let (layout, blocks) = allocate_and_register(config, &agent);
+            let (layout, blocks) = allocate_and_register::<S>(config, &agent);
             let descs = make_descriptors(cli.bench_dir(), nb, bb, worker_id, cli.tp, uid);
             user_layouts.push(layout);
             user_blocks.push(blocks);
@@ -186,13 +209,14 @@ impl Worker {
     }
 }
 
-pub async fn run_chunked_pipeline(
-    blocks: &[HostBlock],
+pub async fn run_chunked_pipeline<S: BenchStorage>(
+    blocks: &[BlockData<S>],
     descriptors: &[RemoteBlockDescriptor],
     remote_ctx: &Arc<RemoteTransferContext>,
     chunk_size: usize,
     concurrent_chunks: usize,
     agent_per_chunk: bool,
+    agent_pool_size: usize,
     io_api: &str,
     use_gds: bool,
     gds_threads: usize,
@@ -204,12 +228,39 @@ pub async fn run_chunked_pipeline(
     let chunk_sz = if chunk_size == 0 { num_blocks } else { chunk_size };
     let num_chunks = (num_blocks + chunk_sz - 1) / chunk_sz;
 
+    let pool: Option<Vec<Arc<RemoteTransferContext>>> = if agent_pool_size > 0 {
+        let pool_ctxs: Vec<Arc<RemoteTransferContext>> = (0..agent_pool_size)
+            .map(|i| {
+                let a = build_agent(
+                    &format!("bench-w{worker_id}-pool{i}"),
+                    io_api,
+                    use_gds,
+                    gds_threads,
+                );
+                build_remote_ctx(
+                    Arc::new(Some(a)),
+                    remote_ctx.base_path().unwrap_or("/tmp"),
+                    remote_ctx.worker_id() as usize,
+                    remote_ctx.world_size(),
+                    disk_flags,
+                )
+            })
+            .collect();
+        Some(pool_ctxs)
+    } else {
+        None
+    };
+
     if concurrent_chunks == 0 {
         for chunk_idx in 0..num_chunks {
             let s = chunk_idx * chunk_sz;
             let e = (s + chunk_sz).min(num_blocks);
+            let ctx = match &pool {
+                Some(p) => p[chunk_idx % p.len()].clone(),
+                None => remote_ctx.clone(),
+            };
             let sub = RemoteTransferPipeline::onboard_direct(descriptors[s..e].to_vec());
-            sub.execute(&blocks[s..e], remote_ctx.as_ref(), cancel)
+            sub.execute(&blocks[s..e], ctx.as_ref(), cancel)
                 .await
                 .map_err(|e| anyhow::anyhow!("worker {worker_id} chunk {chunk_idx}: {e}"))?;
         }
@@ -225,7 +276,9 @@ pub async fn run_chunked_pipeline(
             let chunk_descs = descriptors[s..e].to_vec();
             let chunk_blocks = blocks[s..e].to_vec();
 
-            let ctx = if agent_per_chunk {
+            let ctx = if let Some(ref p) = pool {
+                p[chunk_idx % p.len()].clone()
+            } else if agent_per_chunk {
                 let a = build_agent(
                     &format!("bench-w{worker_id}-c{chunk_idx}"),
                     io_api,

@@ -13,6 +13,8 @@ use tokio::time::interval;
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::block_manager::block::transfer::nixl_poll_interval_from_env;
+
 /// Registration message for NIXL notification-based transfer completion.
 pub struct RegisterNixlNotification {
     pub uuid: Uuid,
@@ -61,7 +63,7 @@ pub async fn process_nixl_notification_events(
     mut rx: mpsc::Receiver<RegisterNixlNotification>,
 ) {
     let mut outstanding: HashMap<Uuid, OutstandingTransfer> = HashMap::new();
-    let mut check_interval = interval(Duration::from_millis(1));
+    let mut check_interval = interval(nixl_poll_interval_from_env());
 
     loop {
         tokio::select! {

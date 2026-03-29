@@ -1,0 +1,14 @@
+configs:
+  # posix_sync with default 16 threads
+  - { nixl_posix_api: posix_sync, remote_disk_o_direct: true, remote_disk_backend: posix, chunk_size: 16, concurrent_chunks: 0 }
+  # posix_sync with 64 threads (set DYN_KVBM_NIXL_POSIX_SYNC_THREADS=64)
+  - { nixl_posix_api: posix_sync, remote_disk_o_direct: true, remote_disk_backend: posix, chunk_size: 64, concurrent_chunks: 0 }
+  # uring baseline
+  - { nixl_posix_api: uring, remote_disk_o_direct: true, remote_disk_backend: posix, chunk_size: 16, concurrent_chunks: 0 }
+  - { nixl_posix_api: uring, remote_disk_o_direct: true, remote_disk_backend: posix, chunk_size: 64, concurrent_chunks: 0 }
+  # aio baseline
+  - { nixl_posix_api: aio, remote_disk_o_direct: true, remote_disk_backend: posix, chunk_size: 16, concurrent_chunks: 0 }
+  - { nixl_posix_api: aio, remote_disk_o_direct: true, remote_disk_backend: posix, chunk_size: 64, concurrent_chunks: 0 }
+  # GDS baseline
+  - { remote_disk_backend: gds, remote_disk_o_direct: true, chunk_size: 16, concurrent_chunks: 0 }
+  - { remote_disk_backend: gds, remote_disk_o_direct: true, chunk_size: 64, concurrent_chunks: 0 }

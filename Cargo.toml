@@ -119,6 +119,9 @@ uuid = { version = "1.18.1", features = ["v4", "serde"] }
 url = { version = "2.5", features = ["serde"] }
 xxhash-rust = { version = "0.8", features = ["xxh3", "const_xxh3"] }
 
+[patch.crates-io]
+nixl-sys = { path = "/workspace/nixl/src/bindings/rust" }
+
 [profile.dev.package]
 insta.opt-level = 3
 

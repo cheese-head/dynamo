@@ -25,3 +25,5 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 
+[patch.crates-io]
+nixl-sys = { path = "/workspace/nixl/src/bindings/rust" }

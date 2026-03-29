@@ -18,11 +18,12 @@ pub fn print_sweep_table(results: &[SweepResult]) {
     table.set_content_arrangement(ContentArrangement::Dynamic);
 
     table.set_header(vec![
-        "#", "nixl_posix_api", "remote_disk_backend", "remote_disk_o_direct", "rt_threads",
-        "write GB/s", "read GB/s",
-        "read p50", "read p95", "read p99",
-        "read min", "read max",
-        "fd_open p99",
+        "#", "io_api", "backend", "o_direct",
+        "chunk", "conc", "users", "poll_us", "apc", "pool", "rt_thr",
+        "wr GB/s", "rd GB/s",
+        "p50", "p95", "p99",
+        "min", "max",
+        "fd p99",
         "status",
     ]);
 
@@ -33,7 +34,10 @@ pub fn print_sweep_table(results: &[SweepResult]) {
             "OK".into()
         };
 
-        let rt_threads = if r.point.runtime_threads == 0 { "default".into() } else { r.point.runtime_threads.to_string() };
+        let rt_threads = if r.point.runtime_threads == 0 { "def".into() } else { r.point.runtime_threads.to_string() };
+        let conc = if r.point.concurrent_chunks == 0 { "seq".into() } else { r.point.concurrent_chunks.to_string() };
+        let apc = if r.point.agent_per_chunk { "Y" } else { "-" };
+        let pool = if r.point.agent_pool_size == 0 { "-".into() } else { r.point.agent_pool_size.to_string() };
 
         let write_gbps = match r.write_duration {
             Some(d) if d.as_nanos() > 0 => fmt_gbps(r.total_bytes, d),
@@ -53,12 +57,25 @@ pub fn print_sweep_table(results: &[SweepResult]) {
         let read_min = stats.as_ref().map(|s| fmt_gbps(r.total_bytes, s.max)).unwrap_or("-".into());
         let read_max = stats.as_ref().map(|s| fmt_gbps(r.total_bytes, s.min)).unwrap_or("-".into());
 
+        let users = if r.point.users == 0 { "cli".into() } else { r.point.users.to_string() };
+        let poll_us = if r.point.nixl_poll_interval_us == 0 {
+            "-".into()
+        } else {
+            r.point.nixl_poll_interval_us.to_string()
+        };
+
         let color = if r.avg_gbps() > 1.0 { Color::Green } else { Color::Reset };
         let row = vec![
             Cell::new(i + 1),
             Cell::new(&r.point.nixl_posix_api),
             Cell::new(&r.point.remote_disk_backend),
             Cell::new(r.point.remote_disk_o_direct),
+            Cell::new(r.point.chunk_size),
+            Cell::new(&conc),
+            Cell::new(&users),
+            Cell::new(&poll_us),
+            Cell::new(apc),
+            Cell::new(&pool),
             Cell::new(&rt_threads),
             Cell::new(&write_gbps),
             Cell::new(&read_avg).fg(color),
@@ -101,7 +118,8 @@ pub fn print_results(label: &str, total_bytes: usize, durations: &[Duration]) {
 
 pub fn write_csv(results: &[SweepResult], path: &str) -> anyhow::Result<()> {
     let mut f = std::fs::File::create(path)?;
-    writeln!(f, "nixl_posix_api,remote_disk_o_direct,remote_disk_backend,runtime_threads,chunk_size,concurrent_chunks,agent_per_chunk,\
+    writeln!(f, "nixl_posix_api,remote_disk_o_direct,remote_disk_backend,runtime_threads,\
+        chunk_size,concurrent_chunks,agent_per_chunk,agent_pool_size,users,nixl_poll_interval_us,\
         write_gbps,write_s,\
         read_avg_gbps,read_p50_gbps,read_p95_gbps,read_p99_gbps,read_min_gbps,read_max_gbps,\
         read_avg_s,read_p50_s,read_p95_s,read_p99_s,read_min_s,read_max_s,\
@@ -137,7 +155,7 @@ pub fn write_csv(results: &[SweepResult], path: &str) -> anyhow::Result<()> {
 
         writeln!(
             f,
-            "{},{},{},{},{},{},{},\
+            "{},{},{},{},{},{},{},{},{},{},\
             {:.4},{:.4},\
             {:.4},{:.4},{:.4},{:.4},{:.4},{:.4},\
             {:.4},{:.4},{:.4},{:.4},{:.4},{:.4},\
@@ -145,6 +163,7 @@ pub fn write_csv(results: &[SweepResult], path: &str) -> anyhow::Result<()> {
             r.point.nixl_posix_api, r.point.remote_disk_o_direct, r.point.remote_disk_backend,
             r.point.runtime_threads,
             r.point.chunk_size, r.point.concurrent_chunks, r.point.agent_per_chunk,
+            r.point.agent_pool_size, r.point.users, r.point.nixl_poll_interval_us,
             w_gbps, w_s,
             avg_gbps, p50_gbps, p95_gbps, p99_gbps, min_gbps, max_gbps,
             avg_s, p50_s, p95_s, p99_s, min_s, max_s,

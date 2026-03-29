@@ -1,6 +1,6 @@
-# Sweep config for internal/VAST: aio vs uring, with and without O_DIRECT.
+# Sweep config for internal/VAST: uring, with and without O_DIRECT.
 # GDS backends are included and may be skipped automatically if unavailable.
-nixl_posix_api: [aio, uring]
+nixl_posix_api: [uring]
 remote_disk_o_direct: [true, false]
 remote_disk_backend: [posix, gds, gds-read-only]
 chunk_size: [16, 64]

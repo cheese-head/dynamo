@@ -1,4 +1,4 @@
-# Sweep config for GPFS: aio vs uring vs GDS_MT, with and without O_DIRECT
+# Sweep config for GPFS: uring vs GDS_MT, with and without O_DIRECT
 nixl_posix_api: [auto, uring]
 remote_disk_o_direct: [true, false]
 remote_disk_backend: [posix, gds, gds-read-only]

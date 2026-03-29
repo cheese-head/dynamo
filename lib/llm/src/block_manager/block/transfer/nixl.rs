@@ -22,9 +22,22 @@ use tokio_util::sync::CancellationToken;
 
 const DEFAULT_REMOTE_DISK_FD_CACHE_MAX_ENTRIES: usize = 131_072;
 const REMOTE_DISK_O_DIRECT_KEY: &str = "DYN_KVBM_REMOTE_DISK_O_DIRECT";
+const REMOTE_DISK_IO_MODE_KEY: &str = "DYN_KVBM_DISK_IO_MODE";
 const REMOTE_DISK_ALIGNMENT_VALIDATE_KEY: &str = "DYN_KVBM_REMOTE_DISK_VALIDATE_ALIGNMENT";
 const REMOTE_DISK_ALIGNMENT_OVERRIDE_KEY: &str = "DYN_KVBM_REMOTE_DISK_ALIGNMENT_BYTES";
 const DEFAULT_O_DIRECT_ALIGNMENT_FALLBACK: usize = 4096;
+/// Tokio / inline NIXL completion polling interval (`DYN_KVBM_NIXL_POLL_INTERVAL_US`), in microseconds.
+pub const NIXL_POLL_INTERVAL_US_ENV: &str = "DYN_KVBM_NIXL_POLL_INTERVAL_US";
+const DEFAULT_NIXL_POLL_INTERVAL_US: u64 = 50_000;
+
+/// Reads [`NIXL_POLL_INTERVAL_US_ENV`] on each call so benchmarks can change it between runs.
+pub(crate) fn nixl_poll_interval_from_env() -> Duration {
+    let us = std::env::var(NIXL_POLL_INTERVAL_US_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_NIXL_POLL_INTERVAL_US);
+    Duration::from_micros(us)
+}
 
 static REMOTE_DISK_FD_CACHE_MAX_ENTRIES: Lazy<usize> = Lazy::new(|| {
     std::env::var("DYN_KVBM_REMOTE_DISK_FD_CACHE_MAX_ENTRIES")
@@ -215,18 +228,20 @@ async fn get_or_open_remote_disk_storage(
 /// Poll transfer status inline with cancellation support.
 ///
 /// This is the fallback path when async notification registration fails.
-/// Polls the agent for transfer status with a 1ms interval.
+/// Polls the agent for transfer status at a configurable interval
+/// (env `DYN_KVBM_NIXL_POLL_INTERVAL_US`, default 50_000 µs).
 async fn poll_transfer_completion_inline(
     agent: &NixlAgent,
     xfer_req: &XferRequest,
     cancel_token: &CancellationToken,
 ) -> Result<(), TransferError> {
+    let interval = nixl_poll_interval_from_env();
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => {
                 return Err(TransferError::Cancelled);
             }
-            _ = tokio::time::sleep(Duration::from_millis(1)) => {
+            _ = tokio::time::sleep(interval) => {
                 match agent.get_xfer_status(xfer_req) {
                     Ok(XferStatus::Success) => return Ok(()),
                     Ok(XferStatus::InProgress) => continue,
@@ -464,16 +479,28 @@ where
             .await
         }
         RemoteStorageKind::Disk => {
-            execute_disk_transfer(
-                agent,
-                direction,
-                descriptors,
-                local_blocks,
-                block_size,
-                ctx,
-                cancel_token,
-            )
-            .await
+            if use_sync_thread_io() {
+                execute_disk_transfer_sync_threads(
+                    direction,
+                    descriptors,
+                    local_blocks,
+                    block_size,
+                    ctx,
+                    cancel_token,
+                )
+                .await
+            } else {
+                execute_disk_transfer(
+                    agent,
+                    direction,
+                    descriptors,
+                    local_blocks,
+                    block_size,
+                    ctx,
+                    cancel_token,
+                )
+                .await
+            }
         }
     }
 }
@@ -620,6 +647,209 @@ where
     Ok(())
 }
 
+/// Check if sync thread-pool I/O mode is enabled via env var.
+fn use_sync_thread_io() -> bool {
+    std::env::var(REMOTE_DISK_IO_MODE_KEY)
+        .map(|v| v.eq_ignore_ascii_case("sync_threads") || v.eq_ignore_ascii_case("sync"))
+        .unwrap_or(false)
+}
+
+/// Execute disk transfer using blocking pread/pwrite on tokio's blocking thread pool.
+///
+/// This bypasses NIXL entirely for local disk I/O: no AIO contexts, no locks, no polling.
+/// Each block gets its own `spawn_blocking` task doing a single `pread` or `pwrite`.
+/// This matches elbencho's approach (sync I/O across many OS threads).
+async fn execute_disk_transfer_sync_threads<LB>(
+    direction: RemoteTransferDirection,
+    descriptors: &[RemoteBlockDescriptor],
+    local_blocks: &[LB],
+    block_size: usize,
+    ctx: &RemoteTransferContext,
+    cancel_token: &CancellationToken,
+) -> Result<(), TransferError>
+where
+    LB: ReadableBlock + WritableBlock + Local,
+    <LB as StorageTypeProvider>::StorageType: NixlDescriptor,
+{
+    let num_blocks = descriptors.len();
+    let create_files = matches!(direction, RemoteTransferDirection::Offload);
+    let op = if create_files { "write" } else { "read" };
+
+    let posix_odirect = std::env::var(REMOTE_DISK_O_DIRECT_KEY)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    tracing::info!(
+        target: "kvbm-diag",
+        direction = op,
+        num_blocks,
+        block_size,
+        mode = "sync_threads",
+        "Sync thread-pool disk transfer starting"
+    );
+
+    let worker_id = ctx.worker_id() as usize;
+    let world_size = ctx.world_size();
+
+    let nixl_agent_arc = ctx.nixl_agent();
+    let agent = nixl_agent_arc
+        .as_ref()
+        .as_ref()
+        .ok_or_else(|| TransferError::ExecutionError("NIXL agent not available".to_string()))?;
+
+    let open_start = std::time::Instant::now();
+    let mut work_items: Vec<(i32, usize, usize)> = Vec::with_capacity(num_blocks);
+
+    for (i, (desc, block)) in descriptors.iter().zip(local_blocks.iter()).enumerate() {
+        let file_path = match desc.key() {
+            RemoteKey::Disk(disk_key) => {
+                let hash = desc.sequence_hash().ok_or_else(|| {
+                    TransferError::ExecutionError(
+                        "Disk descriptor missing sequence_hash metadata".to_string(),
+                    )
+                })?;
+                let base = ctx.base_path().unwrap_or(&disk_key.path);
+                format!("{}/{:016x}_{}_{}", base, hash, worker_id, world_size)
+            }
+            _ => {
+                return Err(TransferError::IncompatibleTypes(
+                    "Expected Disk key for disk storage transfer".to_string(),
+                ));
+            }
+        };
+
+        let storage = get_or_open_remote_disk_storage(
+            agent,
+            &file_path,
+            block_size,
+            create_files,
+            posix_odirect,
+            false, // no GDS preallocate for sync path
+        )
+        .await?;
+
+        let fd = storage.lock().fd() as i32;
+        let block_view = block.block_data().block_view()?;
+        let buf_ptr = unsafe { block_view.as_ptr() as usize };
+
+        work_items.push((fd, buf_ptr, block_size));
+
+        if i == 0 {
+            tracing::info!(
+                target: "kvbm-diag",
+                direction = op,
+                first_file = %file_path,
+                fd,
+                num_blocks,
+                mode = "sync_threads",
+                "Sync transfer files (showing first)"
+            );
+        }
+    }
+    let open_elapsed = open_start.elapsed();
+
+    let is_write = create_files;
+    let cancel = cancel_token.clone();
+
+    let use_bounce = std::env::var("DYN_KVBM_SYNC_BOUNCE_BUFFER")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    let io_start = std::time::Instant::now();
+    let handles: Vec<_> = work_items
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (fd, buf_ptr, size))| {
+            let cancel = cancel.clone();
+            tokio::task::spawn_blocking(move || {
+                if cancel.is_cancelled() {
+                    return Err(TransferError::Cancelled);
+                }
+                let ret = if is_write {
+                    unsafe {
+                        nix::libc::pwrite(fd, buf_ptr as *const nix::libc::c_void, size, 0)
+                    }
+                } else if use_bounce {
+                    let mut aligned_ptr: *mut nix::libc::c_void = std::ptr::null_mut();
+                    let rc = unsafe { nix::libc::posix_memalign(&mut aligned_ptr, 4096, size) };
+                    if rc != 0 || aligned_ptr.is_null() {
+                        return Err(TransferError::ExecutionError(format!(
+                            "posix_memalign failed for block {idx}: rc={rc}"
+                        )));
+                    }
+                    let ret = unsafe {
+                        nix::libc::pread(fd, aligned_ptr, size, 0)
+                    };
+                    if ret > 0 {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                aligned_ptr as *const u8,
+                                buf_ptr as *mut u8,
+                                ret as usize,
+                            );
+                        }
+                    }
+                    unsafe { nix::libc::free(aligned_ptr) };
+                    ret
+                } else {
+                    unsafe {
+                        nix::libc::pread(fd, buf_ptr as *mut nix::libc::c_void, size, 0)
+                    }
+                };
+                if ret < 0 {
+                    let errno = std::io::Error::last_os_error();
+                    return Err(TransferError::ExecutionError(format!(
+                        "sync {} block {idx} failed: {errno}",
+                        if is_write { "pwrite" } else { "pread" }
+                    )));
+                }
+                if (ret as usize) != size {
+                    return Err(TransferError::ExecutionError(format!(
+                        "sync {} block {idx}: short I/O ({ret} of {size} bytes)",
+                        if is_write { "pwrite" } else { "pread" }
+                    )));
+                }
+                Ok(())
+            })
+        })
+        .collect();
+
+    let mut first_err: Option<TransferError> = None;
+    for h in handles {
+        match h.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+            Err(join_err) => {
+                if first_err.is_none() {
+                    first_err = Some(TransferError::ExecutionError(format!(
+                        "sync I/O task panicked: {join_err}"
+                    )));
+                }
+            }
+        }
+    }
+
+    let io_elapsed = io_start.elapsed();
+
+    if let Some(e) = first_err {
+        return Err(e);
+    }
+
+    eprintln!(
+        "  [sync_threads] {op} {num_blocks} blocks: open={:.1}ms io={:.1}ms total={:.1}ms ({:.2} GB/s)",
+        open_elapsed.as_secs_f64() * 1000.0,
+        io_elapsed.as_secs_f64() * 1000.0,
+        (open_elapsed + io_elapsed).as_secs_f64() * 1000.0,
+        (num_blocks * block_size) as f64 / io_elapsed.as_secs_f64() / 1e9,
+    );
+
+    Ok(())
+}
+
 /// Execute disk storage transfer.
 async fn execute_disk_transfer<LB>(
     agent: &NixlAgent,
@@ -695,7 +925,7 @@ where
 
     // Use a scope block to ensure all non-Send types are dropped before await
     // (OptArgs contains NonNull which is !Send)
-    let (xfer_req, still_pending, _disk_storages) = {
+    let (xfer_req, still_pending, _disk_storages, bounce_storage, _bounce_reg) = {
         let worker_id = ctx.worker_id() as usize;
         let world_size = ctx.world_size();
 
@@ -748,6 +978,36 @@ where
             storages
         };
 
+        let use_bounce = std::env::var("DYN_KVBM_BOUNCE_BUFFER")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let is_read = matches!(direction, RemoteTransferDirection::Onboard);
+
+        let (bounce_storage, _bounce_reg_handle): (Option<nixl_sys::SystemStorage>, Option<nixl_sys::RegistrationHandle>) = if use_bounce && is_read {
+            let total_size = num_blocks * block_size;
+            let total_size_aligned = if use_odirect {
+                // Round up to page alignment for O_DIRECT
+                (total_size + 4095) & !4095
+            } else {
+                total_size
+            };
+            let mut aligned_ptr: *mut nix::libc::c_void = std::ptr::null_mut();
+            let rc = unsafe { nix::libc::posix_memalign(&mut aligned_ptr, 4096, total_size_aligned) };
+            if rc != 0 || aligned_ptr.is_null() {
+                return Err(TransferError::ExecutionError(format!(
+                    "posix_memalign failed for bounce buffer: rc={rc}, size={total_size_aligned}"
+                )));
+            }
+            let data = unsafe { Vec::from_raw_parts(aligned_ptr as *mut u8, total_size, total_size_aligned) };
+            let storage = nixl_sys::SystemStorage::from_vec(data);
+            let reg_handle = agent.register_memory(&storage, None).map_err(|e| {
+                TransferError::ExecutionError(format!("Failed to register bounce buffer: {:?}", e))
+            })?;
+            (Some(storage), Some(reg_handle))
+        } else {
+            (None, None)
+        };
+
         // Build transfer descriptor lists for disk
         let mut src_dl = XferDescList::new(MemType::Dram).map_err(|e| {
             TransferError::ExecutionError(format!("Failed to create src_dl: {:?}", e))
@@ -756,11 +1016,15 @@ where
             TransferError::ExecutionError(format!("Failed to create dst_dl: {:?}", e))
         })?;
 
-        for (block, disk_storage) in local_blocks.iter().zip(disk_storages.iter()) {
-            let block_view = block.block_data().block_view()?;
-            let addr = unsafe { block_view.as_ptr() as usize };
+        for (i, (block, disk_storage)) in local_blocks.iter().zip(disk_storages.iter()).enumerate() {
+            let addr = if let Some(ref storage) = bounce_storage {
+                unsafe { storage.as_ptr() as usize + i * block_size }
+            } else {
+                let block_view = block.block_data().block_view()?;
+                unsafe { block_view.as_ptr() as usize }
+            };
 
-            if use_odirect && alignment_cfg.validate && !addr.is_multiple_of(alignment_cfg.quantum)
+            if bounce_storage.is_none() && use_odirect && alignment_cfg.validate && !addr.is_multiple_of(alignment_cfg.quantum)
             {
                 return Err(TransferError::ExecutionError(format!(
                     "O_DIRECT alignment validation failed: host buffer address must be {}-byte aligned; got 0x{:x}. \
@@ -824,7 +1088,7 @@ where
             TransferError::ExecutionError(format!("Failed to post xfer_req: {:?}", e))
         })?;
 
-        (xfer_req, still_pending, disk_storages)
+        (xfer_req, still_pending, disk_storages, bounce_storage, _bounce_reg_handle)
     };
 
     if still_pending {
@@ -867,10 +1131,26 @@ where
         }
     }
 
+    if let Some(ref storage) = bounce_storage {
+        let src_base = unsafe { MemoryRegion::as_ptr(storage) };
+        for (i, block) in local_blocks.iter().enumerate() {
+            let block_view = block.block_data().block_view()?;
+            let dst = unsafe { block_view.as_ptr() as *mut u8 };
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src_base.add(i * block_size),
+                    dst,
+                    block_size,
+                );
+            }
+        }
+    }
+
     tracing::debug!(
-        "Disk transfer complete: {} blocks, direction={:?}",
+        "Disk transfer complete: {} blocks, direction={:?}, bounce={}",
         num_blocks,
-        direction
+        direction,
+        bounce_storage.is_some(),
     );
 
     Ok(())

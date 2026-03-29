@@ -1,0 +1,34 @@
+# GPFS CPU sweep: POSIX io_uring + GDS_MT × chunk/concurrency × nixl_poll_interval_us; 10 concurrent users per worker only.
+# Poll axis: 1000 µs vs 50000 µs (DYN_KVBM_NIXL_POLL_INTERVAL_US). O_DIRECT on.
+# --host-storage system needs DYN_KVBM_BOUNCE_BUFFER=1 with O_DIRECT (aligned bounce path).
+#
+# Example (container — replace CONTAINER_ID with yours, e.g. 0a7d1b14cc81):
+#   docker exec -w /workspace -e DYN_KVBM_BOUNCE_BUFFER=1 CONTAINER_ID \
+#     ./target/release/kvbm-bench disk \
+#       --tp 4 --isl 120000 --iterations 10 --host-storage system \
+#     sweep \
+#       --remote-disk-path /mnt/kv_cache/kvbm-bench/flamegraph_test \
+#       --config lib/llm/bin/kvbm_bench/sweep_gpfs_cpu_test.yaml \
+#       --csv /workspace/sweep_results.csv
+#
+# Sweep YAML sets users: 10 per point; CLI `--users` is ignored when point.users > 0.
+configs:
+  # --- POSIX uring backend ---
+  - { nixl_posix_api: uring, remote_disk_o_direct: true, remote_disk_backend: posix, chunk_size: 16, concurrent_chunks: 0, users: 10, nixl_poll_interval_us: 1000 }
+  - { nixl_posix_api: uring, remote_disk_o_direct: true, remote_disk_backend: posix, chunk_size: 16, concurrent_chunks: 0, users: 10, nixl_poll_interval_us: 50000 }
+  - { nixl_posix_api: uring, remote_disk_o_direct: true, remote_disk_backend: posix, chunk_size: 64, concurrent_chunks: 0, users: 10, nixl_poll_interval_us: 1000 }
+  - { nixl_posix_api: uring, remote_disk_o_direct: true, remote_disk_backend: posix, chunk_size: 64, concurrent_chunks: 0, users: 10, nixl_poll_interval_us: 50000 }
+  - { nixl_posix_api: uring, remote_disk_o_direct: true, remote_disk_backend: posix, chunk_size: 16, concurrent_chunks: 64, users: 10, nixl_poll_interval_us: 1000 }
+  - { nixl_posix_api: uring, remote_disk_o_direct: true, remote_disk_backend: posix, chunk_size: 16, concurrent_chunks: 64, users: 10, nixl_poll_interval_us: 50000 }
+  - { nixl_posix_api: uring, remote_disk_o_direct: true, remote_disk_backend: posix, chunk_size: 64, concurrent_chunks: 64, users: 10, nixl_poll_interval_us: 1000 }
+  - { nixl_posix_api: uring, remote_disk_o_direct: true, remote_disk_backend: posix, chunk_size: 64, concurrent_chunks: 64, users: 10, nixl_poll_interval_us: 50000 }
+
+  # --- GDS_MT backend ---
+  - { remote_disk_backend: gds, remote_disk_o_direct: true, chunk_size: 16, concurrent_chunks: 0, users: 10, nixl_poll_interval_us: 1000 }
+  - { remote_disk_backend: gds, remote_disk_o_direct: true, chunk_size: 16, concurrent_chunks: 0, users: 10, nixl_poll_interval_us: 50000 }
+  - { remote_disk_backend: gds, remote_disk_o_direct: true, chunk_size: 64, concurrent_chunks: 0, users: 10, nixl_poll_interval_us: 1000 }
+  - { remote_disk_backend: gds, remote_disk_o_direct: true, chunk_size: 64, concurrent_chunks: 0, users: 10, nixl_poll_interval_us: 50000 }
+  - { remote_disk_backend: gds, remote_disk_o_direct: true, chunk_size: 16, concurrent_chunks: 64, users: 10, nixl_poll_interval_us: 1000 }
+  - { remote_disk_backend: gds, remote_disk_o_direct: true, chunk_size: 16, concurrent_chunks: 64, users: 10, nixl_poll_interval_us: 50000 }
+  - { remote_disk_backend: gds, remote_disk_o_direct: true, chunk_size: 64, concurrent_chunks: 64, users: 10, nixl_poll_interval_us: 1000 }
+  - { remote_disk_backend: gds, remote_disk_o_direct: true, chunk_size: 64, concurrent_chunks: 64, users: 10, nixl_poll_interval_us: 50000 }

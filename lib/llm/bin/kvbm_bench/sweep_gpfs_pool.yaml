@@ -1,0 +1,28 @@
+# GPFS agent pool sweep: tests the effect of agent concurrency on GPFS throughput.
+#
+# Baseline (shared agent, serial chunks) vs agent pool with concurrent chunks.
+# Use with: kvbm-bench disk sweep --config .../sweep_gpfs_pool.yaml ...
+configs:
+  # 1. Baseline: shared agent, serial chunks (current default behavior)
+  - { nixl_posix_api: uring, remote_disk_o_direct: true, remote_disk_backend: posix, runtime_threads: 128 }
+
+  # 2. Read lock only: shared agent, concurrent chunks (tests read lock improvement)
+  - { nixl_posix_api: uring, remote_disk_o_direct: true, remote_disk_backend: posix, runtime_threads: 128, concurrent_chunks: 16 }
+
+  # 3. Agent pool size 4 with concurrent chunks
+  - { nixl_posix_api: uring, remote_disk_o_direct: true, remote_disk_backend: posix, runtime_threads: 128, concurrent_chunks: 16, agent_pool_size: 4 }
+
+  # 4. Agent pool size 8 with concurrent chunks
+  - { nixl_posix_api: uring, remote_disk_o_direct: true, remote_disk_backend: posix, runtime_threads: 128, concurrent_chunks: 16, agent_pool_size: 8 }
+
+  # 5. Agent pool size 16 with concurrent chunks
+  - { nixl_posix_api: uring, remote_disk_o_direct: true, remote_disk_backend: posix, runtime_threads: 128, concurrent_chunks: 16, agent_pool_size: 16 }
+
+  # 6. Agent pool size 16, chunk_size=1 (max parallelism: 47 concurrent single-block I/Os)
+  - { nixl_posix_api: uring, remote_disk_o_direct: true, remote_disk_backend: posix, runtime_threads: 128, concurrent_chunks: 47, chunk_size: 1, agent_pool_size: 16 }
+
+  # 7. Sync pread thread pool (bypasses NIXL AIO entirely - matches elbencho)
+  - { remote_disk_o_direct: true, remote_disk_backend: posix, runtime_threads: 128, disk_io_mode: sync_threads }
+
+  # 8. Sync pread without O_DIRECT
+  - { remote_disk_o_direct: false, remote_disk_backend: posix, runtime_threads: 128, disk_io_mode: sync_threads }

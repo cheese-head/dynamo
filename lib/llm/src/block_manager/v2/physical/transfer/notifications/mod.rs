@@ -15,6 +15,8 @@ use tokio::time::interval;
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::block_manager::block::transfer::nixl_poll_interval_from_env;
+
 pub mod cuda_event;
 pub mod nixl_events;
 pub mod nixl_status;
@@ -78,7 +80,7 @@ pub async fn process_polling_notifications<C: CompletionChecker>(
     mut rx: mpsc::Receiver<RegisterPollingNotification<C>>,
 ) {
     let mut outstanding: HashMap<Uuid, OutstandingPollingTransfer<C>> = HashMap::new();
-    let mut check_interval = interval(Duration::from_millis(1));
+    let mut check_interval = interval(nixl_poll_interval_from_env());
 
     loop {
         tokio::select! {

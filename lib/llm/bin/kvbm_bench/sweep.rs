@@ -12,9 +12,10 @@ use dynamo_llm::block_manager::block::transfer::{clear_remote_disk_fd_cache, tak
 use dynamo_llm::block_manager::block::transfer::remote::RemoteTransferPipeline;
 
 use crate::cli::DiskArgs;
+use crate::commands::apply_nixl_poll_interval_env;
 use crate::layout::{effective_num_blocks, resolve_layout};
 use crate::table;
-use crate::worker::{self, Worker};
+use crate::worker::{self, BenchStorage, Worker};
 
 /// YAML sweep configuration.  If `configs` is present, each entry is run as-is.
 /// Otherwise, the top-level arrays generate a cartesian product.
@@ -39,6 +40,10 @@ pub enum SweepFile {
         agent_per_chunk: Vec<bool>,
         #[serde(default = "default_runtime_threads")]
         runtime_threads: Vec<usize>,
+        #[serde(default = "default_users")]
+        users: Vec<usize>,
+        #[serde(default = "default_nixl_poll_interval_us")]
+        nixl_poll_interval_us: Vec<u64>,
     },
 }
 
@@ -49,6 +54,8 @@ fn default_chunk_size() -> Vec<usize> { vec![16] }
 fn default_concurrent_chunks() -> Vec<usize> { vec![0] }
 fn default_agent_per_chunk() -> Vec<bool> { vec![false] }
 fn default_runtime_threads() -> Vec<usize> { vec![0] }
+fn default_users() -> Vec<usize> { vec![0] }
+fn default_nixl_poll_interval_us() -> Vec<u64> { vec![0] }
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct SweepPoint {
@@ -65,7 +72,17 @@ pub struct SweepPoint {
     #[serde(default)]
     pub agent_per_chunk: bool,
     #[serde(default)]
+    pub agent_pool_size: usize,
+    #[serde(default)]
+    pub disk_io_mode: String,
+    #[serde(default)]
     pub runtime_threads: usize,
+    /// Per-point user count override. 0 means use the CLI --users value.
+    #[serde(default)]
+    pub users: usize,
+    /// Tokio NIXL poll interval override (µs). 0 = use `--nixl-poll-interval-us` or library default.
+    #[serde(default)]
+    pub nixl_poll_interval_us: u64,
 }
 
 fn default_io_api_single() -> String { "auto".into() }
@@ -81,6 +98,8 @@ impl SweepFile {
                 nixl_posix_api, remote_disk_o_direct, remote_disk_backend,
                 chunk_size, concurrent_chunks, agent_per_chunk,
                 runtime_threads,
+                users,
+                nixl_poll_interval_us,
             } => {
                 let mut points = Vec::new();
                 for api in &nixl_posix_api {
@@ -90,15 +109,23 @@ impl SweepFile {
                                 for &cc in &concurrent_chunks {
                                     for &apc in &agent_per_chunk {
                                         for &rt in &runtime_threads {
-                                            points.push(SweepPoint {
-                                                nixl_posix_api: api.clone(),
-                                                remote_disk_o_direct: od,
-                                                remote_disk_backend: be.clone(),
-                                                chunk_size: cs,
-                                                concurrent_chunks: cc,
-                                                agent_per_chunk: apc,
-                                                runtime_threads: rt,
-                                            });
+                                            for &u in &users {
+                                                for &poll_us in &nixl_poll_interval_us {
+                                                    points.push(SweepPoint {
+                                                        nixl_posix_api: api.clone(),
+                                                        remote_disk_o_direct: od,
+                                                        remote_disk_backend: be.clone(),
+                                                        chunk_size: cs,
+                                                        concurrent_chunks: cc,
+                                                        agent_per_chunk: apc,
+                                                        agent_pool_size: 0,
+                                                        disk_io_mode: String::new(),
+                                                        runtime_threads: rt,
+                                                        users: u,
+                                                        nixl_poll_interval_us: poll_us,
+                                                    });
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -120,6 +147,8 @@ impl SweepFile {
             concurrent_chunks: vec![0, 64],
             agent_per_chunk: vec![false],
             runtime_threads: vec![0],
+            users: vec![0],
+            nixl_poll_interval_us: vec![0],
         }
     }
 }
@@ -184,7 +213,7 @@ impl SweepResult {
     }
 }
 
-pub fn cmd_sweep(
+pub fn cmd_sweep<S: BenchStorage>(
     cli: &DiskArgs,
     num_users: usize,
     config_path: &Option<String>,
@@ -204,16 +233,19 @@ pub fn cmd_sweep(
     let bb = resolved.block_bytes();
     let nb = effective_num_blocks(cli);
     let per_user_per_worker = nb * bb;
-    let total_bytes = per_user_per_worker * cli.tp * num_users;
 
     println!("Sweep: {total_configs} configurations to test");
-    println!("  {:.2} GB per point ({} workers × {} users × {} blocks × {} B)",
-        total_bytes as f64 / 1e9, cli.tp, num_users, nb, bb);
+    println!("  Block: {} blocks × {} B = {:.2} MB per user per worker",
+        nb, bb, per_user_per_worker as f64 / 1e6);
     println!();
 
     let mut results: Vec<SweepResult> = Vec::new();
 
     for (idx, point) in points.into_iter().enumerate() {
+        let effective_users = if point.users > 0 { point.users } else { num_users };
+
+        apply_nixl_poll_interval_env(cli.nixl_poll_interval_us, point.nixl_poll_interval_us);
+
         let rt_threads = if point.runtime_threads > 0 {
             point.runtime_threads
         } else if cli.runtime_threads > 0 {
@@ -229,13 +261,23 @@ pub fn cmd_sweep(
         }
         let rt = rt_builder.build()?;
 
+        let total_bytes = per_user_per_worker * cli.tp * effective_users;
+
         let point_dir = format!("{}/point_{idx}", cli.bench_dir());
         let threads_label = if rt_threads == 0 { "default".to_string() } else { rt_threads.to_string() };
+        let poll_label = if point.nixl_poll_interval_us > 0 {
+            point.nixl_poll_interval_us.to_string()
+        } else if cli.nixl_poll_interval_us > 0 {
+            format!("cli={}", cli.nixl_poll_interval_us)
+        } else {
+            "def".into()
+        };
         let label = format!(
-            "[{}/{}] io_api={} o_direct={} backend={} chunk_size={} conc_chunks={} rt_threads={}",
+            "[{}/{}] io_api={} o_direct={} backend={} chunk_size={} conc_chunks={} users={} rt_threads={} nixl_poll_us={}",
             idx + 1, total_configs,
             point.nixl_posix_api, point.remote_disk_o_direct, point.remote_disk_backend,
-            point.chunk_size, point.concurrent_chunks, threads_label,
+            point.chunk_size, point.concurrent_chunks, effective_users, threads_label,
+            poll_label,
         );
         eprintln!("{label}");
 
@@ -244,6 +286,11 @@ pub fn cmd_sweep(
                 "DYN_KVBM_REMOTE_DISK_O_DIRECT",
                 if point.remote_disk_o_direct { "true" } else { "false" },
             );
+            if !point.disk_io_mode.is_empty() {
+                std::env::set_var("DYN_KVBM_DISK_IO_MODE", &point.disk_io_mode);
+            } else {
+                std::env::remove_var("DYN_KVBM_DISK_IO_MODE");
+            }
         }
 
         rt.block_on(clear_remote_disk_fd_cache());
@@ -282,7 +329,7 @@ pub fn cmd_sweep(
         let setup_err = rt.block_on(async {
             let mut handles = Vec::new();
             for wid in 0..cli.tp {
-                for uid in 0..num_users {
+                for uid in 0..effective_users {
                     let dir = point_dir.clone();
                     let io_api = point.nixl_posix_api.clone();
                     let o_direct = point.remote_disk_o_direct;
@@ -293,7 +340,7 @@ pub fn cmd_sweep(
                     handles.push(tokio::spawn(async move {
                         unsafe { std::env::set_var("DYN_KVBM_REMOTE_DISK_O_DIRECT", if o_direct { "true" } else { "false" }) };
                         let agent = worker::build_agent(&format!("setup-w{wid}-u{uid}"), &io_api, use_gds, gds_threads);
-                        let (_layout, blocks) = worker::allocate_and_register(layout_cfg, &agent);
+                        let (_layout, blocks) = worker::allocate_and_register::<S>(layout_cfg, &agent);
                         let nb = blocks.len();
                         let descs = worker::make_descriptors(&dir, nb, bb, wid, tp, uid);
                         let remote_ctx = worker::build_remote_ctx(Arc::new(Some(agent)), &dir, wid, tp, disk_flags);
@@ -330,7 +377,7 @@ pub fn cmd_sweep(
 
         // --- Read phase ---
         let (durations, had_error) = rt.block_on(async {
-            let workers: Vec<Worker> = (0..cli.tp)
+            let workers: Vec<Worker<S>> = (0..cli.tp)
                 .map(|wid| {
                     let agent = worker::build_agent(
                         &format!("sweep-w{wid}"),
@@ -338,13 +385,13 @@ pub fn cmd_sweep(
                         use_gds,
                         cli.gds_threads,
                     );
-                    let mut user_layouts = Vec::with_capacity(num_users);
-                    let mut user_blocks = Vec::with_capacity(num_users);
-                    let mut user_descriptors = Vec::with_capacity(num_users);
+                    let mut user_layouts = Vec::with_capacity(effective_users);
+                    let mut user_blocks = Vec::with_capacity(effective_users);
+                    let mut user_descriptors = Vec::with_capacity(effective_users);
 
-                    for uid in 0..num_users {
+                    for uid in 0..effective_users {
                         let config = worker::build_layout_config(cli, &resolved);
-                        let (layout, blocks) = worker::allocate_and_register(config, &agent);
+                        let (layout, blocks) = worker::allocate_and_register::<S>(config, &agent);
                         let descs = worker::make_descriptors(&point_dir, nb, bb, wid, cli.tp, uid);
                         user_layouts.push(layout);
                         user_blocks.push(blocks);
@@ -379,7 +426,7 @@ pub fn cmd_sweep(
 
                 let mut handles = Vec::new();
                 for w in &workers {
-                    for uid in 0..num_users {
+                    for uid in 0..effective_users {
                         let blocks = w.user_blocks[uid].clone();
                         let descs = w.user_descriptors[uid].clone();
                         let ctx = w.remote_ctx.clone();
@@ -391,11 +438,13 @@ pub fn cmd_sweep(
                         let wid = w.id;
                         let concurrent_chunks = point.concurrent_chunks;
                         let agent_per_chunk = point.agent_per_chunk;
+                        let agent_pool_size = point.agent_pool_size;
 
                         handles.push(tokio::spawn(async move {
-                            worker::run_chunked_pipeline(
+                            worker::run_chunked_pipeline::<S>(
                                 &blocks, &descs, &ctx,
                                 chunk_sz, concurrent_chunks, agent_per_chunk,
+                                agent_pool_size,
                                 &io_api, use_gds, gds_threads, disk_flags, wid, &cancel,
                             ).await
                         }));

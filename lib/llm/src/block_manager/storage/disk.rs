@@ -579,7 +579,11 @@ impl RemoteDiskStorage {
             })?;
         }
 
-        let mut flags = OFlag::O_RDWR | OFlag::O_CLOEXEC;
+        let mut flags = if create {
+            OFlag::O_RDWR | OFlag::O_CLOEXEC
+        } else {
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC
+        };
         if create {
             flags |= OFlag::O_CREAT;
         }

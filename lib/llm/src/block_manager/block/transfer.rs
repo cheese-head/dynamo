@@ -9,8 +9,10 @@ mod nixl;
 pub mod remote;
 mod strategy;
 
-pub use nixl::clear_remote_disk_fd_cache;
-pub use nixl::take_fd_open_durations;
+pub use nixl::{
+    clear_remote_disk_fd_cache, take_fd_open_durations, NIXL_POLL_INTERVAL_US_ENV,
+};
+pub(crate) use nixl::nixl_poll_interval_from_env;
 
 use super::*;
 

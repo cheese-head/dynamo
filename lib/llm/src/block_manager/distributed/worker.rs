@@ -202,9 +202,32 @@ fn build_agent(worker_id: usize, use_gds: bool) -> anyhow::Result<NixlAgent> {
                     "Configured NIXL POSIX queue API: posix_aio"
                 );
             }
+            "posix_sync" | "pwrite" => {
+                posix_params
+                    .set("use_aio", "false")
+                    .map_err(|e| anyhow::anyhow!("Failed to set POSIX param use_aio: {}", e))?;
+                posix_params
+                    .set("use_uring", "false")
+                    .map_err(|e| anyhow::anyhow!("Failed to set POSIX param use_uring: {}", e))?;
+                posix_params.set("use_posix_aio", "false").map_err(|e| {
+                    anyhow::anyhow!("Failed to set POSIX param use_posix_aio: {}", e)
+                })?;
+                posix_params.set("use_posix_sync", "true").map_err(|e| {
+                    anyhow::anyhow!("Failed to set POSIX param use_posix_sync: {}", e)
+                })?;
+                if let Ok(tc) = std::env::var("DYN_KVBM_NIXL_POSIX_SYNC_THREADS") {
+                    posix_params.set("thread_count", tc.trim()).map_err(|e| {
+                        anyhow::anyhow!("Failed to set POSIX param thread_count: {}", e)
+                    })?;
+                }
+                tracing::info!(
+                    worker_id = worker_id,
+                    "Configured NIXL POSIX queue API: posix_sync (pwrite/pread thread pool)"
+                );
+            }
             _ => {
                 return Err(anyhow::anyhow!(
-                    "Invalid {} value '{}'. Supported: auto, uring, aio, posix_aio",
+                    "Invalid {} value '{}'. Supported: auto, uring, aio, posix_aio, posix_sync",
                     NIXL_POSIX_API_KEY,
                     raw_api
                 ));

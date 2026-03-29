@@ -21,6 +21,7 @@ mod worker;
 
 use anyhow::Result;
 use clap::Parser;
+use dynamo_llm::block_manager::{PinnedStorage, SystemStorage};
 
 fn apply_ucx_env_defaults(ucx_raw_env: bool) {
     if ucx_raw_env || std::env::var_os("UCX_TLS").is_some() {
@@ -48,10 +49,16 @@ fn build_runtime(threads: usize) -> Result<tokio::runtime::Runtime> {
 fn run_disk(disk: &cli::DiskArgs) -> Result<()> {
     apply_ucx_env_defaults(disk.ucx_raw_env);
 
+    let use_system = disk.host_storage.eq_ignore_ascii_case("system");
+
     match &disk.command {
         cli::DiskCommand::Sweep { users, config, csv, .. } => {
             sysinfo::print_system_info(disk.bench_dir());
-            sweep::cmd_sweep(disk, *users, config, csv)
+            if use_system {
+                sweep::cmd_sweep::<SystemStorage>(disk, *users, config, csv)
+            } else {
+                sweep::cmd_sweep::<PinnedStorage>(disk, *users, config, csv)
+            }
         }
         _ => {
             let rt = build_runtime(disk.runtime_threads)?;
@@ -68,15 +75,24 @@ fn run_disk(disk: &cli::DiskArgs) -> Result<()> {
             rt.block_on(async {
                 match &disk.command {
                     cli::DiskCommand::Setup { users, .. } => {
-                        commands::cmd_setup(disk, *users).await
+                        if use_system {
+                            commands::cmd_setup::<SystemStorage>(disk, *users).await
+                        } else {
+                            commands::cmd_setup::<PinnedStorage>(disk, *users).await
+                        }
                     }
                     cli::DiskCommand::Read {
                         users,
                         concurrent_chunks,
                         agent_per_chunk,
+                        agent_pool_size,
                         ..
                     } => {
-                        commands::cmd_read(disk, *users, *concurrent_chunks, *agent_per_chunk).await
+                        if use_system {
+                            commands::cmd_read::<SystemStorage>(disk, *users, *concurrent_chunks, *agent_per_chunk, *agent_pool_size).await
+                        } else {
+                            commands::cmd_read::<PinnedStorage>(disk, *users, *concurrent_chunks, *agent_per_chunk, *agent_pool_size).await
+                        }
                     }
                     cli::DiskCommand::Sweep { .. } => unreachable!(),
                 }
@@ -85,7 +101,22 @@ fn run_disk(disk: &cli::DiskArgs) -> Result<()> {
     }
 }
 
+fn install_signal_handler() {
+    unsafe {
+        libc::signal(libc::SIGINT, handle_sigint as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, handle_sigint as libc::sighandler_t);
+    }
+}
+
+extern "C" fn handle_sigint(_sig: libc::c_int) {
+    let msg = b"\nInterrupted -- exiting.\n";
+    unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()) };
+    std::process::exit(130);
+}
+
 fn main() -> Result<()> {
+    install_signal_handler();
+
     if std::env::var("RUST_LOG").is_err() {
         unsafe { std::env::set_var("RUST_LOG", "error") };
     }

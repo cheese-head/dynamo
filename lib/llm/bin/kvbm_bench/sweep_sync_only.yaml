@@ -1,0 +1,2 @@
+configs:
+  - { nixl_posix_api: uring, remote_disk_o_direct: true, remote_disk_backend: posix, runtime_threads: 128, disk_io_mode: sync_threads, chunk_size: 0 }

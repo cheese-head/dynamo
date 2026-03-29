@@ -87,6 +87,16 @@ pub struct DiskArgs {
     #[arg(long, default_value_t = 0, global = true)]
     pub progress_interval_sec: u64,
 
+    /// Host memory allocator: pinned (CUDA page-locked, default) or system (malloc).
+    /// System storage with O_DIRECT requires DYN_KVBM_BOUNCE_BUFFER=1 for alignment.
+    #[arg(long = "host-storage", default_value = "pinned", global = true)]
+    pub host_storage: String,
+
+    /// NIXL async completion poll interval in microseconds (sets `DYN_KVBM_NIXL_POLL_INTERVAL_US`).
+    /// 0 = unset (library default 50_000 µs). Sweep YAML `nixl_poll_interval_us` overrides this per point when non-zero.
+    #[arg(long = "nixl-poll-interval-us", default_value_t = 0, global = true)]
+    pub nixl_poll_interval_us: u64,
+
     #[command(subcommand)]
     pub command: DiskCommand,
 }
@@ -135,6 +145,8 @@ pub enum DiskCommand {
         concurrent_chunks: usize,
         #[arg(long, default_value_t = false)]
         agent_per_chunk: bool,
+        #[arg(long, default_value_t = 0)]
+        agent_pool_size: usize,
     },
 
     /// Sweep I/O parameters and print a comparison table
